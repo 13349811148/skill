@@ -1203,28 +1203,65 @@ def write_workbook(path: Path, columns: list[str], rows: list[dict[str, Any]]) -
         wb = excel.Workbooks.Add()
         ws = wb.Worksheets(1)
         ws.Name = "每日销售数据"
-        for col in [8, 12, 16, 29, 30, 32, 33]:
-            ws.Columns(col).NumberFormat = "@"
-        ws.Columns(7).NumberFormat = "0"
+        column_numbers = {
+            header: index
+            for index, header in enumerate(columns, start=1)
+            if header
+        }
+        text_columns = {
+            "商品SKU",
+            PROMOTION_MECHANISM_COLUMN,
+            "定价是否合理",
+            "备注",
+            "大类辅助列",
+            "辅助",
+            "项目组",
+            "管理类型",
+            "品种",
+            "产线",
+        }
+        two_decimal_columns = {
+            "产品成本",
+            "活动价",
+            "报名价",
+            "到手价",
+            "实际成交金额（去退款去补单后）",
+            "每单补贴金额",
+            "总补贴金额",
+            "净销售额（实际成交+总补贴金额）",
+            "毛利",
+            "推广费用",
+            "店铺费用",
+            "平摊管理费用",
+            "净利润",
+        }
+        for header in text_columns:
+            if header in column_numbers:
+                ws.Columns(column_numbers[header]).NumberFormat = "@"
+        if "商品ID" in column_numbers:
+            ws.Columns(column_numbers["商品ID"]).NumberFormat = "0"
         for c, header in enumerate(columns, start=1):
             ws.Cells(1, c).Value = header
         for r, row in enumerate(rows, start=2):
             for c, header in enumerate(columns, start=1):
                 value = row.get(header, "")
-                if c == 7 and text(value).isdigit():
+                if header == "商品ID" and text(value).isdigit():
                     value = int(text(value))
-                elif c in {8, 12, 25, 26, 27, 28, 29}:
+                elif header in text_columns:
                     value = text(value)
                 ws.Cells(r, c).Value = value
         ws.Rows(1).Font.Bold = True
         ws.Rows(1).WrapText = True
         ws.Columns.AutoFit()
-        for col in [1]:
-            ws.Columns(col).NumberFormat = "yyyy-mm-dd"
-        for col in [13, 14, 15, 17, 19, 20, 21, 22, 23, 25, 26, 27, 28]:
-            ws.Columns(col).NumberFormat = "#,##0.00"
-        ws.Columns(18).NumberFormat = "#,##0"
-        ws.Columns(24).NumberFormat = "0.00%"
+        if "日期" in column_numbers:
+            ws.Columns(column_numbers["日期"]).NumberFormat = "yyyy-mm-dd"
+        for header in two_decimal_columns:
+            if header in column_numbers:
+                ws.Columns(column_numbers[header]).NumberFormat = "#,##0.00"
+        if "实际成交数量（去退款去补单后）" in column_numbers:
+            ws.Columns(column_numbers["实际成交数量（去退款去补单后）"]).NumberFormat = "#,##0"
+        if "毛利率" in column_numbers:
+            ws.Columns(column_numbers["毛利率"]).NumberFormat = "0.00%"
         wb.SaveAs(str(path), FileFormat=51)
         wb.Close(False)
     finally:
