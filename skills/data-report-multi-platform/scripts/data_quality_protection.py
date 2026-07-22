@@ -8,7 +8,17 @@ from typing import Any, Iterable
 
 
 COST_TABLE_MAX_ROWS = 10_000
-COST_SOURCE_LOG_PREFIX = "成本来源,"
+COST_SOURCE_LOG_COLUMNS = (
+    "平台",
+    "行类型",
+    "日期",
+    "店铺名称",
+    "商品ID",
+    "样式ID",
+    "订单规格编码",
+    "产品成本",
+    "成本来源",
+)
 COST_TABLE_CODE_CANDIDATES = (
     "商品编码",
     "商品SKU名称",
@@ -122,6 +132,7 @@ def marketing_price_warnings(rows: Iterable[dict[str, Any]]) -> list[str]:
 def cost_source_log(
     *,
     platform: str,
+    row_type: str,
     date: str,
     shop: str,
     product_id: str,
@@ -129,10 +140,15 @@ def cost_source_log(
     order_spec_code: str,
     cost: Any,
     source: str,
-) -> str:
-    return (
-        f"{COST_SOURCE_LOG_PREFIX}平台={platform},日期={date or '未提供'},"
-        f"店铺={shop or '未提供'},商品ID={product_id or '未提供'},"
-        f"样式ID={style_id or '未提供'},订单规格编码={order_spec_code or '未提供'},"
-        f"成本={text(cost) or '未匹配'},来源={source}"
-    )
+) -> dict[str, str]:
+    return {
+        "平台": platform,
+        "行类型": row_type,
+        "日期": date or "未提供",
+        "店铺名称": shop or "未提供",
+        "商品ID": product_id or "未提供",
+        "样式ID": style_id or "未提供",
+        "订单规格编码": order_spec_code or "未提供",
+        "产品成本": text(cost) or "未匹配",
+        "成本来源": source,
+    }

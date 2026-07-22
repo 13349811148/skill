@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from data_quality_protection import (
-    COST_SOURCE_LOG_PREFIX,
+    COST_SOURCE_LOG_COLUMNS,
     COST_TABLE_CODE_CANDIDATES,
     COST_TABLE_MAX_ROWS,
     ORDER_SPEC_CODE_CANDIDATES,
@@ -1103,7 +1103,7 @@ def build_report(
     target_dates: set[str],
     cost_table_path: Path = DEFAULT_COST_TABLE,
     small_receipt_action: str = "confirm",
-) -> tuple[list[str], list[dict[str, Any]], list[str]]:
+) -> tuple[list[str], list[dict[str, Any]], list[str], list[dict[str, str]]]:
     columns = read_template_columns()
     marketing_rows = load_marketing_rows(marketing_path)
     marketing_warnings = duplicate_identifier_warnings(
@@ -1143,7 +1143,7 @@ def build_report(
     negative_gross_missing_price_product_ids: set[str] = set()
     arrival_price_warnings: list[str] = []
     cost_data_warnings: list[str] = []
-    cost_source_logs: list[str] = []
+    cost_source_logs: list[dict[str, str]] = []
     for key, aggregate in order_rows.items():
         date, _style_id = key
         style_id = text(aggregate.get("样式ID"))
@@ -1204,6 +1204,7 @@ def build_report(
         cost_source_logs.append(
             cost_source_log(
                 platform="拼多多",
+                row_type="正常销售",
                 date=date,
                 shop=text(row.get("店铺名称")),
                 product_id=product_id,
@@ -1266,6 +1267,7 @@ def build_report(
         cost_source_logs.append(
             cost_source_log(
                 platform="拼多多",
+                row_type="空烧推广费",
                 date=date,
                 shop=text(empty_burn_row.get("店铺名称")),
                 product_id=product_id,
@@ -1303,7 +1305,6 @@ def build_report(
         + product_warnings
         + arrival_price_warnings
         + cost_data_warnings
-        + cost_source_logs
         + empty_burn_warnings
     )
     for product_id in sorted(negative_gross_missing_price_product_ids):
@@ -1321,7 +1322,7 @@ def build_report(
             )
     if not output_rows:
         warnings.append(f"没有生成明细行,请检查指定日期是否有有效订单: {','.join(sorted(target_dates))}")
-    return columns, output_rows, warnings
+    return columns, output_rows, warnings, cost_source_logs
 
 
 def write_workbook(path: Path, columns: list[str], rows: list[dict[str, Any]]) -> None:
@@ -1406,8 +1407,16 @@ def write_log(path: Path, rows_count: int, warnings: list[str]) -> None:
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         writer.writerow([now, "info", f"generated_rows={rows_count}"])
         for warning in warnings:
-            level = "info" if warning.startswith(COST_SOURCE_LOG_PREFIX) else "warning"
-            writer.writerow([now, level, warning])
+            writer.writerow([now, "warning", warning])
+
+
+def write_cost_log(path: Path, cost_source_logs: list[dict[str, str]]) -> Path:
+    log_path = path.with_name(path.stem + "_成本获取日志.csv")
+    with log_path.open("w", encoding="utf-8-sig", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=COST_SOURCE_LOG_COLUMNS)
+        writer.writeheader()
+        writer.writerows(cost_source_logs)
+    return log_path
 
 
 def print_arrival_price_dialogue_reminders(warnings: list[str]) -> None:
@@ -1453,7 +1462,7 @@ def main() -> int:
         raise ReportError(f"成本表不存在: {cost_table_path}")
 
     target_dates = requested_dates_from_args(args)
-    columns, rows, warnings = build_report(
+    columns, rows, warnings, cost_source_logs = build_report(
         database_root,
         marketing_path,
         target_dates,
@@ -1462,14 +1471,15 @@ def main() -> int:
     )
     write_workbook(output_path, columns, rows)
     write_log(output_path, len(rows), warnings)
+    cost_log_path = write_cost_log(output_path, cost_source_logs)
     print(f"输出文件: {output_path}")
+    print(f"成本获取日志: {cost_log_path}")
     print(f"统计日期: {', '.join(sorted(target_dates))}")
     print(f"生成行数: {len(rows)}")
     other_warnings = [
         warning
         for warning in warnings
         if not warning.startswith(ARRIVAL_PRICE_WARNING_PREFIX)
-        and not warning.startswith(COST_SOURCE_LOG_PREFIX)
     ]
     if other_warnings:
         print("提醒:")

@@ -46,7 +46,7 @@ Apply these rules to both platforms while leaving the existing refund and supple
 
 1. Use only an order specification-level merchant-code field such as `商家编码-规格维度`、`商家编码（规格维度）`、`规格维度商家编码`、`规格商家编码`、`SKU商家编码` or `SKU编码` for cost-table matching. Match it against a cost-table key column named `商品编码`、`商品SKU名称`、`商品SKU`、`SKU名称` or `SKU编码`. Normalize full-width characters, surrounding or embedded whitespace, and letter case before comparing while preserving the original values in logs.
 2. Read every cost-table worksheet up to the first `10,000` rows and `100` columns. Warn when a sheet exceeds this limit. Accept a positive numeric cost from `6.11成本价`、`成本价`、`产品成本` or `成本`; never convert a nonblank invalid value such as `待定` into zero. Stop if the cost workbook cannot be read or contains no usable positive cost.
-3. Use costs in this order: matching cost-table record; unique marketing-activity `样式ID`; exact `商品ID + 商品SKU`; same-product fallback; otherwise blank. Carry `项目组`、`管理类型`、`品种`、`产线` from a matched cost-table record for both platforms. For every normal and empty-burn output row, write an info record to the generation log showing platform, date, shop, product ID, style ID, order specification code, selected cost, and exact cost source.
+3. Use costs in this order: matching cost-table record; unique marketing-activity `样式ID`; exact `商品ID + 商品SKU`; same-product fallback; otherwise blank. Carry `项目组`、`管理类型`、`品种`、`产线` from a matched cost-table record for both platforms. For every normal and empty-burn output row, write one structured record to the standalone `<日报文件名>_成本获取日志.csv` with `平台`、`行类型`、`日期`、`店铺名称`、`商品ID`、`样式ID`、`订单规格编码`、`产品成本` and exact `成本来源`. Mark the row type as `正常销售` or `空烧推广费`. Never copy these row-level cost amounts or cost-source records into the generation log or any other log.
 4. Treat marketing-activity `样式ID` as unique. If it repeats, continue with the current last-record behavior but prominently warn the user and write the duplicate value and count to the log. Likewise warn when normalized cost-table matching codes repeat.
 5. Treat an activity as a subsidy activity only when both prices are valid numbers and `报名价 > 活动价`. If `报名价 < 活动价`, do not calculate a negative subsidy; warn that the marketing data is probably wrong and identify the affected style, product, SKU, and prices. Do not determine subsidy status from promotion-mechanism text.
 6. Deduplicate byte-for-byte identical order files, and when the same order line occurs across overlapping exports, keep the newest file by modification time using `店铺 + 订单号 + 样式ID + 商品ID + 商品SKU + 规格编码`. Stop on an unreadable relevant order or promotion file, a required-field failure, or an invalid nonblank order/promotion number. Keep 商品ID as text when writing Excel so long identifiers never lose digits.
@@ -73,7 +73,7 @@ $env:PYTHONUTF8='1'
 python ".\scripts\build_report.py" --date 2026-07-14
 ```
 
-For a date range, append `--start-date YYYY-MM-DD --end-date YYYY-MM-DD`. Review the generated CSV log beside the selected platform’s output file.
+For a date range, append `--start-date YYYY-MM-DD --end-date YYYY-MM-DD`. Review the generated warning CSV log and the separate cost-acquisition CSV log beside the selected platform’s output file.
 
 ## Order Anomaly Confirmation
 
@@ -99,7 +99,7 @@ When the author gate cannot verify all three conditions or returns `PUBLISH_BLOC
 - `scripts/build_report.py`: Platform dispatcher.
 - `scripts/build_tmall_report.py`: 天猫 calculation rules.
 - `scripts/build_pdd_report.py`: 拼多多旧格式 calculation rules.
-- `scripts/data_quality_protection.py`: Shared strict-number, cost-code normalization, duplicate-warning, price-validation, and cost-source logging rules.
+- `scripts/data_quality_protection.py`: Shared strict-number, cost-code normalization, duplicate-warning, price-validation, and standalone cost-acquisition log rules.
 - `scripts/promotion_protection.py`: Shared daily-date integrity, promotion-snapshot deduplication, and input-output reconciliation safeguards.
 - `scripts/update-skills.ps1`: Check the shared public GitHub repository and transactionally update both Skills before business work.
 - `references/template_columns.csv`: Shared output-column order.
