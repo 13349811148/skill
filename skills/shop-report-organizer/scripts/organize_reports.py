@@ -124,6 +124,7 @@ class ExpectedReport:
 @dataclass
 class OrderFileScan:
     month_keys: set[str]
+    order_ids: set[str]
     read_rows: int
     valid_rows: int
     ignored_rows: int
@@ -1084,6 +1085,7 @@ def scan_order_file_full(path: Path, max_cols: int) -> OrderFileScan:
         )
 
     month_keys: set[str] = set()
+    order_ids: set[str] = set()
     read_rows = 0
     valid_rows = 0
     ignored_rows = 0
@@ -1120,6 +1122,7 @@ def scan_order_file_full(path: Path, max_cols: int) -> OrderFileScan:
             continue
         valid_rows += 1
         month_keys.add(parsed_time.strftime("%Y-%m"))
+        order_ids.add(order_id)
 
     if invalid_id_count:
         examples = "；".join(invalid_id_examples)
@@ -1140,18 +1143,57 @@ def scan_order_file_full(path: Path, max_cols: int) -> OrderFileScan:
         )
     if not month_keys:
         raise RuntimeError(f"订单文件没有有效订单行，停止整理并保留源文件：{path}")
-    return OrderFileScan(month_keys, read_rows, valid_rows, ignored_rows)
+    return OrderFileScan(month_keys, order_ids, read_rows, valid_rows, ignored_rows)
+
+
+def order_shop_existing_paths(database_root: Path, shop_name: str) -> list[Path]:
+    shop_root = (
+        database_root
+        / ORDER_REPORT_TYPE
+        / sanitize_filename_part(shop_name)
+    )
+    if not shop_root.exists():
+        return []
+    return sorted(
+        (
+            path
+            for path in shop_root.rglob("*")
+            if path.is_file()
+            and path.suffix.lower() in SUPPORTED_EXTENSIONS
+            and is_cumulative_order_source_name(path.name)
+        ),
+        key=lambda item: str(item),
+    )
 
 
 def order_merge_paths_full(
     analysis: Analysis, database_root: Path, max_cols: int
 ) -> tuple[list[Path], OrderFileScan]:
     source_scan = scan_order_file_full(analysis.source, max_cols)
-    existing_paths: set[Path] = set()
-    for month_key in source_scan.month_keys:
-        target_dir = order_data_folder(database_root, analysis.shop_name, month_key)
-        existing_paths.update(order_data_existing_paths(target_dir))
-    merge_paths = sorted(existing_paths, key=lambda item: item.name)
+    target_dirs = {
+        order_data_folder(database_root, analysis.shop_name, month_key).resolve()
+        for month_key in source_scan.month_keys
+    }
+    paths_by_month_dir: dict[Path, list[Path]] = {}
+    for path in order_shop_existing_paths(database_root, analysis.shop_name):
+        paths_by_month_dir.setdefault(path.parent.resolve(), []).append(path)
+
+    impacted_dirs = set(target_dirs & set(paths_by_month_dir))
+    for month_dir, paths in paths_by_month_dir.items():
+        if month_dir in impacted_dirs:
+            continue
+        for path in paths:
+            existing_scan = scan_order_file_full(path, max_cols)
+            if source_scan.order_ids & existing_scan.order_ids:
+                impacted_dirs.add(month_dir)
+                break
+
+    existing_paths = {
+        path
+        for month_dir in impacted_dirs
+        for path in paths_by_month_dir.get(month_dir, [])
+    }
+    merge_paths = sorted(existing_paths, key=lambda item: str(item))
     merge_paths.append(analysis.source)
     return merge_paths, source_scan
 
@@ -1186,7 +1228,7 @@ def create_order_merge_database(path: Path) -> sqlite3.Connection:
             sort_time TEXT NOT NULL,
             source_time TEXT NOT NULL,
             record_json TEXT NOT NULL,
-            PRIMARY KEY (month_key, order_id)
+            PRIMARY KEY (order_id)
         )
         """
     )
@@ -1283,36 +1325,45 @@ def load_order_merge_database(
             if cursor.rowcount == 0:
                 duplicate_rows += 1
                 old_row = connection.execute(
-                    "SELECT sort_time, source_time, record_json FROM order_records "
-                    "WHERE month_key=? AND order_id=?",
-                    (month_key, order_id),
+                    "SELECT month_key, sort_time, source_time, record_json "
+                    "FROM order_records WHERE order_id=?",
+                    (order_id,),
                 ).fetchone()
                 if old_row is None:
                     raise RuntimeError(
-                        f"订单去重记录读取失败：月份={month_key}，订单号={order_id}"
+                        f"订单去重记录读取失败：订单号={order_id}"
                     )
-                old_sort_time, old_source_time, old_record_json = old_row
+                old_month_key, old_sort_time, old_source_time, old_record_json = old_row
                 old_record = json.loads(old_record_json)
+                merged_headers: list[str] = []
+                append_headers(merged_headers, month_headers.get(old_month_key, []))
+                append_headers(merged_headers, final_headers)
+                append_headers(merged_headers, ORDER_SUMMARY_METADATA_HEADERS)
                 if source_time >= old_source_time:
                     merged_record = merge_order_summary_record(
-                        old_record, record, final_headers
+                        old_record, record, merged_headers
                     )
+                    latest_month_key = month_key
                     latest_sort_time = parsed_time.isoformat()
                     latest_source_time = source_time
                 else:
                     merged_record = merge_order_summary_record(
-                        record, old_record, final_headers
+                        record, old_record, merged_headers
                     )
+                    latest_month_key = old_month_key
                     latest_sort_time = old_sort_time
                     latest_source_time = old_source_time
+                append_headers(
+                    month_headers.setdefault(latest_month_key, []), merged_headers
+                )
                 connection.execute(
-                    "UPDATE order_records SET sort_time=?, source_time=?, record_json=? "
-                    "WHERE month_key=? AND order_id=?",
+                    "UPDATE order_records SET month_key=?, sort_time=?, source_time=?, "
+                    "record_json=? WHERE order_id=?",
                     (
+                        latest_month_key,
                         latest_sort_time,
                         latest_source_time,
                         json.dumps(merged_record, ensure_ascii=False, separators=(",", ":")),
-                        month_key,
                         order_id,
                     ),
                 )
@@ -1376,6 +1427,8 @@ def stage_order_outputs(
                 "SELECT COUNT(*) FROM order_records WHERE month_key=?", (month_key,)
             ).fetchone()[0]
         )
+        if total_rows == 0:
+            continue
         base_path = order_data_folder(database_root, shop_name, month_key) / (
             f"{order_data_filename(shop_name, month_key)}.xlsx"
         )
@@ -1635,7 +1688,7 @@ def merge_order_rows_by_month(
 ) -> dict[str, tuple[list[str], list[list[str]]]]:
     del max_rows  # Preview-only guard; formal cumulative merging reads every row.
     month_headers: dict[str, list[str]] = {}
-    month_records: dict[str, dict[str, dict[str, str]]] = {}
+    records_by_order_id: dict[str, tuple[str, dict[str, str]]] = {}
 
     for path in sorted(paths, key=lambda item: (order_source_datetime(item), item.name)):
         rows = list(iter_rows_full(path, max_cols))
@@ -1673,16 +1726,33 @@ def merge_order_rows_by_month(
             final_headers = month_headers.setdefault(month_key, [])
             append_headers(final_headers, [header for header in headers if header not in ORDER_SUMMARY_METADATA_HEADERS])
             append_headers(final_headers, ORDER_SUMMARY_METADATA_HEADERS)
-            records = month_records.setdefault(month_key, {})
             record = row_to_dict(headers, row)
             record["汇总_店铺名称"] = shop_name
             record["汇总_最新下载时间"] = source_time
             record["汇总_最新来源文件"] = path.name
             record["汇总_最新归档文件"] = ""
-            if order_id in records:
-                records[order_id] = merge_order_summary_record(records[order_id], record, final_headers)
+            if order_id in records_by_order_id:
+                old_month_key, old_record = records_by_order_id[order_id]
+                merged_headers: list[str] = []
+                append_headers(merged_headers, month_headers.get(old_month_key, []))
+                append_headers(merged_headers, final_headers)
+                append_headers(final_headers, merged_headers)
+                records_by_order_id[order_id] = (
+                    month_key,
+                    merge_order_summary_record(old_record, record, merged_headers),
+                )
             else:
-                records[order_id] = {header: normalize_text(record.get(header, "")) for header in final_headers}
+                records_by_order_id[order_id] = (
+                    month_key,
+                    {
+                        header: normalize_text(record.get(header, ""))
+                        for header in final_headers
+                    },
+                )
+
+    month_records: dict[str, dict[str, dict[str, str]]] = {}
+    for order_id, (month_key, record) in records_by_order_id.items():
+        month_records.setdefault(month_key, {})[order_id] = record
 
     result: dict[str, tuple[list[str], list[list[str]]]] = {}
     for month_key, records in month_records.items():
