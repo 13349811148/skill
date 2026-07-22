@@ -737,20 +737,23 @@ def date_range_from_filename(path: Path) -> tuple[str, str] | None:
     return None
 
 
+def file_creation_datetime(path: Path) -> dt.datetime:
+    stat_result = path.stat()
+    if hasattr(stat_result, "st_birthtime"):
+        timestamp = stat_result.st_birthtime
+    elif os.name == "nt":
+        timestamp = stat_result.st_ctime
+    else:
+        timestamp = stat_result.st_mtime
+    return dt.datetime.fromtimestamp(timestamp)
+
+
 def download_date(path: Path) -> dt.date:
-    try:
-        timestamp = path.stat().st_ctime
-    except OSError:
-        timestamp = path.stat().st_mtime
-    return dt.datetime.fromtimestamp(timestamp).date()
+    return file_creation_datetime(path).date()
 
 
 def download_datetime(path: Path) -> dt.datetime:
-    try:
-        timestamp = path.stat().st_ctime
-    except OSError:
-        timestamp = path.stat().st_mtime
-    return dt.datetime.fromtimestamp(timestamp)
+    return file_creation_datetime(path)
 
 
 def decide_period(
@@ -971,10 +974,36 @@ def order_data_existing_paths(target_dir: Path) -> list[Path]:
 
 
 def order_source_datetime(path: Path) -> dt.datetime:
-    parsed = parse_date(path.name)
-    if parsed:
-        return dt.datetime.combine(parsed, dt.time.min)
     return download_datetime(path)
+
+
+def is_cumulative_order_source_name(value: object) -> bool:
+    source_name = normalize_text(value)
+    if not source_name:
+        return False
+    return bool(
+        re.search(
+            rf"{re.escape(ORDER_DATA_PREFIX)}20\d{{2}}年\d{{1,2}}月(?:_第\d+部分)?",
+            Path(source_name).name,
+        )
+    )
+
+
+def saved_order_source_datetime(
+    record: dict[str, str], cumulative_path: Path
+) -> dt.datetime | None:
+    saved_time = parse_datetime_text(record.get("汇总_最新下载时间", ""))
+    saved_source = Path(normalize_text(record.get("汇总_最新来源文件", ""))).name
+    saved_archive = Path(normalize_text(record.get("汇总_最新归档文件", ""))).name
+    if saved_time is None or not saved_source:
+        return None
+    if (
+        saved_source == cumulative_path.name
+        or (saved_archive and saved_source == saved_archive)
+        or is_cumulative_order_source_name(saved_source)
+    ):
+        return None
+    return saved_time
 
 
 def parse_datetime_text(value: object) -> dt.datetime | None:
@@ -1086,10 +1115,8 @@ def order_merge_paths_full(
     for month_key in source_scan.month_keys:
         target_dir = order_data_folder(database_root, analysis.shop_name, month_key)
         existing_paths.update(order_data_existing_paths(target_dir))
-    merge_paths = sorted(
-        {*existing_paths, analysis.source},
-        key=lambda item: (order_source_datetime(item), item.name),
-    )
+    merge_paths = sorted(existing_paths, key=lambda item: item.name)
+    merge_paths.append(analysis.source)
     return merge_paths, source_scan
 
 
@@ -1121,6 +1148,7 @@ def create_order_merge_database(path: Path) -> sqlite3.Connection:
             month_key TEXT NOT NULL,
             order_id TEXT NOT NULL,
             sort_time TEXT NOT NULL,
+            source_time TEXT NOT NULL,
             record_json TEXT NOT NULL,
             PRIMARY KEY (month_key, order_id)
         )
@@ -1132,6 +1160,7 @@ def create_order_merge_database(path: Path) -> sqlite3.Connection:
 def load_order_merge_database(
     connection: sqlite3.Connection,
     paths: list[Path],
+    current_source: Path,
     shop_name: str,
     max_cols: int,
 ) -> tuple[dict[str, list[str]], int, int, int, int]:
@@ -1152,7 +1181,12 @@ def load_order_merge_database(
         time_columns = order_time_columns(headers)
         if order_index is None or not time_columns:
             raise RuntimeError(f"订单文件缺少订单号或可用时间列：{path}")
-        source_time = order_source_datetime(path).strftime("%Y-%m-%d %H:%M:%S")
+        is_current_source = path.resolve() == current_source.resolve()
+        current_file_creation_time = (
+            file_creation_datetime(path).strftime("%Y-%m-%d %H:%M:%S")
+            if is_current_source
+            else ""
+        )
         path_read = 0
         path_valid = 0
         path_ignored = 0
@@ -1186,29 +1220,57 @@ def load_order_merge_database(
             if not order_id:
                 order_id = f"_row_{path.resolve()}_{row_number}"
             record = row_to_dict(headers, row)
+            if is_current_source:
+                source_time = current_file_creation_time
+                record["汇总_最新下载时间"] = source_time
+                record["汇总_最新来源文件"] = path.name
+            else:
+                saved_source_time = saved_order_source_datetime(record, path)
+                source_time = (
+                    saved_source_time.strftime("%Y-%m-%d %H:%M:%S")
+                    if saved_source_time
+                    else ""
+                )
             record["汇总_店铺名称"] = shop_name
-            record["汇总_最新下载时间"] = source_time
-            record["汇总_最新来源文件"] = path.name
             record["汇总_最新归档文件"] = ""
             record_json = json.dumps(record, ensure_ascii=False, separators=(",", ":"))
             cursor = connection.execute(
                 "INSERT OR IGNORE INTO order_records "
-                "(month_key, order_id, sort_time, record_json) VALUES (?, ?, ?, ?)",
-                (month_key, order_id, parsed_time.isoformat(), record_json),
+                "(month_key, order_id, sort_time, source_time, record_json) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (month_key, order_id, parsed_time.isoformat(), source_time, record_json),
             )
             if cursor.rowcount == 0:
                 duplicate_rows += 1
                 old_row = connection.execute(
-                    "SELECT record_json FROM order_records WHERE month_key=? AND order_id=?",
+                    "SELECT sort_time, source_time, record_json FROM order_records "
+                    "WHERE month_key=? AND order_id=?",
                     (month_key, order_id),
                 ).fetchone()
-                old_record = json.loads(old_row[0]) if old_row else {}
-                merged_record = merge_order_summary_record(old_record, record, final_headers)
+                if old_row is None:
+                    raise RuntimeError(
+                        f"订单去重记录读取失败：月份={month_key}，订单号={order_id}"
+                    )
+                old_sort_time, old_source_time, old_record_json = old_row
+                old_record = json.loads(old_record_json)
+                if source_time >= old_source_time:
+                    merged_record = merge_order_summary_record(
+                        old_record, record, final_headers
+                    )
+                    latest_sort_time = parsed_time.isoformat()
+                    latest_source_time = source_time
+                else:
+                    merged_record = merge_order_summary_record(
+                        record, old_record, final_headers
+                    )
+                    latest_sort_time = old_sort_time
+                    latest_source_time = old_source_time
                 connection.execute(
-                    "UPDATE order_records SET sort_time=?, record_json=? "
+                    "UPDATE order_records SET sort_time=?, source_time=?, record_json=? "
                     "WHERE month_key=? AND order_id=?",
                     (
-                        parsed_time.isoformat(),
+                        latest_sort_time,
+                        latest_source_time,
                         json.dumps(merged_record, ensure_ascii=False, separators=(",", ":")),
                         month_key,
                         order_id,
@@ -1601,6 +1663,7 @@ def merge_order_data(
             ) = load_order_merge_database(
                 connection,
                 merge_paths,
+                analysis.source,
                 analysis.shop_name,
                 max_cols,
             )

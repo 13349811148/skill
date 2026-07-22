@@ -158,7 +158,7 @@ Period detection:
 - `推广数据`: single-day files may be archived. A multi-day file may also be archived when the spreadsheet has a recognized date column, the non-summary data rows cover multiple valid dates, and every such row contains a valid product ID; use the actual full date range rather than the download date. The filename (including whether it contains `分天数据`) is not a condition. Other multi-day summary files, or files that fail either content check, must remain pending and must not be archived. The reminder must name the detected shop and say the shop may need to re-download promotion data by single day.
 - `商品数据`: use the download date as a one-day period when no content period exists.
 
-Download date is the Windows file creation date, falling back to modified date if creation date is unavailable.
+Download date comes from the source file's filesystem creation time: use `st_birthtime` on macOS and the Windows creation time on Windows; fall back to modified time only when the platform has no creation-time field. Dates written in filenames never replace the filesystem creation time.
 
 ## Order Data Monthly Merge
 
@@ -178,7 +178,9 @@ Rules:
 - Keep each `.xlsx` worksheet within Excel's limit of 1,048,576 total rows including the header. When one shop-month exceeds 1,048,575 data rows, split it into sequential files named `..._第01部分.xlsx`, `..._第02部分.xlsx`, and so on, and print every part with its row count.
 - Keep one cumulative order table per shop per transaction month. If one downloaded order report contains multiple transaction months, split its rows into the matching monthly tables.
 - Use `订单号` as the Pinduoduo unique key. For Tmall use `子订单编号`, falling back to `主订单编号`.
-- When the same order appears in multiple downloaded order reports, keep one row and update ordinary fields from the latest downloaded report. This keeps fields such as `订单状态` current.
+- Original order reports do not need or contain a download-time column. For each raw order report, read its filesystem creation time and write that value to `汇总_最新下载时间`; never use a date parsed from the filename to decide report freshness.
+- When the same order appears in multiple downloaded order reports, compare the source creation time per order and keep ordinary fields from the latest source. When reading an existing cumulative monthly table, reuse each row's saved `汇总_最新下载时间` and `汇总_最新来源文件`; never use the cumulative workbook's own creation time as the row's source time. If two raw sources have the same creation time, the current input wins.
+- Treat a legacy cumulative row as having unknown source time when its saved source is empty, names the cumulative workbook itself, or otherwise uses the cumulative monthly filename pattern. Keep that historical row, but let any newly downloaded raw report with the same order ID win ordinary fields and replace the legacy metadata with the raw file's creation time and filename.
 - Protect buyer receiving information fields from encrypted later reports. For fields such as `消费者资料`, `省`, `市`, `区`, `用户购买手机号`, `收件/收货地址`, `手机号`, and `电话`, if the latest report value is empty or contains `*`, `＊`, or `加密`, keep the old unmasked value in the monthly table. This avoids losing address/contact details after an order changes from `待发货` or `已发货` to `已收货` or `已收货已退款`.
 - Keep all source order-report columns, and append metadata columns:
   - `汇总_店铺名称`
