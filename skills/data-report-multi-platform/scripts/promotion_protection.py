@@ -36,19 +36,17 @@ class PromotionSnapshotRow:
     platform: str
     shop: str
     promotion_type: str
-    plan_id: str
     date: str
     product_id: str
     amount: float
     source_path: Path
 
     @property
-    def business_key(self) -> tuple[str, str, str, str, str, str]:
+    def business_key(self) -> tuple[str, str, str, str, str]:
         return (
             self.platform,
             self.shop or UNKNOWN_DIMENSION,
             self.promotion_type,
-            self.plan_id or UNKNOWN_DIMENSION,
             self.date,
             self.product_id,
         )
@@ -98,8 +96,10 @@ def infer_path_dimensions(
         if part not in GENERIC_PATH_PARTS and not dates_in_text(part)
     ]
     shop = meaningful[0] if meaningful else ""
-    plan_id = "/".join(meaningful[1:]) if len(meaningful) > 1 else ""
-    return shop, plan_id
+    # The archive's year/month folders are not promotion-plan identities.
+    # Keep the second return value only for backward-compatible callers; the
+    # report workflow never reads or matches a plan ID.
+    return shop, ""
 
 
 def _file_rank(path: Path) -> tuple[int, str]:
@@ -148,7 +148,7 @@ def select_latest_snapshots(
     rows: Iterable[PromotionSnapshotRow],
 ) -> tuple[dict[tuple[str, str], float], list[str]]:
     per_source: dict[
-        tuple[str, str, str, str, str, str], dict[Path, float]
+        tuple[str, str, str, str, str], dict[Path, float]
     ] = defaultdict(lambda: defaultdict(float))
     for row in rows:
         per_source[row.business_key][row.source_path] += row.amount
@@ -156,24 +156,24 @@ def select_latest_snapshots(
     costs: dict[tuple[str, str], float] = defaultdict(float)
     warnings: list[str] = []
     for business_key, source_amounts in per_source.items():
-        platform, shop, promotion_type, plan_id, date, product_id = business_key
+        platform, shop, promotion_type, date, product_id = business_key
         if len(source_amounts) == 1:
             selected_path, amount = next(iter(source_amounts.items()))
         else:
-            if shop == UNKNOWN_DIMENSION or plan_id == UNKNOWN_DIMENSION:
+            if shop == UNKNOWN_DIMENSION:
                 sources = "|".join(str(path) for path in sorted(source_amounts))
                 raise PromotionProtectionError(
                     "推广快照无法安全去重，已停止生成日报："
                     f"平台={platform}，推广类型={promotion_type}，日期={date}，商品ID={product_id}，"
-                    f"店铺={shop}，计划ID={plan_id}，重复来源={sources}。"
-                    "请在推广表补充店铺与计划ID，或只保留一份明确的最新快照。"
+                    f"店铺={shop}，重复来源={sources}。"
+                    "请补充店铺信息，或只保留一份明确的最新快照。"
                 )
             selected_path = max(source_amounts, key=_file_rank)
             amount = source_amounts[selected_path]
             ignored = [path for path in source_amounts if path != selected_path]
             warnings.append(
                 "推广重复快照已去重，保留最新文件,"
-                f"平台={platform},店铺={shop},推广类型={promotion_type},计划ID={plan_id},"
+                f"平台={platform},店铺={shop},推广类型={promotion_type},"
                 f"日期={date},商品ID={product_id},保留={selected_path},忽略="
                 + "|".join(str(path) for path in sorted(ignored))
             )

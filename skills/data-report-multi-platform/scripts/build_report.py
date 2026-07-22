@@ -7,6 +7,8 @@ import sys
 from pathlib import Path
 
 import build_tmall_report
+import build_pdd_report
+from handoff_protection import find_header_row, is_excluded_order_path
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -17,9 +19,6 @@ PLATFORM_SCRIPTS = {
 
 DEFAULT_DATABASE_ROOT = Path(os.environ.get("USERPROFILE", str(Path.home()))) / "Desktop" / "运营数据库"
 ORDER_FILE_EXTENSIONS = {".xls", ".xlsx", ".csv"}
-TMALL_HEADER_SIGNALS = {"宝贝id", "交易状态", "订单付款时间", "订单创建时间", "skuid", "sku_id"}
-PDD_REQUIRED_SIGNALS = {"样式id", "订单成交时间"}
-PDD_DISTINCT_SIGNALS = {"多多支付立减金额(元)", "团id"}
 
 
 def option_value(arguments: list[str], option: str, default: str) -> str:
@@ -42,22 +41,20 @@ def detect_platforms(database_root: Path) -> set[str]:
             not path.is_file()
             or path.suffix.lower() not in ORDER_FILE_EXTENSIONS
             or path.name.startswith("~$")
-            or "_合并前备份" in str(path)
+            or is_excluded_order_path(path)
         ):
             continue
         try:
-            rows = build_tmall_report.read_workbook(
-                path, max_rows=build_tmall_report.ORDER_MAX_ROWS
-            ).rows
+            sheets = build_tmall_report.read_workbook_sheets(
+                path, max_rows=20
+            )
         except Exception:
             continue
-        if not rows:
-            continue
-        headers = {build_tmall_report.normalize_header(value) for value in rows[0]}
-        if headers & TMALL_HEADER_SIGNALS:
-            detected.add("tmall")
-        if PDD_REQUIRED_SIGNALS <= headers and headers & PDD_DISTINCT_SIGNALS:
-            detected.add("pdd")
+        for sheet in sheets:
+            if find_header_row(sheet.rows, build_tmall_report.is_tmall_order_headers) is not None:
+                detected.add("tmall")
+            if find_header_row(sheet.rows, build_pdd_report.is_pdd_order_headers) is not None:
+                detected.add("pdd")
     return detected
 
 
