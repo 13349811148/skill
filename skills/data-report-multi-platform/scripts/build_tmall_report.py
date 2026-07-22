@@ -64,6 +64,20 @@ def text(value: Any) -> str:
     return str(value).strip()
 
 
+def order_output_rows(
+    normal_rows: list[dict[str, Any]],
+    empty_burn_rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Keep all empty-burn promotion rows at the absolute bottom."""
+    sort_key = lambda row: (
+        text(row.get("日期")),
+        text(row.get("店铺名称")),
+        text(row.get("商品ID")),
+        text(row.get("商品SKU")),
+    )
+    return sorted(normal_rows, key=sort_key) + sorted(empty_burn_rows, key=sort_key)
+
+
 def number(value: Any) -> float:
     if value is None or value == "":
         return 0.0
@@ -1144,6 +1158,7 @@ def build_report(
                 row["定价是否合理"] = "合理"
         output_rows.append({column: row.get(column, "") for column in columns})
 
+    empty_burn_rows: list[dict[str, Any]] = []
     empty_burn_warnings: list[str] = []
     for date, product_id in empty_burn_keys:
         component_fees = {
@@ -1158,12 +1173,12 @@ def build_report(
             template_styles,
             product_exports,
         )
-        output_rows.append({column: empty_burn_row.get(column, "") for column in columns})
+        empty_burn_rows.append({column: empty_burn_row.get(column, "") for column in columns})
         empty_burn_warnings.append(
             f"空烧推广费已写入报表,无有效销售,{date},{product_id},{sum(component_fees.values()):.2f}"
         )
 
-    output_rows.sort(key=lambda r: (text(r.get("日期")), text(r.get("店铺名称")), text(r.get("商品ID")), text(r.get("商品SKU"))))
+    output_rows = order_output_rows(output_rows, empty_burn_rows)
     warnings = (
         order_warnings
         + wanxiang_warnings
