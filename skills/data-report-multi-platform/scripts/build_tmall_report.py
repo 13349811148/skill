@@ -11,6 +11,17 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from promotion_protection import (
+    PromotionProtectionError,
+    PromotionSnapshotRow,
+    date_bounds_from_filename,
+    deduplicate_exact_files,
+    infer_path_dimensions,
+    reconcile_promotion_costs,
+    require_single_day_value,
+    select_latest_snapshots,
+)
+
 try:
     import win32com.client as win32
 except Exception as exc:  # pragma: no cover - environment guard
@@ -38,6 +49,18 @@ ORDER_MAX_ROWS = 100_000
 SMALL_RECEIPT_UPPER_BOUND = 1.0
 COST_LOW_DEVIATION_THRESHOLD = 0.10
 SMALL_RECEIPT_ACTIONS = ("confirm", "include", "exclude")
+PROMOTION_SHOP_CANDIDATES = ("店铺名称", "店铺", "汇总_店铺名称", "店铺名")
+PROMOTION_PLAN_CANDIDATES = (
+    "计划ID",
+    "推广计划ID",
+    "计划编号",
+    "计划名称",
+    "推广计划名称",
+    "单元ID",
+    "推广单元ID",
+    "单元名称",
+    "推广单元名称",
+)
 
 SKILL_ROOT = Path(__file__).resolve().parents[1]
 COLUMNS_CSV = SKILL_ROOT / "references" / "template_columns.csv"
@@ -765,13 +788,8 @@ def load_order_aggregates(
 
 
 def promo_date_from_filename(path: Path) -> str:
-    match = re.search(r"(20\d{2})-(\d{2})-(\d{2})至\1-\2-\3", path.name)
-    if match:
-        return f"{match.group(1)}-{match.group(2)}-{match.group(3)}"
-    match = re.search(r"(20\d{2})-(\d{2})-(\d{2})", path.name)
-    if match:
-        return f"{match.group(1)}-{match.group(2)}-{match.group(3)}"
-    return ""
+    start_date, _end_date = date_bounds_from_filename(path)
+    return start_date
 
 
 def is_brand_enjoy(value: Any) -> bool:
@@ -801,10 +819,14 @@ def load_promo_costs(
     cost_candidates: list[str] | None = None,
     source_markers: list[str] | None = None,
 ) -> tuple[dict[tuple[str, str], float], list[str]]:
-    costs: dict[tuple[str, str], float] = defaultdict(float)
     warnings: list[str] = []
-    for path in promotion_files(root, promotion_dir, is_brand_enjoy_channel):
-        file_date = promo_date_from_filename(path)
+    snapshot_rows: list[PromotionSnapshotRow] = []
+    promotion_paths, duplicate_warnings = deduplicate_exact_files(
+        promotion_files(root, promotion_dir, is_brand_enjoy_channel), fee_name
+    )
+    warnings.extend(duplicate_warnings)
+    for path in promotion_paths:
+        file_start_date, file_end_date = date_bounds_from_filename(path)
         try:
             rows = rows_to_dicts(read_workbook(path).rows)
         except Exception as exc:
@@ -833,17 +855,61 @@ def load_promo_costs(
             ],
         )
         date_col = find_col(headers, ["日期", "统计日期", "报表日期"])
+        shop_col = find_col(headers, list(PROMOTION_SHOP_CANDIDATES))
+        plan_col = find_col(headers, list(PROMOTION_PLAN_CANDIDATES))
         if not product_col or not cost_col:
             warnings.append(f"{fee_name}文件缺字段,{path},商品ID或花费")
             continue
+        if file_start_date and file_end_date and file_start_date != file_end_date and not date_col:
+            raise ReportError(
+                f"{fee_name}区间推广文件没有逐行日期，无法生成准确日报，已停止：{path}。"
+                "请使用含日期列的逐日明细，或改为单日推广文件。"
+            )
+        if not date_col and not file_start_date:
+            raise ReportError(
+                f"{fee_name}推广文件既没有日期列，文件名也没有单日日期，已停止：{path}。"
+            )
+        path_shop, path_plan_id = infer_path_dimensions(root, promotion_dir, path)
         for row in rows:
-            date = parse_date(row.get(date_col)) if date_col else file_date
-            if date not in target_dates:
+            amount = number(row.get(cost_col))
+            if abs(amount) <= 1e-12:
                 continue
             product_id = text(row.get(product_col))
             if not product_id or not product_id.isdigit():
+                raise ReportError(
+                    f"{fee_name}推广行有非零花费但商品ID无效，已停止：文件={path}，商品ID={product_id or '空'}，花费={amount:.2f}。"
+                )
+            if date_col:
+                try:
+                    require_single_day_value(row.get(date_col), path, date_col)
+                except PromotionProtectionError as exc:
+                    raise ReportError(str(exc)) from exc
+                date = parse_date(row.get(date_col))
+            else:
+                date = file_start_date
+            if not re.fullmatch(r"20\d{2}-\d{2}-\d{2}", date):
+                raise ReportError(
+                    f"{fee_name}推广行有非零花费但日期无效，已停止：文件={path}，日期={date or '空'}，商品ID={product_id}。"
+                )
+            if date not in target_dates:
                 continue
-            costs[(date, product_id)] += number(row.get(cost_col))
+            snapshot_rows.append(
+                PromotionSnapshotRow(
+                    platform="天猫",
+                    shop=text(row.get(shop_col)) if shop_col else path_shop,
+                    promotion_type=fee_name,
+                    plan_id=text(row.get(plan_col)) if plan_col else path_plan_id,
+                    date=date,
+                    product_id=product_id,
+                    amount=amount,
+                    source_path=path,
+                )
+            )
+    try:
+        costs, snapshot_warnings = select_latest_snapshots(snapshot_rows)
+    except PromotionProtectionError as exc:
+        raise ReportError(str(exc)) from exc
+    warnings.extend(snapshot_warnings)
     return costs, warnings
 
 
@@ -1179,6 +1245,11 @@ def build_report(
         )
 
     output_rows = order_output_rows(output_rows, empty_burn_rows)
+    expected_promotion_costs = merge_promo_cost_maps(*promotion_components.values())
+    try:
+        reconcile_promotion_costs(expected_promotion_costs, output_rows, "天猫")
+    except PromotionProtectionError as exc:
+        raise ReportError(str(exc)) from exc
     warnings = (
         order_warnings
         + wanxiang_warnings

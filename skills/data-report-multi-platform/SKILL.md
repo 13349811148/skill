@@ -32,6 +32,14 @@ Follow this order exactly. Do not skip a step, run a platform builder directly, 
 
 For both platforms, never transfer a product's promotion spend to another selling product. When promotion data exists for a `日期 + 商品ID` but that product has no effective sales amount for the date, add one independent `空烧推广费` row for that product and date. Keep the promotion fee and every product, shop, category, cost, and activity field that can be matched safely; write both `实际成交数量（去退款去补单后）` and `实际成交金额（去退款去补单后）` as `0`, write net sales and gross profit as `0`, and write net profit as the negative promotion fee. If a product has multiple SKUs and the promotion export does not identify one, leave `商品SKU` blank instead of assigning the spend to an arbitrary SKU. Mark `备注` as `空烧推广费：无有效销售`, retain the three Tmall promotion-component amounts in the Tmall remark, and record the generated empty-burn row in the generation log. Keep every normal sales row before every empty-burn row; place the complete empty-burn group at the absolute bottom of the output table, then sort that bottom group by `日期`、`店铺名称`、`商品ID`、`商品SKU`.
 
+## Promotion Matching Protection
+
+Apply all three safeguards before writing either platform workbook. A failure in any safeguard must stop report generation; never silently skip an invalid nonzero promotion row or continue with an unreconciled amount.
+
+1. **Daily date integrity**: Use a row-level `日期`、`统计日期` or `报表日期` value when the promotion export provides one. Every nonzero-spend row must resolve to exactly one calendar day. Do not require one row for every calendar day in the requested range: a day with no promotion spend may be completely absent. For example, a 1–3 day export containing dated spend rows only for day 1 and day 3 is valid when day 2 had no spend. Never assign a multi-day export total to the range's first date. If the filename or date cell covers multiple days and the file has no single-day detail for every nonzero-spend row, stop and ask for a daily-detail export. This rule applies especially to Pinduoduo recent-seven-day promotion exports.
+2. **Promotion snapshot deduplication**: First remove byte-for-byte duplicate files by SHA-256 and keep the newest copy. Then aggregate rows within each source file by `平台 + 店铺 + 推广类型 + 计划ID + 日期 + 商品ID`. If the same complete business key occurs in multiple source files, keep only the newest file by modification time and write the ignored files to the generation log. If missing `店铺` or `计划ID` makes overlapping snapshots ambiguous, stop and ask the user to provide those dimensions or retain only one clearly newest snapshot; never add ambiguous snapshots together.
+3. **Input-output reconciliation**: Immediately before workbook writing, reconcile every deduplicated imported promotion amount against the sum of `推广费用` in all normal sales rows plus all `空烧推广费` rows, first by `日期 + 商品ID` and then in total. The maximum permitted absolute difference is `0.01` yuan. If any key or the total exceeds this tolerance, stop, show the imported amount, output amount, and difference, and do not produce the workbook.
+
 Treat an activity as a subsidy activity only when both `活动价` and `报名价` are present and their values differ. Do not determine subsidy status from the promotion-mechanism text.
 
 For both platform outputs, display `实际成交数量（去退款去补单后）` as an integer, `每单补贴金额` and `总补贴金额` as numbers with two decimal places, and `毛利率` as a percentage.
@@ -81,5 +89,6 @@ When the author gate cannot verify all three conditions or returns `PUBLISH_BLOC
 - `scripts/build_report.py`: Platform dispatcher.
 - `scripts/build_tmall_report.py`: 天猫 calculation rules.
 - `scripts/build_pdd_report.py`: 拼多多旧格式 calculation rules.
+- `scripts/promotion_protection.py`: Shared daily-date integrity, promotion-snapshot deduplication, and input-output reconciliation safeguards.
 - `scripts/update-skills.ps1`: Check the shared public GitHub repository and transactionally update both Skills before business work.
 - `references/template_columns.csv`: Shared output-column order.
