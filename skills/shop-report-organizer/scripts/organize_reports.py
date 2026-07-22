@@ -2513,6 +2513,9 @@ def merge_order_summary_record(
             merged[header] = old_value
             continue
         new_value = normalize_text(new_record.get(header, ""))
+        if not new_value and old_value:
+            merged[header] = old_value
+            continue
         if (
             is_protected_order_info_header(header)
             and is_masked_or_empty(new_value)
