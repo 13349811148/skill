@@ -60,6 +60,9 @@ ORDER_TIME_HEADERS = [
 ]
 PREVIEW_MAX_ROWS = 100_000
 EXCEL_MAX_DATA_ROWS = 1_048_575
+XLS_MAX_COLUMNS = 256
+ORDER_HEADER_SEARCH_ROWS = 20
+ORDER_XLS_SHEET_MARKER = "__CODEX_ORDER_SHEET__"
 STREAM_COMMIT_INTERVAL = 2_000
 TMALL_PLATFORM = "天猫"
 TMALL_SHOP_SUFFIX = "（天猫）"
@@ -125,9 +128,21 @@ class ExpectedReport:
 class OrderFileScan:
     month_keys: set[str]
     order_ids: set[str]
+    alias_ids: set[str]
+    ambiguous_main_ids: set[str]
     read_rows: int
     valid_rows: int
     ignored_rows: int
+
+
+@dataclass
+class OrderRow:
+    sheet_name: str
+    row_number: int
+    headers: list[str]
+    id_columns: list[tuple[str, int]]
+    time_columns: list[tuple[str, int]]
+    values: list[str]
 
 
 def read_utf8_sig_csv(path: Path) -> list[dict[str, str]]:
@@ -285,7 +300,16 @@ def powershell_exe() -> str:
     return shutil.which("powershell.exe") or shutil.which("powershell") or "powershell"
 
 
-def read_xls_rows(path: Path, max_rows: int, max_cols: int) -> list[list[str]]:
+def read_xls_rows(
+    path: Path,
+    max_rows: int,
+    max_cols: int,
+    *,
+    all_worksheets: bool = False,
+    include_sheet_markers: bool = False,
+) -> list[list[str]]:
+    all_worksheets_ps = "$true" if all_worksheets else "$false"
+    include_sheet_markers_ps = "$true" if include_sheet_markers else "$false"
     ps_script = rf"""
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
@@ -294,6 +318,8 @@ $path = @'
 '@
 $maxRows = {max_rows}
 $maxCols = {max_cols}
+$allWorksheets = {all_worksheets_ps}
+$includeSheetMarkers = {include_sheet_markers_ps}
 $excel = $null
 try {{
   $excel = New-Object -ComObject Excel.Application
@@ -301,18 +327,24 @@ try {{
   $excel.DisplayAlerts = $false
   $wb = $excel.Workbooks.Open($path, 0, $true)
   try {{
-    $ws = $wb.Worksheets.Item(1)
-    $used = $ws.UsedRange
-    $rows = [Math]::Min($maxRows, $used.Rows.Count)
-    $cols = [Math]::Min($maxCols, $used.Columns.Count)
     $result = @()
-    for ($r = 1; $r -le $rows; $r++) {{
-      $vals = @()
-      for ($c = 1; $c -le $cols; $c++) {{
-        $vals += [string]$ws.Cells.Item($r, $c).Text
+    $sheetCount = if ($allWorksheets) {{ $wb.Worksheets.Count }} else {{ 1 }}
+    for ($s = 1; $s -le $sheetCount; $s++) {{
+      $ws = $wb.Worksheets.Item($s)
+      if ($includeSheetMarkers) {{
+        $result += [PSCustomObject]@{{ cells = @('{ORDER_XLS_SHEET_MARKER}', [string]$ws.Name) }}
       }}
-      if ((($vals -join '')).Trim().Length -gt 0) {{
-        $result += [PSCustomObject]@{{ cells = $vals }}
+      $used = $ws.UsedRange
+      $rows = [Math]::Min($maxRows, $used.Rows.Count)
+      $cols = [Math]::Min($maxCols, $used.Columns.Count)
+      for ($r = 1; $r -le $rows; $r++) {{
+        $vals = @()
+        for ($c = 1; $c -le $cols; $c++) {{
+          $vals += [string]$ws.Cells.Item($r, $c).Text
+        }}
+        if ((($vals -join '')).Trim().Length -gt 0) {{
+          $result += [PSCustomObject]@{{ cells = $vals }}
+        }}
       }}
     }}
     $result | ConvertTo-Json -Compress -Depth 5
@@ -382,6 +414,7 @@ def iter_csv_rows_full(path: Path) -> Iterable[list[str]]:
 
 
 def iter_xlsx_rows_full(path: Path, max_cols: int) -> Iterable[list[str]]:
+    del max_cols  # Formal cumulative processing preserves every effective column.
     try:
         import openpyxl
     except ImportError as exc:  # pragma: no cover - environment specific
@@ -398,7 +431,7 @@ def iter_xlsx_rows_full(path: Path, max_cols: int) -> Iterable[list[str]]:
                 else:
                     if dimension == "A1:A1":
                         worksheet.reset_dimensions()
-            for row in worksheet.iter_rows(min_row=1, max_col=max_cols, values_only=True):
+            for row in worksheet.iter_rows(min_row=1, values_only=True):
                 values = [normalize_text(cell) for cell in row]
                 if any(values):
                     yield values
@@ -417,7 +450,7 @@ def iter_rows_full(path: Path, max_cols: int) -> Iterable[list[str]]:
     if suffix == ".xls":
         # Legacy .xls worksheets cannot exceed 65,536 rows, so a complete COM
         # read remains below the Excel single-sheet limit.
-        yield from read_xls_rows(path, EXCEL_MAX_DATA_ROWS + 1, max_cols)
+        yield from read_xls_rows(path, EXCEL_MAX_DATA_ROWS + 1, XLS_MAX_COLUMNS)
         return
     raise RuntimeError(f"unsupported extension: {suffix}")
 
@@ -493,6 +526,195 @@ def resolve_order_id_from_columns(
         if raw_value:
             return raw_value, header, "；".join(raw_values)
     return "", "", "；".join(raw_values) or "未找到订单号列"
+
+
+def order_identifier_values(
+    row: list[str], id_columns: list[tuple[str, int]]
+) -> tuple[str, str, str, str, set[str]]:
+    values = {
+        header: normalize_text(row[column_index]) if column_index < len(row) else ""
+        for header, column_index in id_columns
+    }
+    is_tmall = "子订单编号" in values or "主订单编号" in values
+    if is_tmall:
+        child_id = values.get("子订单编号", "")
+        main_id = values.get("主订单编号", "")
+        primary_id = child_id or main_id
+        aliases = {value for value in (child_id, main_id) if value}
+        return primary_id, child_id, main_id, "", aliases
+    order_id = values.get("订单号", "")
+    return order_id, "", "", order_id, ({order_id} if order_id else set())
+
+
+def trim_trailing_empty_cells(values: Iterable[object]) -> list[str]:
+    row = [normalize_text(value) for value in values]
+    while row and not row[-1]:
+        row.pop()
+    return row
+
+
+def is_order_header_row(values: list[str]) -> bool:
+    return bool(order_id_columns(values) and order_time_columns(values))
+
+
+def find_order_header(
+    numbered_rows: Iterable[tuple[int, list[str]]]
+) -> tuple[int, list[str]] | None:
+    nonblank_seen = 0
+    for row_number, values in numbered_rows:
+        if not any(values):
+            continue
+        nonblank_seen += 1
+        if is_order_header_row(values):
+            return row_number, values
+        if nonblank_seen >= ORDER_HEADER_SEARCH_ROWS:
+            break
+    return None
+
+
+def csv_delimiter(path: Path, encoding: str) -> str:
+    with path.open("r", encoding=encoding, errors="strict", newline="") as handle:
+        first_line = handle.readline()
+    return "\t" if "\t" in first_line and "," not in first_line else ","
+
+
+def iter_order_rows_full(path: Path, max_cols: int) -> Iterable[OrderRow]:
+    del max_cols  # Formal order processing reads all effective columns.
+    suffix = path.suffix.lower()
+    if suffix == ".csv":
+        encoding = detect_csv_encoding(path)
+        delimiter = csv_delimiter(path, encoding)
+        with path.open("r", encoding=encoding, errors="strict", newline="") as handle:
+            header_match = find_order_header(
+                (
+                    (row_number, trim_trailing_empty_cells(row))
+                    for row_number, row in enumerate(
+                        csv.reader(handle, delimiter=delimiter), start=1
+                    )
+                )
+            )
+        if header_match is None:
+            raise RuntimeError(f"订单文件没有找到有效订单工作表或表头：{path}")
+        header_row_number, headers = header_match
+        id_columns = order_id_columns(headers)
+        time_columns = order_time_columns(headers)
+        with path.open("r", encoding=encoding, errors="strict", newline="") as handle:
+            for row_number, row in enumerate(csv.reader(handle, delimiter=delimiter), start=1):
+                if row_number <= header_row_number:
+                    continue
+                values = trim_trailing_empty_cells(row)
+                if any(values):
+                    yield OrderRow(
+                        "CSV",
+                        row_number,
+                        headers,
+                        id_columns,
+                        time_columns,
+                        values,
+                    )
+        return
+
+    if suffix == ".xlsx":
+        try:
+            import openpyxl
+        except ImportError as exc:  # pragma: no cover - environment specific
+            raise RuntimeError("openpyxl is required for .xlsx files") from exc
+
+        workbook = openpyxl.load_workbook(path, read_only=True, data_only=True)
+        valid_sheet_count = 0
+        try:
+            for worksheet in workbook.worksheets:
+                if hasattr(worksheet, "reset_dimensions"):
+                    try:
+                        dimension = worksheet.calculate_dimension()
+                    except ValueError:
+                        worksheet.reset_dimensions()
+                    else:
+                        if dimension == "A1:A1":
+                            worksheet.reset_dimensions()
+                header_match = find_order_header(
+                    (
+                        (row_number, trim_trailing_empty_cells(row))
+                        for row_number, row in enumerate(
+                            worksheet.iter_rows(min_row=1, values_only=True), start=1
+                        )
+                    )
+                )
+                if header_match is None:
+                    continue
+                valid_sheet_count += 1
+                header_row_number, headers = header_match
+                id_columns = order_id_columns(headers)
+                time_columns = order_time_columns(headers)
+                for row_number, row in enumerate(
+                    worksheet.iter_rows(
+                        min_row=header_row_number + 1, values_only=True
+                    ),
+                    start=header_row_number + 1,
+                ):
+                    values = trim_trailing_empty_cells(row)
+                    if any(values):
+                        yield OrderRow(
+                            worksheet.title,
+                            row_number,
+                            headers,
+                            id_columns,
+                            time_columns,
+                            values,
+                        )
+        finally:
+            workbook.close()
+        if valid_sheet_count == 0:
+            raise RuntimeError(f"订单文件没有找到有效订单工作表或表头：{path}")
+        return
+
+    if suffix == ".xls":
+        rows = read_xls_rows(
+            path,
+            EXCEL_MAX_DATA_ROWS + 1,
+            XLS_MAX_COLUMNS,
+            all_worksheets=True,
+            include_sheet_markers=True,
+        )
+        sheets: list[tuple[str, list[tuple[int, list[str]]]]] = []
+        sheet_name = "工作表1"
+        sheet_rows: list[tuple[int, list[str]]] = []
+        for row in rows:
+            if row and row[0] == ORDER_XLS_SHEET_MARKER:
+                if sheet_rows:
+                    sheets.append((sheet_name, sheet_rows))
+                sheet_name = row[1] if len(row) > 1 and row[1] else "未命名工作表"
+                sheet_rows = []
+                continue
+            sheet_rows.append((len(sheet_rows) + 1, trim_trailing_empty_cells(row)))
+        if sheet_rows:
+            sheets.append((sheet_name, sheet_rows))
+
+        valid_sheet_count = 0
+        for current_sheet_name, numbered_rows in sheets:
+            header_match = find_order_header(numbered_rows)
+            if header_match is None:
+                continue
+            valid_sheet_count += 1
+            header_row_number, headers = header_match
+            id_columns = order_id_columns(headers)
+            time_columns = order_time_columns(headers)
+            for row_number, values in numbered_rows:
+                if row_number <= header_row_number or not any(values):
+                    continue
+                yield OrderRow(
+                    current_sheet_name,
+                    row_number,
+                    headers,
+                    id_columns,
+                    time_columns,
+                    values,
+                )
+        if valid_sheet_count == 0:
+            raise RuntimeError(f"订单文件没有找到有效订单工作表或表头：{path}")
+        return
+
+    raise RuntimeError(f"unsupported extension: {suffix}")
 
 
 def match_signature(rows: list[list[str]], signatures: list[Signature]) -> tuple[Signature | None, int, list[str], list[str]]:
@@ -1067,25 +1289,48 @@ def resolve_order_row_datetime_from_columns(
     return None, "", "；".join(raw_values) or "未找到订单时间列"
 
 
+def order_row_record(headers: list[str], row: list[str]) -> dict[str, str]:
+    return {
+        normalize_text(header): normalize_text(row[index]) if index < len(row) else ""
+        for index, header in enumerate(headers)
+        if normalize_text(header)
+    }
+
+
+def conflicting_order_fields(
+    old_headers: list[str],
+    old_row: list[str],
+    new_headers: list[str],
+    new_row: list[str],
+    limit: int = 8,
+) -> str:
+    old_record = order_row_record(old_headers, old_row)
+    new_record = order_row_record(new_headers, new_row)
+    differences: list[str] = []
+    ordered_headers: list[str] = []
+    append_headers(ordered_headers, old_record)
+    append_headers(ordered_headers, new_record)
+    for header in ordered_headers:
+        old_value = normalize_text(old_record.get(header, ""))
+        new_value = normalize_text(new_record.get(header, ""))
+        if old_value != new_value:
+            differences.append(
+                f"{header}={old_value or '空'}→{new_value or '空'}"
+            )
+        if len(differences) >= limit:
+            break
+    return "；".join(differences) or "行内容不一致"
+
+
 def scan_order_file_full(path: Path, max_cols: int) -> OrderFileScan:
-    row_iterator = iter(iter_rows_full(path, max_cols))
-    try:
-        headers = next(row_iterator)
-    except StopIteration as exc:
-        raise RuntimeError(f"订单文件没有可读取内容：{path}") from exc
-
-    id_columns = order_id_columns(headers)
-    time_columns = order_time_columns(headers)
-    if not id_columns:
-        raise RuntimeError(f"订单文件缺少订单号列，停止整理并保留源文件：{path}")
-    if not time_columns:
-        raise RuntimeError(
-            "订单文件缺少订单支付/付款时间、订单成交时间和订单创建时间列，"
-            f"停止整理并保留源文件：{path}"
-        )
-
     month_keys: set[str] = set()
     order_ids: set[str] = set()
+    alias_ids: set[str] = set()
+    main_children: dict[str, set[str]] = {}
+    fallback_main_rows: dict[str, list[str]] = {}
+    seen_order_rows: dict[str, tuple[OrderRow, tuple[tuple[str, str], ...]]] = {}
+    conflict_examples: list[str] = []
+    conflict_count = 0
     read_rows = 0
     valid_rows = 0
     ignored_rows = 0
@@ -1093,7 +1338,9 @@ def scan_order_file_full(path: Path, max_cols: int) -> OrderFileScan:
     invalid_id_count = 0
     invalid_examples: list[str] = []
     invalid_count = 0
-    for row_number, row in enumerate(row_iterator, start=2):
+    for order_row in iter_order_rows_full(path, max_cols):
+        row_number = order_row.row_number
+        row = order_row.values
         if not any(normalize_text(cell) for cell in row):
             continue
         read_rows += 1
@@ -1101,29 +1348,79 @@ def scan_order_file_full(path: Path, max_cols: int) -> OrderFileScan:
             ignored_rows += 1
             continue
         order_id, _selected_id_header, raw_id_values = resolve_order_id_from_columns(
-            row, id_columns
+            row, order_row.id_columns
         )
         if not order_id:
             invalid_id_count += 1
             if len(invalid_id_examples) < 10:
                 invalid_id_examples.append(
-                    f"行={row_number}，编号字段={raw_id_values}"
+                    f"工作表={order_row.sheet_name}，行={row_number}，编号字段={raw_id_values}"
                 )
             continue
+        (
+            _primary_id,
+            child_id,
+            main_id,
+            _pdd_order_id,
+            row_aliases,
+        ) = order_identifier_values(row, order_row.id_columns)
+        alias_ids.update(row_aliases)
+        if main_id:
+            if child_id:
+                main_children.setdefault(main_id, set()).add(child_id)
+            else:
+                fallback_main_rows.setdefault(main_id, []).append(
+                    f"{order_row.sheet_name}!{row_number}"
+                )
+
+        fingerprint = tuple(sorted(order_row_record(order_row.headers, row).items()))
+        previous = seen_order_rows.get(order_id)
+        if previous is None:
+            seen_order_rows[order_id] = (order_row, fingerprint)
+        elif previous[1] != fingerprint:
+            conflict_count += 1
+            if len(conflict_examples) < 10:
+                previous_row = previous[0]
+                conflict_examples.append(
+                    f"订单号={order_id}，首次={previous_row.sheet_name}!{previous_row.row_number}，"
+                    f"再次={order_row.sheet_name}!{row_number}，差异="
+                    f"{conflicting_order_fields(previous_row.headers, previous_row.values, order_row.headers, row)}"
+                )
+
         parsed_time, _selected_header, raw_values = resolve_order_row_datetime_from_columns(
-            row, time_columns
+            row, order_row.time_columns
         )
         if parsed_time is None:
             invalid_count += 1
             if len(invalid_examples) < 10:
                 invalid_examples.append(
-                    f"行={row_number}，订单号={order_id}，时间字段={raw_values}"
+                    f"工作表={order_row.sheet_name}，行={row_number}，"
+                    f"订单号={order_id}，时间字段={raw_values}"
                 )
             continue
         valid_rows += 1
         month_keys.add(parsed_time.strftime("%Y-%m"))
         order_ids.add(order_id)
 
+    if conflict_count:
+        raise RuntimeError(
+            f"同一订单编号存在内容冲突，共{conflict_count}处；"
+            f"{'；'.join(conflict_examples)}。停止整理，请用户确认冲突行：{path}"
+        )
+    ambiguous_main_ids = {
+        main_id for main_id, child_ids in main_children.items() if len(child_ids) > 1
+    }
+    ambiguous_fallbacks = sorted(ambiguous_main_ids & set(fallback_main_rows))
+    if ambiguous_fallbacks:
+        examples = "；".join(
+            f"主订单编号={main_id}，子订单编号={','.join(sorted(main_children[main_id]))}，"
+            f"无子订单编号行={','.join(fallback_main_rows[main_id])}"
+            for main_id in ambiguous_fallbacks[:10]
+        )
+        raise RuntimeError(
+            f"天猫主订单编号无法唯一对应子订单，共{len(ambiguous_fallbacks)}组；"
+            f"{examples}。停止整理，请用户确认：{path}"
+        )
     if invalid_id_count:
         examples = "；".join(invalid_id_examples)
         raise RuntimeError(
@@ -1143,7 +1440,15 @@ def scan_order_file_full(path: Path, max_cols: int) -> OrderFileScan:
         )
     if not month_keys:
         raise RuntimeError(f"订单文件没有有效订单行，停止整理并保留源文件：{path}")
-    return OrderFileScan(month_keys, order_ids, read_rows, valid_rows, ignored_rows)
+    return OrderFileScan(
+        month_keys,
+        order_ids,
+        alias_ids,
+        ambiguous_main_ids,
+        read_rows,
+        valid_rows,
+        ignored_rows,
+    )
 
 
 def order_shop_existing_paths(database_root: Path, shop_name: str) -> list[Path]:
@@ -1184,7 +1489,7 @@ def order_merge_paths_full(
             continue
         for path in paths:
             existing_scan = scan_order_file_full(path, max_cols)
-            if source_scan.order_ids & existing_scan.order_ids:
+            if source_scan.alias_ids & existing_scan.alias_ids:
                 impacted_dirs.add(month_dir)
                 break
 
@@ -1232,7 +1537,176 @@ def create_order_merge_database(path: Path) -> sqlite3.Connection:
         )
         """
     )
+    connection.execute(
+        """
+        CREATE TABLE order_aliases (
+            alias_type TEXT NOT NULL,
+            alias_id TEXT NOT NULL,
+            order_id TEXT NOT NULL,
+            PRIMARY KEY (alias_type, alias_id, order_id)
+        )
+        """
+    )
+    connection.execute(
+        "CREATE INDEX order_alias_lookup ON order_aliases(alias_type, alias_id)"
+    )
     return connection
+
+
+def order_alias_matches(
+    connection: sqlite3.Connection, alias_type: str, alias_id: str
+) -> list[str]:
+    if not alias_id:
+        return []
+    return [
+        normalize_text(row[0])
+        for row in connection.execute(
+            "SELECT order_id FROM order_aliases "
+            "WHERE alias_type=? AND alias_id=? ORDER BY order_id",
+            (alias_type, alias_id),
+        ).fetchall()
+    ]
+
+
+def order_record_child_id(connection: sqlite3.Connection, order_id: str) -> str:
+    row = connection.execute(
+        "SELECT record_json FROM order_records WHERE order_id=?", (order_id,)
+    ).fetchone()
+    if row is None:
+        return ""
+    record = json.loads(row[0])
+    return normalize_text(record.get("子订单编号", ""))
+
+
+def resolve_existing_order_alias(
+    connection: sqlite3.Connection,
+    child_id: str,
+    main_id: str,
+    pdd_order_id: str,
+    ambiguous_main_ids: set[str],
+    path: Path,
+    sheet_name: str,
+    row_number: int,
+) -> str:
+    location = f"文件={path}，工作表={sheet_name}，行={row_number}"
+    if pdd_order_id:
+        matches = order_alias_matches(connection, "pdd", pdd_order_id)
+        if len(matches) > 1:
+            raise RuntimeError(
+                f"拼多多订单号对应多条历史订单：{location}，订单号={pdd_order_id}，"
+                f"匹配={','.join(matches)}；停止整理，请用户确认。"
+            )
+        return matches[0] if matches else ""
+
+    child_matches = order_alias_matches(connection, "tmall_child", child_id)
+    if len(child_matches) > 1:
+        raise RuntimeError(
+            f"天猫子订单编号对应多条历史订单：{location}，子订单编号={child_id}，"
+            f"匹配={','.join(child_matches)}；停止整理，请用户确认。"
+        )
+    main_matches = order_alias_matches(connection, "tmall_main", main_id)
+    fallback_origin_matches = order_alias_matches(
+        connection, "tmall_fallback_main", main_id
+    )
+    unresolved_fallbacks = [
+        order_id
+        for order_id in fallback_origin_matches
+        if not order_record_child_id(connection, order_id)
+    ]
+    assigned_fallbacks = [
+        order_id
+        for order_id in fallback_origin_matches
+        if order_record_child_id(connection, order_id)
+    ]
+
+    if child_matches:
+        unrelated_fallbacks = [
+            order_id
+            for order_id in fallback_origin_matches
+            if order_id != child_matches[0]
+        ]
+        if unrelated_fallbacks:
+            raise RuntimeError(
+                f"天猫主、子订单历史关系冲突：{location}，主订单编号={main_id}，"
+                f"子订单编号={child_id}，未归属旧记录={','.join(unrelated_fallbacks)}；"
+                "停止整理，请用户确认。"
+            )
+        return child_matches[0]
+
+    if child_id:
+        if assigned_fallbacks:
+            raise RuntimeError(
+                f"天猫旧主订单已归属其他子订单：{location}，主订单编号={main_id}，"
+                f"当前子订单编号={child_id}，已归属记录={','.join(assigned_fallbacks)}；"
+                "停止整理，请用户确认。"
+            )
+        if unresolved_fallbacks:
+            if len(unresolved_fallbacks) > 1 or main_id in ambiguous_main_ids:
+                raise RuntimeError(
+                    f"天猫主订单编号无法唯一回退到子订单：{location}，"
+                    f"主订单编号={main_id}，子订单编号={child_id}，"
+                    f"旧记录={','.join(unresolved_fallbacks)}；停止整理，请用户确认。"
+                )
+            return unresolved_fallbacks[0]
+        return ""
+
+    if len(main_matches) > 1:
+        raise RuntimeError(
+            f"天猫主订单编号对应多个子订单：{location}，主订单编号={main_id}，"
+            f"匹配={','.join(main_matches)}；当前行没有子订单编号，停止整理，请用户确认。"
+        )
+    return main_matches[0] if main_matches else ""
+
+
+def register_order_aliases(
+    connection: sqlite3.Connection,
+    order_id: str,
+    child_id: str,
+    main_id: str,
+    pdd_order_id: str,
+) -> None:
+    aliases = [
+        ("tmall_child", child_id),
+        ("tmall_main", main_id),
+        ("tmall_fallback_main", main_id if main_id and not child_id else ""),
+        ("pdd", pdd_order_id),
+    ]
+    for alias_type, alias_id in aliases:
+        if alias_id:
+            connection.execute(
+                "INSERT OR IGNORE INTO order_aliases(alias_type, alias_id, order_id) "
+                "VALUES (?, ?, ?)",
+                (alias_type, alias_id, order_id),
+            )
+
+
+def rename_order_record(
+    connection: sqlite3.Connection, old_order_id: str, new_order_id: str
+) -> None:
+    if not new_order_id or old_order_id == new_order_id:
+        return
+    if connection.execute(
+        "SELECT 1 FROM order_records WHERE order_id=?", (new_order_id,)
+    ).fetchone():
+        raise RuntimeError(
+            f"订单主键转换冲突：旧订单号={old_order_id}，新订单号={new_order_id}；"
+            "停止整理，请用户确认。"
+        )
+    aliases = connection.execute(
+        "SELECT alias_type, alias_id FROM order_aliases WHERE order_id=?",
+        (old_order_id,),
+    ).fetchall()
+    connection.execute(
+        "UPDATE order_records SET order_id=? WHERE order_id=?",
+        (new_order_id, old_order_id),
+    )
+    connection.execute("DELETE FROM order_aliases WHERE order_id=?", (old_order_id,))
+    for alias_type, alias_id in aliases:
+        connection.execute(
+            "INSERT OR IGNORE INTO order_aliases(alias_type, alias_id, order_id) "
+            "VALUES (?, ?, ?)",
+            (alias_type, alias_id, new_order_id),
+        )
 
 
 def load_order_merge_database(
@@ -1250,15 +1724,7 @@ def load_order_merge_database(
     pending_writes = 0
 
     for path in paths:
-        row_iterator = iter(iter_rows_full(path, max_cols))
-        try:
-            headers = next(row_iterator)
-        except StopIteration as exc:
-            raise RuntimeError(f"订单文件没有可读取内容：{path}") from exc
-        id_columns = order_id_columns(headers)
-        time_columns = order_time_columns(headers)
-        if not id_columns or not time_columns:
-            raise RuntimeError(f"订单文件缺少订单号或可用时间列：{path}")
+        path_scan = scan_order_file_full(path, max_cols)
         is_current_source = path.resolve() == current_source.resolve()
         current_file_creation_time = (
             file_creation_datetime(path).strftime("%Y-%m-%d %H:%M:%S")
@@ -1269,7 +1735,10 @@ def load_order_merge_database(
         path_valid = 0
         path_ignored = 0
 
-        for row_number, row in enumerate(row_iterator, start=2):
+        for order_row in iter_order_rows_full(path, max_cols):
+            row_number = order_row.row_number
+            row = order_row.values
+            headers = order_row.headers
             if not any(normalize_text(cell) for cell in row):
                 continue
             path_read += 1
@@ -1277,19 +1746,26 @@ def load_order_merge_database(
                 path_ignored += 1
                 continue
             order_id, _selected_id_header, raw_id_values = resolve_order_id_from_columns(
-                row, id_columns
+                row, order_row.id_columns
             )
             if not order_id:
                 raise RuntimeError(
-                    f"订单编号为空：文件={path}，行={row_number}，"
+                    f"订单编号为空：文件={path}，工作表={order_row.sheet_name}，行={row_number}，"
                     f"编号字段={raw_id_values}；停止整理并保留源文件。"
                 )
+            (
+                _primary_id,
+                child_id,
+                main_id,
+                pdd_order_id,
+                _row_aliases,
+            ) = order_identifier_values(row, order_row.id_columns)
             parsed_time, _selected_header, raw_values = resolve_order_row_datetime_from_columns(
-                row, time_columns
+                row, order_row.time_columns
             )
             if parsed_time is None:
                 raise RuntimeError(
-                    f"订单时间无法识别：文件={path}，行={row_number}，"
+                    f"订单时间无法识别：文件={path}，工作表={order_row.sheet_name}，行={row_number}，"
                     f"订单号={order_id}，时间字段={raw_values}；"
                     "停止整理并保留源文件。"
                 )
@@ -1316,22 +1792,36 @@ def load_order_merge_database(
             record["汇总_店铺名称"] = shop_name
             record["汇总_最新归档文件"] = ""
             record_json = json.dumps(record, ensure_ascii=False, separators=(",", ":"))
-            cursor = connection.execute(
-                "INSERT OR IGNORE INTO order_records "
-                "(month_key, order_id, sort_time, source_time, record_json) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (month_key, order_id, parsed_time.isoformat(), source_time, record_json),
+            existing_order_id = resolve_existing_order_alias(
+                connection,
+                child_id,
+                main_id,
+                pdd_order_id,
+                path_scan.ambiguous_main_ids,
+                path,
+                order_row.sheet_name,
+                row_number,
             )
-            if cursor.rowcount == 0:
+            if not existing_order_id:
+                connection.execute(
+                    "INSERT INTO order_records "
+                    "(month_key, order_id, sort_time, source_time, record_json) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (month_key, order_id, parsed_time.isoformat(), source_time, record_json),
+                )
+                register_order_aliases(
+                    connection, order_id, child_id, main_id, pdd_order_id
+                )
+            else:
                 duplicate_rows += 1
                 old_row = connection.execute(
                     "SELECT month_key, sort_time, source_time, record_json "
                     "FROM order_records WHERE order_id=?",
-                    (order_id,),
+                    (existing_order_id,),
                 ).fetchone()
                 if old_row is None:
                     raise RuntimeError(
-                        f"订单去重记录读取失败：订单号={order_id}"
+                        f"订单去重记录读取失败：订单号={existing_order_id}"
                     )
                 old_month_key, old_sort_time, old_source_time, old_record_json = old_row
                 old_record = json.loads(old_record_json)
@@ -1364,8 +1854,22 @@ def load_order_merge_database(
                         latest_sort_time,
                         latest_source_time,
                         json.dumps(merged_record, ensure_ascii=False, separators=(",", ":")),
-                        order_id,
+                        existing_order_id,
                     ),
+                )
+                merged_child_id = normalize_text(
+                    merged_record.get("子订单编号", "")
+                )
+                canonical_order_id = merged_child_id or existing_order_id
+                rename_order_record(
+                    connection, existing_order_id, canonical_order_id
+                )
+                register_order_aliases(
+                    connection,
+                    canonical_order_id,
+                    child_id,
+                    main_id,
+                    pdd_order_id,
                 )
             pending_writes += 1
             if pending_writes >= STREAM_COMMIT_INTERVAL:
@@ -1444,7 +1948,7 @@ def stage_order_outputs(
             part_rows = min(max_data_rows, remaining)
             staged_path = staging_dir / final_path.name
             workbook = Workbook(write_only=True)
-            worksheet = workbook.create_sheet("推广调整日志")
+            worksheet = workbook.create_sheet("订单数据")
             worksheet.freeze_panes = "A2"
             worksheet.append(headers)
             written = 0
@@ -1480,6 +1984,8 @@ def commit_order_outputs(
     backup_dir.mkdir(parents=True, exist_ok=True)
     backups: list[tuple[Path, Path]] = []
     installed: list[Path] = []
+    source_backup = backup_dir / "source" / source_path.name
+    source_moved = False
     try:
         for index, old_path in enumerate(sorted(set(old_paths), key=lambda item: str(item))):
             if not old_path.exists():
@@ -1487,6 +1993,9 @@ def commit_order_outputs(
             backup_path = backup_dir / f"{index:04d}_{old_path.name}"
             os.replace(old_path, backup_path)
             backups.append((backup_path, old_path))
+        source_backup.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(source_path, source_backup)
+        source_moved = True
         for staged_path, final_path, _row_count in staged_outputs:
             final_path.parent.mkdir(parents=True, exist_ok=True)
             os.replace(staged_path, final_path)
@@ -1494,11 +2003,13 @@ def commit_order_outputs(
     except Exception:
         for final_path in installed:
             final_path.unlink(missing_ok=True)
+        if source_moved and source_backup.exists():
+            source_path.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(source_backup, source_path)
         for backup_path, old_path in reversed(backups):
             old_path.parent.mkdir(parents=True, exist_ok=True)
             os.replace(backup_path, old_path)
         raise
-    source_path.unlink()
 
 
 def promotion_adjustment_merge_rows(paths: list[Path], max_rows: int, max_cols: int) -> tuple[list[str], list[list[str]], str]:
@@ -1691,34 +2202,30 @@ def merge_order_rows_by_month(
     records_by_order_id: dict[str, tuple[str, dict[str, str]]] = {}
 
     for path in sorted(paths, key=lambda item: (order_source_datetime(item), item.name)):
-        rows = list(iter_rows_full(path, max_cols))
-        if not rows:
-            continue
-        headers = rows[0]
-        id_columns = order_id_columns(headers)
-        time_columns = order_time_columns(headers)
-        if not id_columns or not time_columns:
-            raise RuntimeError(f"订单文件缺少订单号或可用时间列：{path}")
+        scan_order_file_full(path, max_cols)
         source_time = order_source_datetime(path).strftime("%Y-%m-%d %H:%M:%S")
-        for row_number, row in enumerate(rows[1:], start=2):
+        for order_row in iter_order_rows_full(path, max_cols):
+            row_number = order_row.row_number
+            row = order_row.values
+            headers = order_row.headers
             if not any(normalize_text(cell) for cell in row):
                 continue
             if is_ignorable_order_row(row):
                 continue
             order_id, _selected_id_header, raw_id_values = resolve_order_id_from_columns(
-                row, id_columns
+                row, order_row.id_columns
             )
             if not order_id:
                 raise RuntimeError(
-                    f"订单编号为空：文件={path}，行={row_number}，"
+                    f"订单编号为空：文件={path}，工作表={order_row.sheet_name}，行={row_number}，"
                     f"编号字段={raw_id_values}；停止整理并保留源文件。"
                 )
             parsed_time, _selected_time_header, raw_time_values = (
-                resolve_order_row_datetime_from_columns(row, time_columns)
+                resolve_order_row_datetime_from_columns(row, order_row.time_columns)
             )
             if parsed_time is None:
                 raise RuntimeError(
-                    f"订单时间无法识别：文件={path}，行={row_number}，"
+                    f"订单时间无法识别：文件={path}，工作表={order_row.sheet_name}，行={row_number}，"
                     f"订单号={order_id}，时间字段={raw_time_values}；"
                     "停止整理并保留源文件。"
                 )
@@ -2684,6 +3191,7 @@ def update_order_summary(
     reset: bool = False,
 ) -> list[tuple[Path, int, int, int, int]]:
     del max_rows  # Preview-only guard; cumulative summary rebuild reads every row.
+    del signatures  # Formal order-table recognition is handled per worksheet.
     order_analyses = [
         analysis
         for analysis in analyses
@@ -2694,69 +3202,105 @@ def update_order_summary(
 
     grouped_analyses: dict[str, list[Analysis]] = {}
     for analysis in order_analyses:
-        month_key = analysis_summary_month_key(analysis)
-        grouped_analyses.setdefault(month_key, []).append(analysis)
+        grouped_analyses.setdefault(analysis.shop_name, []).append(analysis)
+
+    month_headers: dict[str, list[str]] = {}
+    month_records: dict[str, dict[tuple[str, str], dict[str, str]]] = {}
+    month_report_counts: Counter[str] = Counter()
+
+    for shop_name in sorted(grouped_analyses):
+        shop_analyses = sorted(
+            grouped_analyses[shop_name],
+            key=lambda item: (analysis_summary_datetime(item), item.target_path.name),
+        )
+        paths = [analysis.target_path for analysis in shop_analyses]
+        with tempfile.TemporaryDirectory(
+            prefix=".order-summary-", dir=database_root
+        ) as temp_name:
+            connection = create_order_merge_database(Path(temp_name) / "orders.sqlite3")
+            try:
+                shop_month_headers, _read, _valid, _ignored, _duplicates = (
+                    load_order_merge_database(
+                        connection,
+                        paths,
+                        Path(temp_name) / "no-current-source",
+                        shop_name,
+                        max_cols,
+                    )
+                )
+                for month_key, headers in shop_month_headers.items():
+                    row_count = int(
+                        connection.execute(
+                            "SELECT COUNT(*) FROM order_records WHERE month_key=?",
+                            (month_key,),
+                        ).fetchone()[0]
+                    )
+                    if row_count == 0:
+                        continue
+                    append_headers(month_headers.setdefault(month_key, []), headers)
+                    month_report_counts[month_key] += len(paths)
+                for month_key, order_id, record_json in connection.execute(
+                    "SELECT month_key, order_id, record_json FROM order_records"
+                ):
+                    record = json.loads(record_json)
+                    record["汇总_店铺名称"] = shop_name
+                    month_records.setdefault(month_key, {})[(shop_name, order_id)] = record
+            finally:
+                connection.close()
 
     results: list[tuple[Path, int, int, int, int]] = []
-    for month_key in sorted(grouped_analyses):
-        monthly_analyses = grouped_analyses[month_key]
+    written_paths: set[Path] = set()
+    for month_key in sorted(month_records):
         summary_path = order_summary_path(database_root, month_key)
-        existing_headers, summary_rows = ([], {}) if reset else read_existing_order_summary(summary_path)
-        base_headers = [header for header in existing_headers if header not in ORDER_SUMMARY_METADATA_HEADERS]
-        incoming_headers: list[str] = []
-        incoming_records: list[tuple[str, dict[str, str]]] = []
-
-        for analysis in sorted(monthly_analyses, key=lambda item: (analysis_summary_datetime(item), item.target_path.name)):
-            rows = list(iter_rows_full(analysis.target_path, max_cols))
-            signature, header_row_index, headers, _matched = match_signature(rows, signatures)
-            if signature is None or signature.report_type != "订单数据":
-                continue
-            id_columns = order_id_columns(headers)
-            if not id_columns:
-                raise RuntimeError(f"订单文件缺少订单号列：{analysis.target_path}")
-            append_headers(incoming_headers, headers)
-            latest_download_time = download_datetime(analysis.target_path).strftime("%Y-%m-%d %H:%M:%S")
-            for row_number, row in enumerate(
-                rows[header_row_index + 1 :], start=header_row_index + 2
-            ):
-                if not any(normalize_text(cell) for cell in row) or is_ignorable_order_row(row):
-                    continue
-                order_id, _selected_id_header, raw_id_values = resolve_order_id_from_columns(
-                    row, id_columns
-                )
-                if not order_id:
-                    raise RuntimeError(
-                        f"订单编号为空：文件={analysis.target_path}，行={row_number}，"
-                        f"编号字段={raw_id_values}；停止整理并保留原汇总表。"
-                    )
-                record = row_to_dict(headers, row)
-                record["汇总_店铺名称"] = analysis.shop_name
-                record["汇总_最新下载时间"] = latest_download_time
-                record["汇总_最新来源文件"] = analysis.source.name
-                record["汇总_最新归档文件"] = analysis.target_path.name
-                incoming_records.append((order_id, record))
-
         final_headers: list[str] = []
-        append_headers(final_headers, base_headers)
-        append_headers(final_headers, incoming_headers)
+        if not reset:
+            existing_headers, existing_rows = read_existing_order_summary(summary_path)
+            append_headers(final_headers, existing_headers)
+        else:
+            existing_rows = {}
+        append_headers(final_headers, month_headers[month_key])
         append_headers(final_headers, ORDER_SUMMARY_METADATA_HEADERS)
 
+        generated_records = month_records[month_key]
+        output_records: dict[tuple[str, str], dict[str, str]] = {}
+        for order_id, record in existing_rows.items():
+            shop_name = normalize_text(record.get("汇总_店铺名称", ""))
+            output_records[(shop_name, order_id)] = record
         inserted = 0
         updated = 0
-        for order_id, record in incoming_records:
-            if order_id in summary_rows:
+        for key, record in generated_records.items():
+            if key in output_records:
                 updated += 1
-                summary_rows[order_id] = merge_order_summary_record(summary_rows[order_id], record, final_headers)
+                output_records[key] = merge_order_summary_record(
+                    output_records[key], record, final_headers
+                )
             else:
                 inserted += 1
-                summary_rows[order_id] = {header: normalize_text(record.get(header, "")) for header in final_headers}
-
+                output_records[key] = record
         output_rows = [
-            {header: normalize_text(row.get(header, "")) for header in final_headers}
-            for row in summary_rows.values()
+            {
+                header: normalize_text(record.get(header, ""))
+                for header in final_headers
+            }
+            for _key, record in sorted(output_records.items())
         ]
         write_utf8_sig_csv(summary_path, output_rows, final_headers)
-        results.append((summary_path, len(monthly_analyses), len(output_rows), inserted, updated))
+        written_paths.add(summary_path.resolve())
+        results.append(
+            (
+                summary_path,
+                month_report_counts[month_key],
+                len(output_rows),
+                inserted,
+                updated,
+            )
+        )
+
+    if reset:
+        order_root = database_root / ORDER_REPORT_TYPE
+        for existing_summary in order_root.glob(f"{ORDER_SUMMARY_PREFIX}_*.csv"):
+            if existing_summary.resolve() not in written_paths:
+                existing_summary.unlink()
     return results
 
 
