@@ -1,4 +1,4 @@
 interface:
-  display_name: "数据整理 2026.07.22.151045"
+  display_name: "数据整理 2026.07.22.152755"
   short_description: "V2版：整理拼多多和天猫运营数据库报表"
   default_prompt: "整理数据库V2版本：使用 $shop-report-organizer 处理拼多多和天猫运营数据库报表；天猫店铺名添加（天猫），并在聊天窗口逐条完整回复所有提醒日志。"

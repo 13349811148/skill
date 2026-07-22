@@ -45,7 +45,7 @@ python ".\scripts\organize_reports.py" --database-root "$databaseRoot" --dry-run
 3. Review `整理记录_预览.csv`, `缺失提醒_预览.csv`, and the console summary. Pay attention to files marked `pending` or `duplicate_file` and reminders marked `missing`. Copy every row of the reminder log into the chat response as required by **Chat Reminder Output** below.
 4. For order reports, remember that each download usually covers the latest 7 days, so repeated downloads overlap. On `--apply`, merge order rows into cumulative shop/month tables by transaction month.
    - Use at most the first 100,000 rows only for preview, report recognition, and shop/period inference. This is a script-side preview guard, not an AI row-processing limit.
-   - During formal order merging, stream and validate every row in every source and existing monthly table. Never truncate formal processing at 100,000 rows, and never load the entire order table into the AI context.
+   - During every formal cumulative merge or rebuild, read every row in every source and existing cumulative table. This applies to order monthly tables, after-sale cumulative tables, promotion-adjustment cumulative logs, and order-summary rebuilds. Never truncate formal processing at 100,000 rows, and never load the entire table into the AI context merely for reasoning.
 5. Only after the preview is acceptable and no required report is missing, run:
 
 ```powershell
@@ -77,7 +77,7 @@ Special filename format and merge rule for `推广调整日志`:
 店铺—商品ID—推广调整日志更新至YYYY-MM-DD.xlsx
 ```
 
-For `推广调整日志`, keep one cumulative table per shop and product ID. On `--apply`, merge the newly downloaded operation log into the existing table for the same shop/product ID, de-duplicate identical operation rows, sort by `操作时间` newest first, and rename the cumulative table so the filename's `更新至YYYY-MM-DD` matches the latest operation date in the merged rows. Print the merged target file, source file count, and de-duplicated row count in the message window.
+For `推广调整日志`, keep one cumulative table per shop and product ID. On `--apply`, read every row from the new source and every existing cumulative table without the 100,000-row preview cap, merge them, de-duplicate identical operation rows, sort by `操作时间` newest first, and rename the cumulative table so the filename's `更新至YYYY-MM-DD` matches the latest operation date in the merged rows. Print the merged target file, source file count, and de-duplicated row count in the message window.
 
 Special filename format and merge rule for `售后数据`:
 
@@ -85,7 +85,7 @@ Special filename format and merge rule for `售后数据`:
 店铺—售后数据更新至YYYY-MM-DD.xlsx
 ```
 
-For `售后数据`, keep one cumulative table per shop in the current download-month archive folder. On `--apply`, merge the newly downloaded after-sale report into the existing table for the same shop, de-duplicate by `售后编号`, keep the row from the later source when the same `售后编号` appears again, sort by `申请时间` newest first, and rename the cumulative table so the filename's `更新至YYYY-MM-DD` matches the latest `申请时间` in the merged rows. Print the merged target file, source file count, and de-duplicated row count in the message window.
+For `售后数据`, keep one cumulative table per shop in the current download-month archive folder. On `--apply`, read every row from the new source and every existing cumulative table without the 100,000-row preview cap, merge them, de-duplicate by `售后编号`, keep the row from the later source when the same `售后编号` appears again, sort by `申请时间` newest first, and rename the cumulative table so the filename's `更新至YYYY-MM-DD` matches the latest `申请时间` in the merged rows. Print the merged target file, source file count, and de-duplicated row count in the message window.
 
 Use the existing archive layout:
 

@@ -1409,15 +1409,20 @@ def commit_order_outputs(
 
 
 def promotion_adjustment_merge_rows(paths: list[Path], max_rows: int, max_cols: int) -> tuple[list[str], list[list[str]], str]:
+    del max_rows  # Preview-only guard; formal cumulative merging reads every row.
     header: list[str] = []
     data_rows: list[list[str]] = []
     for path in paths:
-        rows = read_rows(path, max_rows, max_cols)
-        if not rows:
+        row_iterator = iter(iter_rows_full(path, max_cols))
+        try:
+            file_header = next(row_iterator)
+        except StopIteration:
             continue
-        if len(rows[0]) > len(header):
-            header = rows[0]
-        data_rows.extend(row for row in rows[1:] if any(normalize_text(cell) for cell in row))
+        if len(file_header) > len(header):
+            header = file_header
+        data_rows.extend(
+            row for row in row_iterator if any(normalize_text(cell) for cell in row)
+        )
 
     max_cols_seen = max([len(header), *(len(row) for row in data_rows)] or [0])
     if not header:
@@ -1453,22 +1458,25 @@ def promotion_adjustment_merge_rows(paths: list[Path], max_rows: int, max_cols: 
 
 
 def merge_after_sale_rows(paths: list[Path], max_rows: int, max_cols: int) -> tuple[list[str], list[list[str]], str]:
+    del max_rows  # Preview-only guard; formal cumulative merging reads every row.
     headers: list[str] = []
     rows_by_key: dict[tuple[str, str], list[str]] = {}
     fallback_index = 0
     latest_time: dt.datetime | None = None
 
     for path in paths:
-        rows = read_rows(path, max_rows, max_cols)
-        if not rows:
+        row_iterator = iter(iter_rows_full(path, max_cols))
+        try:
+            file_headers = next(row_iterator)
+        except StopIteration:
             continue
-        append_headers(headers, rows[0])
-        key_index = find_header_index(rows[0], ["售后编号", "退款编号"])
-        time_index = find_header_index(rows[0], ["申请时间", "退款申请时间"])
-        for row in rows[1:]:
+        append_headers(headers, file_headers)
+        key_index = find_header_index(file_headers, ["售后编号", "退款编号"])
+        time_index = find_header_index(file_headers, ["申请时间", "退款申请时间"])
+        for row in row_iterator:
             if not any(normalize_text(cell) for cell in row):
                 continue
-            record = {normalize_text(header): normalize_text(row[index]) if index < len(row) else "" for index, header in enumerate(rows[0])}
+            record = {normalize_text(header): normalize_text(row[index]) if index < len(row) else "" for index, header in enumerate(file_headers)}
             append_headers(headers, record.keys())
             if key_index is not None and key_index < len(row):
                 key_value = normalize_text(row[key_index])
@@ -1585,12 +1593,13 @@ def merge_order_rows_by_month(
     max_rows: int,
     max_cols: int,
 ) -> dict[str, tuple[list[str], list[list[str]]]]:
+    del max_rows  # Preview-only guard; formal cumulative merging reads every row.
     month_headers: dict[str, list[str]] = {}
     month_records: dict[str, dict[str, dict[str, str]]] = {}
     fallback_index = 0
 
     for path in sorted(paths, key=lambda item: (order_source_datetime(item), item.name)):
-        rows = read_rows(path, max_rows, max_cols)
+        rows = list(iter_rows_full(path, max_cols))
         if not rows:
             continue
         headers = rows[0]
@@ -2544,6 +2553,7 @@ def update_order_summary(
     max_cols: int,
     reset: bool = False,
 ) -> list[tuple[Path, int, int, int, int]]:
+    del max_rows  # Preview-only guard; cumulative summary rebuild reads every row.
     order_analyses = [
         analysis
         for analysis in analyses
@@ -2567,7 +2577,7 @@ def update_order_summary(
         incoming_records: list[tuple[str, dict[str, str]]] = []
 
         for analysis in sorted(monthly_analyses, key=lambda item: (analysis_summary_datetime(item), item.target_path.name)):
-            rows = read_rows(analysis.target_path, max_rows, max_cols)
+            rows = list(iter_rows_full(analysis.target_path, max_cols))
             signature, header_row_index, headers, _matched = match_signature(rows, signatures)
             if signature is None or signature.report_type != "订单数据":
                 continue
