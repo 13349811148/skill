@@ -475,6 +475,25 @@ def order_time_columns(headers: list[str]) -> list[tuple[str, int]]:
     return find_header_indices(headers, candidates)
 
 
+def order_id_columns(headers: list[str]) -> list[tuple[str, int]]:
+    tmall_columns = find_header_indices(headers, ["子订单编号", "主订单编号"])
+    if tmall_columns:
+        return tmall_columns
+    return find_header_indices(headers, ["订单号"])
+
+
+def resolve_order_id_from_columns(
+    row: list[str], id_columns: list[tuple[str, int]]
+) -> tuple[str, str, str]:
+    raw_values: list[str] = []
+    for header, column_index in id_columns:
+        raw_value = normalize_text(row[column_index]) if column_index < len(row) else ""
+        raw_values.append(f"{header}={raw_value or '空'}")
+        if raw_value:
+            return raw_value, header, "；".join(raw_values)
+    return "", "", "；".join(raw_values) or "未找到订单号列"
+
+
 def match_signature(rows: list[list[str]], signatures: list[Signature]) -> tuple[Signature | None, int, list[str], list[str]]:
     best: tuple[int, Signature | None, int, list[str], list[str]] = (-1, None, -1, [], [])
     for row_index, row in enumerate(rows[:20]):
@@ -1054,9 +1073,9 @@ def scan_order_file_full(path: Path, max_cols: int) -> OrderFileScan:
     except StopIteration as exc:
         raise RuntimeError(f"订单文件没有可读取内容：{path}") from exc
 
-    order_index = find_header_index(headers, ORDER_ID_HEADERS)
+    id_columns = order_id_columns(headers)
     time_columns = order_time_columns(headers)
-    if order_index is None:
+    if not id_columns:
         raise RuntimeError(f"订单文件缺少订单号列，停止整理并保留源文件：{path}")
     if not time_columns:
         raise RuntimeError(
@@ -1068,6 +1087,8 @@ def scan_order_file_full(path: Path, max_cols: int) -> OrderFileScan:
     read_rows = 0
     valid_rows = 0
     ignored_rows = 0
+    invalid_id_examples: list[str] = []
+    invalid_id_count = 0
     invalid_examples: list[str] = []
     invalid_count = 0
     for row_number, row in enumerate(row_iterator, start=2):
@@ -1077,20 +1098,35 @@ def scan_order_file_full(path: Path, max_cols: int) -> OrderFileScan:
         if is_ignorable_order_row(row):
             ignored_rows += 1
             continue
+        order_id, _selected_id_header, raw_id_values = resolve_order_id_from_columns(
+            row, id_columns
+        )
+        if not order_id:
+            invalid_id_count += 1
+            if len(invalid_id_examples) < 10:
+                invalid_id_examples.append(
+                    f"行={row_number}，编号字段={raw_id_values}"
+                )
+            continue
         parsed_time, _selected_header, raw_values = resolve_order_row_datetime_from_columns(
             row, time_columns
         )
         if parsed_time is None:
             invalid_count += 1
             if len(invalid_examples) < 10:
-                order_id = normalize_text(row[order_index]) if order_index < len(row) else ""
                 invalid_examples.append(
-                    f"行={row_number}，订单号={order_id or '空'}，时间字段={raw_values}"
+                    f"行={row_number}，订单号={order_id}，时间字段={raw_values}"
                 )
             continue
         valid_rows += 1
         month_keys.add(parsed_time.strftime("%Y-%m"))
 
+    if invalid_id_count:
+        examples = "；".join(invalid_id_examples)
+        raise RuntimeError(
+            f"订单编号为空，共{invalid_id_count}行；{examples}。"
+            f"停止整理，不生成或覆盖月表，并保留源文件：{path}"
+        )
     if invalid_count:
         examples = "；".join(invalid_examples)
         raise RuntimeError(
@@ -1177,9 +1213,9 @@ def load_order_merge_database(
             headers = next(row_iterator)
         except StopIteration as exc:
             raise RuntimeError(f"订单文件没有可读取内容：{path}") from exc
-        order_index = find_header_index(headers, ORDER_ID_HEADERS)
+        id_columns = order_id_columns(headers)
         time_columns = order_time_columns(headers)
-        if order_index is None or not time_columns:
+        if not id_columns or not time_columns:
             raise RuntimeError(f"订单文件缺少订单号或可用时间列：{path}")
         is_current_source = path.resolve() == current_source.resolve()
         current_file_creation_time = (
@@ -1198,14 +1234,21 @@ def load_order_merge_database(
             if is_ignorable_order_row(row):
                 path_ignored += 1
                 continue
+            order_id, _selected_id_header, raw_id_values = resolve_order_id_from_columns(
+                row, id_columns
+            )
+            if not order_id:
+                raise RuntimeError(
+                    f"订单编号为空：文件={path}，行={row_number}，"
+                    f"编号字段={raw_id_values}；停止整理并保留源文件。"
+                )
             parsed_time, _selected_header, raw_values = resolve_order_row_datetime_from_columns(
                 row, time_columns
             )
             if parsed_time is None:
-                order_id = normalize_text(row[order_index]) if order_index < len(row) else ""
                 raise RuntimeError(
                     f"订单时间无法识别：文件={path}，行={row_number}，"
-                    f"订单号={order_id or '空'}，时间字段={raw_values}；"
+                    f"订单号={order_id}，时间字段={raw_values}；"
                     "停止整理并保留源文件。"
                 )
             path_valid += 1
@@ -1216,9 +1259,6 @@ def load_order_merge_database(
                 [header for header in headers if header not in ORDER_SUMMARY_METADATA_HEADERS],
             )
             append_headers(final_headers, ORDER_SUMMARY_METADATA_HEADERS)
-            order_id = normalize_text(row[order_index]) if order_index < len(row) else ""
-            if not order_id:
-                order_id = f"_row_{path.resolve()}_{row_number}"
             record = row_to_dict(headers, row)
             if is_current_source:
                 source_time = current_file_creation_time
@@ -1596,34 +1636,44 @@ def merge_order_rows_by_month(
     del max_rows  # Preview-only guard; formal cumulative merging reads every row.
     month_headers: dict[str, list[str]] = {}
     month_records: dict[str, dict[str, dict[str, str]]] = {}
-    fallback_index = 0
 
     for path in sorted(paths, key=lambda item: (order_source_datetime(item), item.name)):
         rows = list(iter_rows_full(path, max_cols))
         if not rows:
             continue
         headers = rows[0]
-        order_index = find_header_index(headers, ORDER_ID_HEADERS)
-        time_index = find_header_index(headers, ORDER_TIME_HEADERS)
-        if order_index is None or time_index is None:
-            continue
+        id_columns = order_id_columns(headers)
+        time_columns = order_time_columns(headers)
+        if not id_columns or not time_columns:
+            raise RuntimeError(f"订单文件缺少订单号或可用时间列：{path}")
         source_time = order_source_datetime(path).strftime("%Y-%m-%d %H:%M:%S")
-        for row in rows[1:]:
+        for row_number, row in enumerate(rows[1:], start=2):
             if not any(normalize_text(cell) for cell in row):
                 continue
-            if time_index >= len(row):
+            if is_ignorable_order_row(row):
                 continue
-            month_key = order_month_key_from_date(row[time_index])
-            if not month_key:
-                continue
+            order_id, _selected_id_header, raw_id_values = resolve_order_id_from_columns(
+                row, id_columns
+            )
+            if not order_id:
+                raise RuntimeError(
+                    f"订单编号为空：文件={path}，行={row_number}，"
+                    f"编号字段={raw_id_values}；停止整理并保留源文件。"
+                )
+            parsed_time, _selected_time_header, raw_time_values = (
+                resolve_order_row_datetime_from_columns(row, time_columns)
+            )
+            if parsed_time is None:
+                raise RuntimeError(
+                    f"订单时间无法识别：文件={path}，行={row_number}，"
+                    f"订单号={order_id}，时间字段={raw_time_values}；"
+                    "停止整理并保留源文件。"
+                )
+            month_key = parsed_time.strftime("%Y-%m")
             final_headers = month_headers.setdefault(month_key, [])
             append_headers(final_headers, [header for header in headers if header not in ORDER_SUMMARY_METADATA_HEADERS])
             append_headers(final_headers, ORDER_SUMMARY_METADATA_HEADERS)
             records = month_records.setdefault(month_key, {})
-            order_id = normalize_text(row[order_index]) if order_index < len(row) else ""
-            if not order_id:
-                fallback_index += 1
-                order_id = f"_row_{fallback_index}"
             record = row_to_dict(headers, row)
             record["汇总_店铺名称"] = shop_name
             record["汇总_最新下载时间"] = source_time
@@ -2473,14 +2523,24 @@ def read_existing_order_summary(path: Path) -> tuple[list[str], dict[str, dict[s
         reader = csv.DictReader(handle)
         headers = list(reader.fieldnames or [])
         rows: dict[str, dict[str, str]] = {}
-        order_key = find_header_index(headers, ORDER_ID_HEADERS)
-        if order_key is None:
+        id_columns = order_id_columns(headers)
+        if not id_columns:
             return headers, {}
-        order_header = headers[order_key]
-        for row in reader:
-            order_id = normalize_text(row.get(order_header, ""))
-            if order_id:
-                rows[order_id] = {header: normalize_text(row.get(header, "")) for header in headers}
+        for row_number, row in enumerate(reader, start=2):
+            row_values = [normalize_text(row.get(header, "")) for header in headers]
+            if not any(row_values) or is_ignorable_order_row(row_values):
+                continue
+            order_id, _selected_id_header, raw_id_values = resolve_order_id_from_columns(
+                row_values, id_columns
+            )
+            if not order_id:
+                raise RuntimeError(
+                    f"订单编号为空：文件={path}，行={row_number}，"
+                    f"编号字段={raw_id_values}；停止整理并保留原汇总表。"
+                )
+            rows[order_id] = {
+                header: normalize_text(row.get(header, "")) for header in headers
+            }
         return headers, rows
 
 
@@ -2581,17 +2641,24 @@ def update_order_summary(
             signature, header_row_index, headers, _matched = match_signature(rows, signatures)
             if signature is None or signature.report_type != "订单数据":
                 continue
-            order_index = find_header_index(headers, ORDER_ID_HEADERS)
-            if order_index is None:
-                continue
+            id_columns = order_id_columns(headers)
+            if not id_columns:
+                raise RuntimeError(f"订单文件缺少订单号列：{analysis.target_path}")
             append_headers(incoming_headers, headers)
             latest_download_time = download_datetime(analysis.target_path).strftime("%Y-%m-%d %H:%M:%S")
-            for row in rows[header_row_index + 1 :]:
-                if order_index >= len(row):
+            for row_number, row in enumerate(
+                rows[header_row_index + 1 :], start=header_row_index + 2
+            ):
+                if not any(normalize_text(cell) for cell in row) or is_ignorable_order_row(row):
                     continue
-                order_id = normalize_text(row[order_index])
+                order_id, _selected_id_header, raw_id_values = resolve_order_id_from_columns(
+                    row, id_columns
+                )
                 if not order_id:
-                    continue
+                    raise RuntimeError(
+                        f"订单编号为空：文件={analysis.target_path}，行={row_number}，"
+                        f"编号字段={raw_id_values}；停止整理并保留原汇总表。"
+                    )
                 record = row_to_dict(headers, row)
                 record["汇总_店铺名称"] = analysis.shop_name
                 record["汇总_最新下载时间"] = latest_download_time
