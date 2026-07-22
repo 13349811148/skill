@@ -11,6 +11,19 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from data_quality_protection import (
+    COST_SOURCE_LOG_PREFIX,
+    COST_TABLE_CODE_CANDIDATES,
+    COST_TABLE_MAX_ROWS,
+    ORDER_SPEC_CODE_CANDIDATES,
+    DataQualityError,
+    cost_source_log,
+    duplicate_identifier_warnings,
+    marketing_price_warnings,
+    normalize_match_code,
+    optional_number,
+    parse_number_strict,
+)
 from promotion_protection import (
     PromotionProtectionError,
     PromotionSnapshotRow,
@@ -43,6 +56,7 @@ DEFAULT_OUTPUT = DEFAULT_OUTPUT_DIR / "数据报表拼多多.xlsx"
 REFERENCE_TABLE_EXTENSIONS = {".xls", ".xlsx"}
 PROMOTION_MECHANISM_COLUMN = "促销机制        (天猫参加活动填万人团\n淘宝参加活动填百亿补贴)"
 TEMPLATE_SHEET = "每日销售数据"
+COST_METADATA_FIELDS = ("产线", "项目组", "管理类型", "品种")
 ORDER_MAX_ROWS = 100_000
 SMALL_RECEIPT_UPPER_BOUND = 1.0
 COST_LOW_DEVIATION_THRESHOLD = 0.10
@@ -259,7 +273,8 @@ def read_all_workbook_sheets(path: Path) -> list[WorkbookData]:
                 used = ws.UsedRange
                 first_row = used.Row
                 first_col = used.Column
-                row_count = min(int(used.Rows.Count), 5000)
+                total_rows = int(used.Rows.Count)
+                row_count = min(total_rows, COST_TABLE_MAX_ROWS)
                 col_count = min(int(used.Columns.Count), 100)
                 end_row = first_row + row_count - 1
                 end_col = first_col + col_count - 1
@@ -271,7 +286,15 @@ def read_all_workbook_sheets(path: Path) -> list[WorkbookData]:
                 else:
                     raw_rows = [list(row if isinstance(row, tuple) else (row,)) for row in values]
                 rows: list[list[Any]] = [row for row in raw_rows if any(text(value) for value in row)]
-                result.append(WorkbookData(path=path, sheet_name=ws.Name, rows=rows))
+                result.append(
+                    WorkbookData(
+                        path=path,
+                        sheet_name=ws.Name,
+                        rows=rows,
+                        total_rows=total_rows,
+                        truncated=total_rows > COST_TABLE_MAX_ROWS,
+                    )
+                )
             return result
         finally:
             wb.Close(False)
@@ -381,9 +404,13 @@ def marketing_promotion_mechanism(row: dict[str, Any]) -> Any:
 
 
 def is_subsidy_activity(row: dict[str, Any]) -> bool:
-    activity_price = text(row.get("活动价"))
-    registration_price = text(row.get("报名价"))
-    return bool(activity_price and registration_price and number(activity_price) != number(registration_price))
+    activity_price = optional_number(row.get("活动价"))
+    registration_price = optional_number(row.get("报名价"))
+    return bool(
+        activity_price is not None
+        and registration_price is not None
+        and registration_price > activity_price
+    )
 
 
 def resolve_arrival_price(
@@ -536,46 +563,83 @@ def load_marketing_products(marketing_rows: list[dict[str, Any]]) -> dict[tuple[
     return products
 
 
-def load_costs_by_merchant_code(cost_table_path: Path) -> tuple[dict[str, float], list[str]]:
-    costs: dict[str, float] = {}
+def load_costs_by_merchant_code(
+    cost_table_path: Path,
+) -> tuple[dict[str, dict[str, Any]], list[str]]:
+    costs: dict[str, dict[str, Any]] = {}
     warnings: list[str] = []
     try:
         sheets = read_all_workbook_sheets(cost_table_path)
     except Exception as exc:
-        return costs, [f"成本表读取失败,{cost_table_path},{exc}"]
+        raise ReportError(f"成本表读取失败，已停止生成日报,{cost_table_path},{exc}") from exc
 
     for data in sheets:
+        if data.truncated:
+            warnings.append(
+                f"成本表工作表超过{COST_TABLE_MAX_ROWS}行，仅读取前{COST_TABLE_MAX_ROWS}行,{cost_table_path},{data.sheet_name}"
+            )
         rows = rows_to_dicts(data.rows)
         if not rows:
             continue
         headers = list(rows[0].keys())
-        code_col = find_col(headers, ["商家编码", "商品编码"])
+        code_col = find_col(headers, list(COST_TABLE_CODE_CANDIDATES))
         cost_col = find_col(headers, ["6.11成本价", "成本价", "产品成本", "成本"])
         if not code_col or not cost_col:
             continue
         for row in rows:
-            merchant_code = text(row.get(code_col))
-            if not merchant_code:
+            raw_code = text(row.get(code_col))
+            match_code = normalize_match_code(raw_code)
+            if not match_code:
                 continue
             if text(row.get(cost_col)) == "":
-                warnings.append(f"成本表成本为空,{data.sheet_name},{merchant_code}")
+                warnings.append(f"成本表成本为空,{data.sheet_name},{raw_code}")
                 continue
-            costs[merchant_code] = number(row.get(cost_col))
+            try:
+                cost_value = parse_number_strict(
+                    row.get(cost_col),
+                    field_name="成本",
+                    context=f"文件={cost_table_path}，工作表={data.sheet_name}，编码={raw_code}",
+                )
+            except DataQualityError as exc:
+                warnings.append(f"成本表成本无效，已忽略并尝试营销活动表兜底,{exc}")
+                continue
+            if cost_value <= 0.0:
+                warnings.append(
+                    f"成本表成本必须大于0，已忽略并尝试营销活动表兜底,{data.sheet_name},{raw_code},{cost_value:.2f}"
+                )
+                continue
+            if match_code in costs:
+                previous = costs[match_code]
+                warnings.append(
+                    "成本表匹配编码重复，请检查；"
+                    f"标准化编码={match_code}，前一来源={previous['来源']}，"
+                    f"后一来源={cost_table_path.name}/{data.sheet_name}/{code_col}={raw_code}"
+                )
+            costs[match_code] = {
+                "产品成本": cost_value,
+                **{field: row.get(field, "") for field in COST_METADATA_FIELDS},
+                "来源": f"成本表:{cost_table_path.name}/{data.sheet_name}/{code_col}={raw_code}/{cost_col}",
+                "原始编码": raw_code,
+            }
 
     if not costs:
-        warnings.append(f"成本表未读取到可用成本,{cost_table_path}")
+        raise ReportError(f"成本表未读取到可用正数成本，已停止生成日报,{cost_table_path}")
     return costs, warnings
 
 
-def load_product_exports(root: Path) -> dict[str, dict[str, Any]]:
+def load_product_exports(
+    root: Path,
+) -> tuple[dict[str, dict[str, Any]], list[str]]:
     products: dict[str, dict[str, Any]] = {}
+    warnings: list[str] = []
     for path in discover_files(root, "商品数据"):
         try:
             workbook = read_workbook(path, max_rows=ORDER_MAX_ROWS)
             if workbook.truncated:
                 warnings.append(f"商品数据文件超过{ORDER_MAX_ROWS}行，仅读取前{ORDER_MAX_ROWS}行,{path}")
             rows = rows_to_dicts(workbook.rows)
-        except Exception:
+        except Exception as exc:
+            warnings.append(f"商品数据文件读取失败,{path},{exc}")
             continue
         for row in rows:
             product_id = text(row.get("商品ID（必填）") or row.get("商品ID") or row.get("商品id"))
@@ -585,10 +649,10 @@ def load_product_exports(root: Path) -> dict[str, dict[str, Any]]:
             products[product_id].update(
                 {
                     "商品ID": product_id,
-                    "商品SKU": text(row.get("商品名称") or row.get("商品SKU") or products[product_id].get("商品SKU", "")),
+                    "商品SKU": text(row.get("商品SKU") or row.get("商品名称") or products[product_id].get("商品SKU", "")),
                 }
             )
-    return products
+    return products, warnings
 
 
 def is_valid_order(row: dict[str, Any]) -> bool:
@@ -619,6 +683,22 @@ def matching_marketing_row(
     )
 
 
+def marketing_cost_source(
+    style_id: str,
+    product_id: str,
+    sku: str,
+    template_products: dict[tuple[str, str], dict[str, Any]],
+    template_styles: dict[str, dict[str, Any]],
+) -> str:
+    if style_id and style_id in template_styles:
+        return f"样式ID={style_id}"
+    if (product_id, sku) in template_products:
+        return f"商品ID+商品SKU={product_id}+{sku}"
+    if any(candidate_product_id == product_id for candidate_product_id, _sku in template_products):
+        return f"商品ID兜底={product_id}"
+    return "未匹配"
+
+
 def resolve_order_unit_cost(
     style_id: str,
     product_id: str,
@@ -626,10 +706,11 @@ def resolve_order_unit_cost(
     merchant_spec_code: str,
     template_products: dict[tuple[str, str], dict[str, Any]],
     template_styles: dict[str, dict[str, Any]],
-    cost_by_merchant_code: dict[str, float],
+    cost_by_merchant_code: dict[str, dict[str, Any]],
 ) -> float | None:
-    if merchant_spec_code and merchant_spec_code in cost_by_merchant_code:
-        cost_value = cost_by_merchant_code[merchant_spec_code]
+    match_code = normalize_match_code(merchant_spec_code)
+    if match_code and match_code in cost_by_merchant_code:
+        cost_value = cost_by_merchant_code[match_code]["产品成本"]
         if number(cost_value) > 0.0:
             return number(cost_value)
     marketing_row = matching_marketing_row(
@@ -674,7 +755,7 @@ def load_order_aggregates(
     small_receipt_action: str = "confirm",
     template_products: dict[tuple[str, str], dict[str, Any]] | None = None,
     template_styles: dict[str, dict[str, Any]] | None = None,
-    cost_by_merchant_code: dict[str, float] | None = None,
+    cost_by_merchant_code: dict[str, dict[str, Any]] | None = None,
 ) -> tuple[dict[tuple[str, str], dict[str, Any]], list[str]]:
     if small_receipt_action not in SMALL_RECEIPT_ACTIONS:
         raise ReportError(f"Unsupported small receipt action: {small_receipt_action}")
@@ -687,18 +768,29 @@ def load_order_aggregates(
     small_receipt_count = 0
     below_cost_count = 0
     missing_cost_rows: set[tuple[str, str, str, str, str]] = set()
-    for path in discover_files(root, "订单数据"):
+    seen_order_lines: dict[tuple[str, str, str, str, str, str], Path] = {}
+    order_paths, duplicate_file_warnings = deduplicate_exact_files(
+        discover_files(root, "订单数据"), "订单数据"
+    )
+    warnings.extend(duplicate_file_warnings)
+    order_paths.sort(
+        key=lambda path: (
+            path.stat().st_mtime_ns if path.exists() else 0,
+            str(path).casefold(),
+        ),
+        reverse=True,
+    )
+    for path in order_paths:
         try:
             rows = rows_to_dicts(read_workbook(path).rows)
         except Exception as exc:
-            warnings.append(f"订单文件读取失败,{path},{exc}")
-            continue
+            raise ReportError(f"订单文件读取失败，已停止生成日报,{path},{exc}") from exc
         if not rows:
             continue
         headers = list(rows[0].keys())
         if not is_pdd_order_headers(headers):
             continue
-        merchant_code_col = find_col(headers, ["商家编码-规格维度"])
+        merchant_code_col = find_col(headers, list(ORDER_SPEC_CODE_CANDIDATES))
         order_id_col = find_col(headers, ["订单号", "订单编号", "子订单编号", "主订单编号", "订单ID"])
         required = {
             "date": find_col(headers, ["订单成交时间", "支付时间"]),
@@ -711,8 +803,7 @@ def load_order_aggregates(
         }
         missing = [name for name, col in required.items() if not col]
         if missing:
-            warnings.append(f"订单文件缺字段,{path},{'|'.join(missing)}")
-            continue
+            raise ReportError(f"订单文件缺字段，已停止生成日报,{path},{'|'.join(missing)}")
         for row in rows:
             if not is_valid_order(row):
                 continue
@@ -726,8 +817,43 @@ def load_order_aggregates(
             merchant_spec_code = text(row.get(merchant_code_col)) if merchant_code_col else ""
             if not date or not style_id:
                 continue
-            actual_receipt = row.get(required["amount"])
-            quantity = number(row.get(required["qty"]))
+            order_id = text(row.get(order_id_col)) if order_id_col else ""
+            if order_id:
+                order_line_key = (
+                    shop,
+                    order_id,
+                    style_id,
+                    product_id,
+                    sku,
+                    merchant_spec_code,
+                )
+                selected_source = seen_order_lines.get(order_line_key)
+                if selected_source is not None and selected_source != path:
+                    warnings.append(
+                        "订单跨文件重复，已保留最新文件中的记录；"
+                        f"订单={order_id}，样式ID={style_id}，保留={selected_source}，忽略={path}"
+                    )
+                    continue
+                seen_order_lines.setdefault(order_line_key, path)
+            numeric_context = (
+                f"文件={path}，订单={order_id or '未提供'}，日期={date}，"
+                f"样式ID={style_id}，商品ID={product_id or '未提供'}"
+            )
+            try:
+                actual_receipt = parse_number_strict(
+                    row.get(required["amount"]),
+                    field_name="订单实收金额",
+                    context=numeric_context,
+                )
+                quantity = parse_number_strict(
+                    row.get(required["qty"]),
+                    field_name="订单数量",
+                    context=numeric_context,
+                )
+            except DataQualityError as exc:
+                raise ReportError(f"订单数字字段无效，已停止生成日报：{exc}") from exc
+            if quantity < 0.0:
+                raise ReportError(f"订单数量不能为负数，已停止生成日报：{numeric_context}，数量={quantity}")
             review_reasons: list[str] = []
             if is_small_actual_receipt(actual_receipt):
                 small_receipt_count += 1
@@ -753,7 +879,6 @@ def load_order_aggregates(
                     below_cost_count += 1
                     review_reasons.append(cost_reason)
             if review_reasons:
-                order_id = text(row.get(order_id_col)) if order_id_col else ""
                 detail = (
                     f"文件={path.name}；日期={date}；订单={order_id or '未提供'}；"
                     f"店铺={shop or '未提供'}；商品ID={product_id or '未提供'}；"
@@ -815,8 +940,7 @@ def load_promo_costs(
         try:
             rows = rows_to_dicts(read_workbook(path).rows)
         except Exception as exc:
-            warnings.append(f"推广文件读取失败,{path},{exc}")
-            continue
+            raise ReportError(f"推广文件读取失败，已停止生成日报,{path},{exc}") from exc
         if not rows:
             continue
         headers = list(rows[0].keys())
@@ -826,8 +950,7 @@ def load_promo_costs(
         shop_col = find_col(headers, list(PROMOTION_SHOP_CANDIDATES))
         plan_col = find_col(headers, list(PROMOTION_PLAN_CANDIDATES))
         if not product_col or not cost_col:
-            warnings.append(f"推广文件缺字段,{path},商品ID或花费")
-            continue
+            raise ReportError(f"推广文件缺字段，已停止生成日报,{path},商品ID或花费")
         if file_start_date and file_end_date and file_start_date != file_end_date and not date_col:
             raise ReportError(
                 f"拼多多区间推广文件没有逐行日期，无法生成准确日报，已停止：{path}。"
@@ -839,7 +962,15 @@ def load_promo_costs(
             )
         path_shop, path_plan_id = infer_path_dimensions(root, "推广数据", path)
         for row in rows:
-            amount = number(row.get(cost_col))
+            try:
+                amount = parse_number_strict(
+                    row.get(cost_col),
+                    field_name="推广花费",
+                    context=f"文件={path}，商品ID={text(row.get(product_col)) or '未提供'}",
+                    blank_as_zero=True,
+                )
+            except DataQualityError as exc:
+                raise ReportError(f"推广数字字段无效，已停止生成日报：{exc}") from exc
             if abs(amount) <= 1e-12:
                 continue
             product_id = text(row.get(product_col))
@@ -975,13 +1106,16 @@ def build_report(
 ) -> tuple[list[str], list[dict[str, Any]], list[str]]:
     columns = read_template_columns()
     marketing_rows = load_marketing_rows(marketing_path)
+    marketing_warnings = duplicate_identifier_warnings(
+        marketing_rows, "样式ID", "营销活动表样式ID"
+    ) + marketing_price_warnings(marketing_rows)
     template_products = load_marketing_products(marketing_rows)
     template_styles = load_marketing_styles(marketing_rows)
     known_marketing_product_ids = {
         text(row.get("商品ID")) for row in template_styles.values() if text(row.get("商品ID"))
     }
     cost_by_merchant_code, cost_warnings = load_costs_by_merchant_code(cost_table_path)
-    product_exports = load_product_exports(database_root)
+    product_exports, product_warnings = load_product_exports(database_root)
     order_rows, order_warnings = load_order_aggregates(
         database_root,
         target_dates,
@@ -1008,6 +1142,8 @@ def build_report(
     unmatched_cost_merchant_codes: set[str] = set()
     negative_gross_missing_price_product_ids: set[str] = set()
     arrival_price_warnings: list[str] = []
+    cost_data_warnings: list[str] = []
+    cost_source_logs: list[str] = []
     for key, aggregate in order_rows.items():
         date, _style_id = key
         style_id = text(aggregate.get("样式ID"))
@@ -1027,17 +1163,56 @@ def build_report(
         subsidy = number(row.get("总补贴金额"))
         merchant_spec_code = text(row.get("商家编码-规格维度"))
         marketing_cost = row.get("产品成本", "")
-        if merchant_spec_code and merchant_spec_code in cost_by_merchant_code:
-            row["产品成本"] = cost_by_merchant_code[merchant_spec_code]
-        elif text(marketing_cost) != "":
-            row["产品成本"] = marketing_cost
+        marketing_cost_value = optional_number(marketing_cost)
+        normalized_spec_code = normalize_match_code(merchant_spec_code)
+        cost_record = (
+            cost_by_merchant_code.get(normalized_spec_code, {})
+            if normalized_spec_code
+            else {}
+        )
+        if cost_record:
+            row["产品成本"] = cost_record["产品成本"]
+            selected_cost_source = cost_record["来源"]
+        elif marketing_cost_value is not None and marketing_cost_value > 0.0:
+            row["产品成本"] = marketing_cost_value
+            selected_cost_source = (
+                f"营销活动表:{marketing_path.name}/"
+                + marketing_cost_source(
+                    style_id,
+                    text(row.get("商品ID")),
+                    text(row.get("商品SKU")),
+                    template_products,
+                    template_styles,
+                )
+            )
         else:
             row["产品成本"] = ""
+            selected_cost_source = "未匹配"
+            if text(marketing_cost) != "":
+                cost_data_warnings.append(
+                    "营销活动表产品成本无效，已留空；"
+                    f"日期={date}，样式ID={style_id}，商品ID={text(row.get('商品ID')) or '未提供'}，"
+                    f"值={text(marketing_cost)}"
+                )
             if merchant_spec_code:
                 unmatched_cost_merchant_codes.add(merchant_spec_code)
+        for field in COST_METADATA_FIELDS:
+            row[field] = cost_record.get(field, "")
         has_cost = text(row.get("产品成本")) != ""
         cost = number(row.get("产品成本"))
         product_id = text(row.get("商品ID"))
+        cost_source_logs.append(
+            cost_source_log(
+                platform="拼多多",
+                date=date,
+                shop=text(row.get("店铺名称")),
+                product_id=product_id,
+                style_id=style_id,
+                order_spec_code=merchant_spec_code,
+                cost=row.get("产品成本"),
+                source=selected_cost_source,
+            )
+        )
         promo_total = promo_costs.get((date, product_id), 0.0)
         product_amount = product_sales.get((date, product_id), 0.0)
         row["到手价"], arrival_price_warning = resolve_arrival_price(
@@ -1087,6 +1262,30 @@ def build_report(
             product_exports,
         )
         empty_burn_rows.append({column: empty_burn_row.get(column, "") for column in columns})
+        empty_burn_cost = empty_burn_row.get("产品成本", "")
+        cost_source_logs.append(
+            cost_source_log(
+                platform="拼多多",
+                date=date,
+                shop=text(empty_burn_row.get("店铺名称")),
+                product_id=product_id,
+                style_id="",
+                order_spec_code="",
+                cost=empty_burn_cost,
+                source=(
+                    f"营销活动表:{marketing_path.name}/"
+                    + marketing_cost_source(
+                        "",
+                        product_id,
+                        text(empty_burn_row.get("商品SKU")),
+                        template_products,
+                        template_styles,
+                    )
+                    if text(empty_burn_cost)
+                    else "未匹配"
+                ),
+            )
+        )
         empty_burn_warnings.append(
             f"空烧推广费已写入报表,无有效销售,{date},{product_id},{promotion_fee:.2f}"
         )
@@ -1098,9 +1297,13 @@ def build_report(
         raise ReportError(str(exc)) from exc
     warnings = (
         order_warnings
+        + marketing_warnings
         + promo_warnings
         + cost_warnings
+        + product_warnings
         + arrival_price_warnings
+        + cost_data_warnings
+        + cost_source_logs
         + empty_burn_warnings
     )
     for product_id in sorted(negative_gross_missing_price_product_ids):
@@ -1139,6 +1342,7 @@ def write_workbook(path: Path, columns: list[str], rows: list[dict[str, Any]]) -
             if header
         }
         text_columns = {
+            "商品ID",
             "商品SKU",
             PROMOTION_MECHANISM_COLUMN,
             "定价是否合理",
@@ -1168,16 +1372,12 @@ def write_workbook(path: Path, columns: list[str], rows: list[dict[str, Any]]) -
         for header in text_columns:
             if header in column_numbers:
                 ws.Columns(column_numbers[header]).NumberFormat = "@"
-        if "商品ID" in column_numbers:
-            ws.Columns(column_numbers["商品ID"]).NumberFormat = "0"
         for c, header in enumerate(columns, start=1):
             ws.Cells(1, c).Value = header
         for r, row in enumerate(rows, start=2):
             for c, header in enumerate(columns, start=1):
                 value = row.get(header, "")
-                if header == "商品ID" and text(value).isdigit():
-                    value = int(text(value))
-                elif header in text_columns:
+                if header in text_columns:
                     value = text(value)
                 ws.Cells(r, c).Value = value
         ws.Rows(1).Font.Bold = True
@@ -1206,7 +1406,8 @@ def write_log(path: Path, rows_count: int, warnings: list[str]) -> None:
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         writer.writerow([now, "info", f"generated_rows={rows_count}"])
         for warning in warnings:
-            writer.writerow([now, "warning", warning])
+            level = "info" if warning.startswith(COST_SOURCE_LOG_PREFIX) else "warning"
+            writer.writerow([now, level, warning])
 
 
 def print_arrival_price_dialogue_reminders(warnings: list[str]) -> None:
@@ -1265,7 +1466,10 @@ def main() -> int:
     print(f"统计日期: {', '.join(sorted(target_dates))}")
     print(f"生成行数: {len(rows)}")
     other_warnings = [
-        warning for warning in warnings if not warning.startswith(ARRIVAL_PRICE_WARNING_PREFIX)
+        warning
+        for warning in warnings
+        if not warning.startswith(ARRIVAL_PRICE_WARNING_PREFIX)
+        and not warning.startswith(COST_SOURCE_LOG_PREFIX)
     ]
     if other_warnings:
         print("提醒:")

@@ -1,4 +1,4 @@
 interface:
-  display_name: "日报 2026.07.22.103959"
+  display_name: "日报 2026.07.22.134222"
   short_description: "自动区分天猫和拼多多模式，生成每天的经营数据报表。"
   default_prompt: "使用 $data-report-multi-platform 生成日报V2版本（天猫+拼多多）的指定日期经营报表。"
