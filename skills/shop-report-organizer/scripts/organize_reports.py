@@ -2509,6 +2509,9 @@ def merge_order_summary_record(
     merged: dict[str, str] = {}
     for header in final_headers:
         old_value = normalize_text(old_record.get(header, ""))
+        if header not in new_record:
+            merged[header] = old_value
+            continue
         new_value = normalize_text(new_record.get(header, ""))
         if (
             is_protected_order_info_header(header)
