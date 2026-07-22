@@ -44,7 +44,8 @@ python ".\scripts\organize_reports.py" --database-root "$databaseRoot" --dry-run
 
 3. Review `整理记录_预览.csv`, `缺失提醒_预览.csv`, and the console summary. Pay attention to files marked `pending` and reminders marked `missing`. Copy every row of the reminder log into the chat response as required by **Chat Reminder Output** below.
 4. For order reports, remember that each download usually covers the latest 7 days, so repeated downloads overlap. On `--apply`, merge order rows into cumulative shop/month tables by transaction month.
-   - Read at most 30,000 rows from each input spreadsheet by default.
+   - Use at most the first 100,000 rows only for preview, report recognition, and shop/period inference. This is a script-side preview guard, not an AI row-processing limit.
+   - During formal order merging, stream and validate every row in every source and existing monthly table. Never truncate formal processing at 100,000 rows, and never load the entire order table into the AI context.
 5. Only after the preview is acceptable and no required report is missing, run:
 
 ```powershell
@@ -129,8 +130,8 @@ The CSV reminder files are an audit copy, not the primary way the user should le
 
 Read `references/report_signatures.csv` for report signatures. Current content-based signatures:
 
-- Pinduoduo `订单数据`: headers include `订单号`, `订单状态`, `支付时间`, `商品id`.
-- Tmall `订单数据`: headers include `子订单编号`, `主订单编号`, `订单状态`, `订单付款时间`, `商品ID`.
+- Pinduoduo `订单数据`: headers include `订单号`, `订单状态`, `商品id`, plus either `支付时间`/`订单支付时间` or `订单成交时间`.
+- Tmall `订单数据`: headers include `子订单编号`, `主订单编号`, `订单状态`, `商品ID`, plus either `订单付款时间`/`订单支付时间` or `订单成交时间`.
 - Pinduoduo `售后数据`: headers include `售后编号`, `退款类型`, `申请时间`, `商品ID`.
 - Tmall 退款 `售后数据`: headers include `订单编号`, `退款编号`, `退款申请时间`, `退款状态`, `商品id`; use the refund application time as the period and the refund number to de-duplicate cumulative records.
 - `商品数据`: headers include `商品ID（必填）` and `商品名称`. Current product exports may be either the old product-code table with `商品编码`, or the newer stock export table with `SKUID（必填，注意不是SKU编码）`, `规格名称`, `库存增减`, and `规格编码`.
@@ -151,8 +152,7 @@ Store-name detection order:
 
 Period detection:
 
-- Pinduoduo `订单数据`: min and max of `支付时间`.
-- Tmall `订单数据`: min and max of `订单付款时间`, falling back to `订单创建时间`.
+- For every order row, prefer a valid `订单支付时间`、`支付时间` or `订单付款时间`; when that row's preferred value is blank or invalid, fall back to `订单成交时间`; for Tmall, fall back once more to `订单创建时间`. If both payment and transaction times are valid, use the payment/付款 time. A valid fallback means the row is valid and must not stop processing.
 - Pinduoduo `售后数据`: min and max of `申请时间`; Tmall refund exports use `退款申请时间`, falling back to `退款完结时间`.
 - `推广数据`: first use a spreadsheet date column if one exists; otherwise use the filename date range such as `20260627至20260627`.
 - `推广数据`: single-day files may be archived. A multi-day file may also be archived when the spreadsheet has a recognized date column, the non-summary data rows cover multiple valid dates, and every such row contains a valid product ID; use the actual full date range rather than the download date. The filename (including whether it contains `分天数据`) is not a condition. Other multi-day summary files, or files that fail either content check, must remain pending and must not be archived. The reminder must name the detected shop and say the shop may need to re-download promotion data by single day.
@@ -171,7 +171,11 @@ Maintain de-duplicated monthly order tables by shop and transaction month:
 Rules:
 
 - Only update monthly order tables during `--apply`; `--dry-run` must not change them.
-- Split Pinduoduo order rows by `支付时间` or `订单成交时间`; split Tmall order rows by `订单付款时间`, falling back to `订单创建时间`. Never split by file creation time, download time, or export month.
+- Split each order row by the first valid time under the payment/付款 → transaction → Tmall creation fallback rule above. Never split by file creation time, download time, or export month.
+- Treat 100,000 rows only as the preview/classification guard. Stream every row during formal order merging, including all rows from an existing monthly table, so 200,000- or 300,000-row inputs are processed by local Python rather than by the AI context.
+- Ignore only completely blank rows and explicit `总计`、`合计`、`汇总`、`注` or `说明` rows. If a real order row has no valid value in any available order-time field, stop the entire apply before moving files, show the source file, row number, order number, and original time values, and keep the source and existing monthly tables unchanged.
+- Before deleting a source, reconcile each input's nonblank row count as `有效订单行 + 明确忽略的说明/合计行`, then reconcile the de-duplicated database row count against all rows written to the monthly output parts. Any difference must stop the apply without deleting the source.
+- Keep each `.xlsx` worksheet within Excel's limit of 1,048,576 total rows including the header. When one shop-month exceeds 1,048,575 data rows, split it into sequential files named `..._第01部分.xlsx`, `..._第02部分.xlsx`, and so on, and print every part with its row count.
 - Keep one cumulative order table per shop per transaction month. If one downloaded order report contains multiple transaction months, split its rows into the matching monthly tables.
 - Use `订单号` as the Pinduoduo unique key. For Tmall use `子订单编号`, falling back to `主订单编号`.
 - When the same order appears in multiple downloaded order reports, keep one row and update ordinary fields from the latest downloaded report. This keeps fields such as `订单状态` current.

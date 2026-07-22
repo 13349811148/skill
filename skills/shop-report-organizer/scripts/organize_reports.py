@@ -4,12 +4,15 @@
 from __future__ import annotations
 
 import argparse
+import codecs
 import csv
 import datetime as dt
 import json
+import math
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -41,7 +44,21 @@ PROMOTION_ADJUSTMENT_REPORT_TYPE = "推广调整日志"
 PROMOTION_ADJUSTMENT_UPDATE_PREFIX = "推广调整日志更新至"
 ORDER_SUMMARY_PREFIX = "订单汇总表"
 ORDER_ID_HEADERS = ["订单号", "子订单编号", "主订单编号"]
-ORDER_TIME_HEADERS = ["支付时间", "订单成交时间", "订单付款时间", "订单创建时间"]
+ORDER_PAYMENT_TIME_HEADERS = [
+    "订单支付时间",
+    "支付时间",
+    "订单付款时间",
+]
+ORDER_TRANSACTION_TIME_HEADERS = ["订单成交时间"]
+ORDER_CREATION_TIME_HEADERS = ["订单创建时间"]
+ORDER_TIME_HEADERS = [
+    *ORDER_PAYMENT_TIME_HEADERS,
+    *ORDER_TRANSACTION_TIME_HEADERS,
+    *ORDER_CREATION_TIME_HEADERS,
+]
+PREVIEW_MAX_ROWS = 100_000
+EXCEL_MAX_DATA_ROWS = 1_048_575
+STREAM_COMMIT_INTERVAL = 2_000
 TMALL_PLATFORM = "天猫"
 TMALL_SHOP_SUFFIX = "（天猫）"
 ORDER_SUMMARY_METADATA_HEADERS = ["汇总_店铺名称", "汇总_最新下载时间", "汇总_最新来源文件", "汇总_最新归档文件"]
@@ -100,6 +117,14 @@ class ExpectedReport:
     report_type: str
     required: bool
     reminder_message: str
+
+
+@dataclass
+class OrderFileScan:
+    month_keys: set[str]
+    read_rows: int
+    valid_rows: int
+    ignored_rows: int
 
 
 def read_utf8_sig_csv(path: Path) -> list[dict[str, str]]:
@@ -203,29 +228,19 @@ def normalize_product_id(value: object) -> str:
 
 
 def read_csv_rows(path: Path, max_rows: int) -> list[list[str]]:
-    last_error: Exception | None = None
-    for encoding in ("utf-8-sig", "gb18030", "utf-8"):
-        try:
-            text = path.read_text(encoding=encoding, errors="strict")
-            rows: list[list[str]] = []
-            for index, row in enumerate(csv.reader(text.splitlines(), delimiter=",")):
-                if index >= max_rows:
-                    break
-                values = [normalize_text(cell) for cell in row]
-                if any(values):
-                    rows.append(values)
-            if rows and len(rows[0]) == 1 and "\t" in rows[0][0]:
-                rows = []
-                for index, row in enumerate(csv.reader(text.splitlines(), delimiter="\t")):
-                    if index >= max_rows:
-                        break
-                    values = [normalize_text(cell) for cell in row]
-                    if any(values):
-                        rows.append(values)
-            return rows
-        except Exception as exc:  # pragma: no cover - fallback path
-            last_error = exc
-    raise RuntimeError(f"CSV read failed: {last_error}")
+    encoding = detect_csv_encoding(path)
+    rows: list[list[str]] = []
+    with path.open("r", encoding=encoding, errors="strict", newline="") as handle:
+        first_line = handle.readline()
+        delimiter = "\t" if "\t" in first_line and "," not in first_line else ","
+        handle.seek(0)
+        for index, row in enumerate(csv.reader(handle, delimiter=delimiter)):
+            if index >= max_rows:
+                break
+            values = [normalize_text(cell) for cell in row]
+            if any(values):
+                rows.append(values)
+    return rows
 
 
 def read_xlsx_rows(path: Path, max_rows: int, max_cols: int) -> list[list[str]]:
@@ -241,8 +256,14 @@ def read_xlsx_rows(path: Path, max_rows: int, max_cols: int) -> list[list[str]]:
     for worksheet in workbook.worksheets:
         if len(rows) >= max_rows:
             break
-        if hasattr(worksheet, "reset_dimensions") and worksheet.calculate_dimension() == "A1:A1":
-            worksheet.reset_dimensions()
+        if hasattr(worksheet, "reset_dimensions"):
+            try:
+                dimension = worksheet.calculate_dimension()
+            except ValueError:
+                worksheet.reset_dimensions()
+            else:
+                if dimension == "A1:A1":
+                    worksheet.reset_dimensions()
         remaining_rows = max_rows - len(rows)
         for row in worksheet.iter_rows(
             min_row=1,
@@ -331,6 +352,73 @@ def read_rows(path: Path, max_rows: int, max_cols: int) -> list[list[str]]:
     raise RuntimeError(f"unsupported extension: {suffix}")
 
 
+def detect_csv_encoding(path: Path) -> str:
+    for encoding in ("utf-8-sig", "gb18030", "utf-8"):
+        decoder = codecs.getincrementaldecoder(encoding)(errors="strict")
+        try:
+            with path.open("rb") as handle:
+                while chunk := handle.read(1024 * 1024):
+                    decoder.decode(chunk)
+                decoder.decode(b"", final=True)
+            return encoding
+        except UnicodeDecodeError:
+            continue
+    raise RuntimeError(f"CSV encoding cannot be decoded: {path}")
+
+
+def iter_csv_rows_full(path: Path) -> Iterable[list[str]]:
+    encoding = detect_csv_encoding(path)
+    with path.open("r", encoding=encoding, errors="strict", newline="") as handle:
+        first_line = handle.readline()
+        delimiter = "\t" if "\t" in first_line and "," not in first_line else ","
+        handle.seek(0)
+        for row in csv.reader(handle, delimiter=delimiter):
+            values = [normalize_text(cell) for cell in row]
+            if any(values):
+                yield values
+
+
+def iter_xlsx_rows_full(path: Path, max_cols: int) -> Iterable[list[str]]:
+    try:
+        import openpyxl
+    except ImportError as exc:  # pragma: no cover - environment specific
+        raise RuntimeError("openpyxl is required for .xlsx files") from exc
+
+    workbook = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    try:
+        for worksheet in workbook.worksheets:
+            if hasattr(worksheet, "reset_dimensions"):
+                try:
+                    dimension = worksheet.calculate_dimension()
+                except ValueError:
+                    worksheet.reset_dimensions()
+                else:
+                    if dimension == "A1:A1":
+                        worksheet.reset_dimensions()
+            for row in worksheet.iter_rows(min_row=1, max_col=max_cols, values_only=True):
+                values = [normalize_text(cell) for cell in row]
+                if any(values):
+                    yield values
+    finally:
+        workbook.close()
+
+
+def iter_rows_full(path: Path, max_cols: int) -> Iterable[list[str]]:
+    suffix = path.suffix.lower()
+    if suffix == ".csv":
+        yield from iter_csv_rows_full(path)
+        return
+    if suffix == ".xlsx":
+        yield from iter_xlsx_rows_full(path, max_cols)
+        return
+    if suffix == ".xls":
+        # Legacy .xls worksheets cannot exceed 65,536 rows, so a complete COM
+        # read remains below the Excel single-sheet limit.
+        yield from read_xls_rows(path, EXCEL_MAX_DATA_ROWS + 1, max_cols)
+        return
+    raise RuntimeError(f"unsupported extension: {suffix}")
+
+
 def header_contains(headers: list[str], required: str) -> bool:
     needle = normalize_header(required)
     return any(needle in normalize_header(header) for header in headers)
@@ -343,6 +431,46 @@ def find_header_index(headers: list[str], candidates: Iterable[str]) -> int | No
             if needle and needle in normalize_header(header):
                 return index
     return None
+
+
+def find_header_indices(headers: list[str], candidates: Iterable[str]) -> list[tuple[str, int]]:
+    matches: list[tuple[str, int]] = []
+    seen_indices: set[int] = set()
+    for candidate in candidates:
+        needle = normalize_header(candidate)
+        index = next(
+            (
+                header_index
+                for header_index, header in enumerate(headers)
+                if header_index not in seen_indices and normalize_header(header) == needle
+            ),
+            None,
+        )
+        if index is None:
+            index = next(
+                (
+                    header_index
+                    for header_index, header in enumerate(headers)
+                    if header_index not in seen_indices
+                    and needle
+                    and needle in normalize_header(header)
+                ),
+                None,
+            )
+        if index is not None and index not in seen_indices:
+            matches.append((candidate, index))
+            seen_indices.add(index)
+    return matches
+
+
+def order_time_columns(headers: list[str]) -> list[tuple[str, int]]:
+    candidates = [*ORDER_PAYMENT_TIME_HEADERS, *ORDER_TRANSACTION_TIME_HEADERS]
+    if (
+        find_header_index(headers, ["子订单编号"]) is not None
+        and find_header_index(headers, ["主订单编号"]) is not None
+    ):
+        candidates.extend(ORDER_CREATION_TIME_HEADERS)
+    return find_header_indices(headers, candidates)
 
 
 def match_signature(rows: list[list[str]], signatures: list[Signature]) -> tuple[Signature | None, int, list[str], list[str]]:
@@ -573,15 +701,16 @@ def parse_date(text: object) -> dt.date | None:
 
 
 def date_range_from_column(rows: list[list[str]], header_row_index: int, headers: list[str], period_headers: list[str]) -> tuple[str, str] | None:
-    column_index = find_header_index(headers, period_headers)
-    if column_index is None:
+    columns = find_header_indices(headers, period_headers)
+    if not columns:
         return None
     dates: list[dt.date] = []
     for row in rows[header_row_index + 1 :]:
-        if column_index < len(row):
-            parsed = parse_date(row[column_index])
+        for _header, column_index in columns:
+            parsed = parse_date(row[column_index]) if column_index < len(row) else None
             if parsed:
                 dates.append(parsed)
+                break
     if not dates:
         return None
     start = min(dates).isoformat()
@@ -857,6 +986,364 @@ def parse_datetime_text(value: object) -> dt.datetime | None:
     return dt.datetime.combine(parsed_date, dt.time.min) if parsed_date else None
 
 
+def is_ignorable_order_row(row: list[str]) -> bool:
+    first_cell = normalize_text(row[0]) if row else ""
+    return (
+        first_cell in {"总计", "合计", "汇总"}
+        or first_cell.startswith("注")
+        or first_cell.startswith("说明")
+    )
+
+
+def resolve_order_row_datetime(
+    headers: list[str], row: list[str]
+) -> tuple[dt.datetime | None, str, str]:
+    return resolve_order_row_datetime_from_columns(
+        row, order_time_columns(headers)
+    )
+
+
+def resolve_order_row_datetime_from_columns(
+    row: list[str], time_columns: list[tuple[str, int]]
+) -> tuple[dt.datetime | None, str, str]:
+    raw_values: list[str] = []
+    for header, column_index in time_columns:
+        raw_value = normalize_text(row[column_index]) if column_index < len(row) else ""
+        raw_values.append(f"{header}={raw_value or '空'}")
+        parsed = parse_datetime_text(raw_value)
+        if parsed is not None:
+            return parsed, header, "；".join(raw_values)
+    return None, "", "；".join(raw_values) or "未找到订单时间列"
+
+
+def scan_order_file_full(path: Path, max_cols: int) -> OrderFileScan:
+    row_iterator = iter(iter_rows_full(path, max_cols))
+    try:
+        headers = next(row_iterator)
+    except StopIteration as exc:
+        raise RuntimeError(f"订单文件没有可读取内容：{path}") from exc
+
+    order_index = find_header_index(headers, ORDER_ID_HEADERS)
+    time_columns = order_time_columns(headers)
+    if order_index is None:
+        raise RuntimeError(f"订单文件缺少订单号列，停止整理并保留源文件：{path}")
+    if not time_columns:
+        raise RuntimeError(
+            "订单文件缺少订单支付/付款时间、订单成交时间和订单创建时间列，"
+            f"停止整理并保留源文件：{path}"
+        )
+
+    month_keys: set[str] = set()
+    read_rows = 0
+    valid_rows = 0
+    ignored_rows = 0
+    invalid_examples: list[str] = []
+    invalid_count = 0
+    for row_number, row in enumerate(row_iterator, start=2):
+        if not any(normalize_text(cell) for cell in row):
+            continue
+        read_rows += 1
+        if is_ignorable_order_row(row):
+            ignored_rows += 1
+            continue
+        parsed_time, _selected_header, raw_values = resolve_order_row_datetime_from_columns(
+            row, time_columns
+        )
+        if parsed_time is None:
+            invalid_count += 1
+            if len(invalid_examples) < 10:
+                order_id = normalize_text(row[order_index]) if order_index < len(row) else ""
+                invalid_examples.append(
+                    f"行={row_number}，订单号={order_id or '空'}，时间字段={raw_values}"
+                )
+            continue
+        valid_rows += 1
+        month_keys.add(parsed_time.strftime("%Y-%m"))
+
+    if invalid_count:
+        examples = "；".join(invalid_examples)
+        raise RuntimeError(
+            f"订单时间无法识别，共{invalid_count}行；{examples}。"
+            f"停止整理，不生成或覆盖月表，并保留源文件：{path}"
+        )
+    if read_rows != valid_rows + ignored_rows:
+        raise RuntimeError(
+            f"订单行数核对失败：读取={read_rows}，有效={valid_rows}，"
+            f"忽略说明/合计={ignored_rows}；停止整理并保留源文件：{path}"
+        )
+    if not month_keys:
+        raise RuntimeError(f"订单文件没有有效订单行，停止整理并保留源文件：{path}")
+    return OrderFileScan(month_keys, read_rows, valid_rows, ignored_rows)
+
+
+def order_merge_paths_full(
+    analysis: Analysis, database_root: Path, max_cols: int
+) -> tuple[list[Path], OrderFileScan]:
+    source_scan = scan_order_file_full(analysis.source, max_cols)
+    existing_paths: set[Path] = set()
+    for month_key in source_scan.month_keys:
+        target_dir = order_data_folder(database_root, analysis.shop_name, month_key)
+        existing_paths.update(order_data_existing_paths(target_dir))
+    merge_paths = sorted(
+        {*existing_paths, analysis.source},
+        key=lambda item: (order_source_datetime(item), item.name),
+    )
+    return merge_paths, source_scan
+
+
+def validate_order_merge_inputs(
+    analyses: list[Analysis], database_root: Path, max_cols: int
+) -> None:
+    checked: set[Path] = set()
+    for analysis in analyses:
+        if analysis.status != "ready" or analysis.report_type != ORDER_REPORT_TYPE:
+            continue
+        merge_paths, _source_scan = order_merge_paths_full(analysis, database_root, max_cols)
+        for path in merge_paths:
+            resolved = path.resolve()
+            if resolved in checked:
+                continue
+            scan_order_file_full(path, max_cols)
+            checked.add(resolved)
+    if checked:
+        print(f"order input integrity preflight passed: files={len(checked)}")
+
+
+def create_order_merge_database(path: Path) -> sqlite3.Connection:
+    connection = sqlite3.connect(path)
+    connection.execute("PRAGMA journal_mode=WAL")
+    connection.execute("PRAGMA synchronous=NORMAL")
+    connection.execute(
+        """
+        CREATE TABLE order_records (
+            month_key TEXT NOT NULL,
+            order_id TEXT NOT NULL,
+            sort_time TEXT NOT NULL,
+            record_json TEXT NOT NULL,
+            PRIMARY KEY (month_key, order_id)
+        )
+        """
+    )
+    return connection
+
+
+def load_order_merge_database(
+    connection: sqlite3.Connection,
+    paths: list[Path],
+    shop_name: str,
+    max_cols: int,
+) -> tuple[dict[str, list[str]], int, int, int, int]:
+    month_headers: dict[str, list[str]] = {}
+    total_read = 0
+    total_valid = 0
+    total_ignored = 0
+    duplicate_rows = 0
+    pending_writes = 0
+
+    for path in paths:
+        row_iterator = iter(iter_rows_full(path, max_cols))
+        try:
+            headers = next(row_iterator)
+        except StopIteration as exc:
+            raise RuntimeError(f"订单文件没有可读取内容：{path}") from exc
+        order_index = find_header_index(headers, ORDER_ID_HEADERS)
+        time_columns = order_time_columns(headers)
+        if order_index is None or not time_columns:
+            raise RuntimeError(f"订单文件缺少订单号或可用时间列：{path}")
+        source_time = order_source_datetime(path).strftime("%Y-%m-%d %H:%M:%S")
+        path_read = 0
+        path_valid = 0
+        path_ignored = 0
+
+        for row_number, row in enumerate(row_iterator, start=2):
+            if not any(normalize_text(cell) for cell in row):
+                continue
+            path_read += 1
+            if is_ignorable_order_row(row):
+                path_ignored += 1
+                continue
+            parsed_time, _selected_header, raw_values = resolve_order_row_datetime_from_columns(
+                row, time_columns
+            )
+            if parsed_time is None:
+                order_id = normalize_text(row[order_index]) if order_index < len(row) else ""
+                raise RuntimeError(
+                    f"订单时间无法识别：文件={path}，行={row_number}，"
+                    f"订单号={order_id or '空'}，时间字段={raw_values}；"
+                    "停止整理并保留源文件。"
+                )
+            path_valid += 1
+            month_key = parsed_time.strftime("%Y-%m")
+            final_headers = month_headers.setdefault(month_key, [])
+            append_headers(
+                final_headers,
+                [header for header in headers if header not in ORDER_SUMMARY_METADATA_HEADERS],
+            )
+            append_headers(final_headers, ORDER_SUMMARY_METADATA_HEADERS)
+            order_id = normalize_text(row[order_index]) if order_index < len(row) else ""
+            if not order_id:
+                order_id = f"_row_{path.resolve()}_{row_number}"
+            record = row_to_dict(headers, row)
+            record["汇总_店铺名称"] = shop_name
+            record["汇总_最新下载时间"] = source_time
+            record["汇总_最新来源文件"] = path.name
+            record["汇总_最新归档文件"] = ""
+            record_json = json.dumps(record, ensure_ascii=False, separators=(",", ":"))
+            cursor = connection.execute(
+                "INSERT OR IGNORE INTO order_records "
+                "(month_key, order_id, sort_time, record_json) VALUES (?, ?, ?, ?)",
+                (month_key, order_id, parsed_time.isoformat(), record_json),
+            )
+            if cursor.rowcount == 0:
+                duplicate_rows += 1
+                old_row = connection.execute(
+                    "SELECT record_json FROM order_records WHERE month_key=? AND order_id=?",
+                    (month_key, order_id),
+                ).fetchone()
+                old_record = json.loads(old_row[0]) if old_row else {}
+                merged_record = merge_order_summary_record(old_record, record, final_headers)
+                connection.execute(
+                    "UPDATE order_records SET sort_time=?, record_json=? "
+                    "WHERE month_key=? AND order_id=?",
+                    (
+                        parsed_time.isoformat(),
+                        json.dumps(merged_record, ensure_ascii=False, separators=(",", ":")),
+                        month_key,
+                        order_id,
+                    ),
+                )
+            pending_writes += 1
+            if pending_writes >= STREAM_COMMIT_INTERVAL:
+                connection.commit()
+                pending_writes = 0
+
+        if path_read != path_valid + path_ignored:
+            raise RuntimeError(
+                f"订单行数核对失败：文件={path}，读取={path_read}，"
+                f"有效={path_valid}，忽略={path_ignored}"
+            )
+        total_read += path_read
+        total_valid += path_valid
+        total_ignored += path_ignored
+
+    connection.commit()
+    unique_rows = int(connection.execute("SELECT COUNT(*) FROM order_records").fetchone()[0])
+    if total_valid - duplicate_rows != unique_rows:
+        raise RuntimeError(
+            f"订单去重核对失败：有效={total_valid}，重复={duplicate_rows}，唯一={unique_rows}"
+        )
+    return month_headers, total_read, total_valid, total_ignored, duplicate_rows
+
+
+def order_output_part_paths(
+    base_path: Path, total_rows: int, max_data_rows: int = EXCEL_MAX_DATA_ROWS
+) -> list[Path]:
+    if total_rows <= max_data_rows:
+        return [base_path]
+    part_count = math.ceil(total_rows / max_data_rows)
+    width = max(2, len(str(part_count)))
+    return [
+        base_path.with_name(
+            f"{base_path.stem}_第{part_number:0{width}d}部分{base_path.suffix}"
+        )
+        for part_number in range(1, part_count + 1)
+    ]
+
+
+def stage_order_outputs(
+    connection: sqlite3.Connection,
+    month_headers: dict[str, list[str]],
+    shop_name: str,
+    database_root: Path,
+    staging_dir: Path,
+    max_data_rows: int = EXCEL_MAX_DATA_ROWS,
+) -> list[tuple[Path, Path, int]]:
+    try:
+        from openpyxl import Workbook
+    except ImportError as exc:  # pragma: no cover - environment specific
+        raise RuntimeError("openpyxl is required to write merged order data") from exc
+
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    staged_outputs: list[tuple[Path, Path, int]] = []
+    for month_key in sorted(month_headers):
+        headers = month_headers[month_key]
+        total_rows = int(
+            connection.execute(
+                "SELECT COUNT(*) FROM order_records WHERE month_key=?", (month_key,)
+            ).fetchone()[0]
+        )
+        base_path = order_data_folder(database_root, shop_name, month_key) / (
+            f"{order_data_filename(shop_name, month_key)}.xlsx"
+        )
+        final_paths = order_output_part_paths(base_path, total_rows, max_data_rows)
+        records = connection.execute(
+            "SELECT record_json FROM order_records WHERE month_key=? "
+            "ORDER BY sort_time DESC, order_id",
+            (month_key,),
+        )
+        remaining = total_rows
+        month_written = 0
+        for final_path in final_paths:
+            part_rows = min(max_data_rows, remaining)
+            staged_path = staging_dir / final_path.name
+            workbook = Workbook(write_only=True)
+            worksheet = workbook.create_sheet("推广调整日志")
+            worksheet.freeze_panes = "A2"
+            worksheet.append(headers)
+            written = 0
+            for _ in range(part_rows):
+                database_row = records.fetchone()
+                if database_row is None:
+                    workbook.close()
+                    raise RuntimeError(
+                        f"订单输出提前结束：月份={month_key}，预计={total_rows}，已写={month_written}"
+                    )
+                record = json.loads(database_row[0])
+                record["汇总_最新归档文件"] = final_path.name
+                worksheet.append([normalize_text(record.get(header, "")) for header in headers])
+                written += 1
+                month_written += 1
+            workbook.save(staged_path)
+            workbook.close()
+            staged_outputs.append((staged_path, final_path, written))
+            remaining -= written
+        if month_written != total_rows or remaining != 0:
+            raise RuntimeError(
+                f"订单输出行数核对失败：月份={month_key}，数据库={total_rows}，写入={month_written}"
+            )
+    return staged_outputs
+
+
+def commit_order_outputs(
+    staged_outputs: list[tuple[Path, Path, int]],
+    old_paths: Iterable[Path],
+    source_path: Path,
+    backup_dir: Path,
+) -> None:
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    backups: list[tuple[Path, Path]] = []
+    installed: list[Path] = []
+    try:
+        for index, old_path in enumerate(sorted(set(old_paths), key=lambda item: str(item))):
+            if not old_path.exists():
+                continue
+            backup_path = backup_dir / f"{index:04d}_{old_path.name}"
+            os.replace(old_path, backup_path)
+            backups.append((backup_path, old_path))
+        for staged_path, final_path, _row_count in staged_outputs:
+            final_path.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(staged_path, final_path)
+            installed.append(final_path)
+    except Exception:
+        for final_path in installed:
+            final_path.unlink(missing_ok=True)
+        for backup_path, old_path in reversed(backups):
+            old_path.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(backup_path, old_path)
+        raise
+    source_path.unlink()
+
+
 def promotion_adjustment_merge_rows(paths: list[Path], max_rows: int, max_cols: int) -> tuple[list[str], list[list[str]], str]:
     header: list[str] = []
     data_rows: list[list[str]] = []
@@ -1096,36 +1583,65 @@ def merge_order_data(
     max_rows: int,
     max_cols: int,
 ) -> list[tuple[Path, int, int]]:
-    source_rows = read_rows(analysis.source, max_rows, max_cols)
-    source_months = order_month_keys_from_rows(source_rows)
-    outputs: list[tuple[Path, int, int]] = []
-    source_paths_to_remove: set[Path] = {analysis.source}
+    del max_rows  # The row cap is preview-only; formal order merging always reads every row.
+    merge_paths, source_scan = order_merge_paths_full(analysis, database_root, max_cols)
+    old_paths = [path for path in merge_paths if path.resolve() != analysis.source.resolve()]
+    with tempfile.TemporaryDirectory(prefix=".order-merge-", dir=database_root) as temp_name:
+        transaction_root = Path(temp_name)
+        connection = create_order_merge_database(transaction_root / "orders.sqlite3")
+        try:
+            (
+                month_headers,
+                total_read,
+                total_valid,
+                total_ignored,
+                duplicate_rows,
+            ) = load_order_merge_database(
+                connection,
+                merge_paths,
+                analysis.shop_name,
+                max_cols,
+            )
+            staged_outputs = stage_order_outputs(
+                connection,
+                month_headers,
+                analysis.shop_name,
+                database_root,
+                transaction_root / "new",
+            )
+            written_rows = sum(row_count for _staged, _final, row_count in staged_outputs)
+            unique_rows = int(
+                connection.execute("SELECT COUNT(*) FROM order_records").fetchone()[0]
+            )
+            if written_rows != unique_rows:
+                raise RuntimeError(
+                    f"订单合并最终核对失败：唯一订单={unique_rows}，写入={written_rows}；"
+                    "停止整理并保留源文件。"
+                )
+            commit_order_outputs(
+                staged_outputs,
+                old_paths,
+                analysis.source,
+                transaction_root / "old",
+            )
+        finally:
+            connection.close()
 
-    for month_key in sorted(source_months):
-        target_dir = order_data_folder(database_root, analysis.shop_name, month_key)
-        existing_paths = order_data_existing_paths(target_dir)
-        merge_paths = [*existing_paths, analysis.source]
-        merged_by_month = merge_order_rows_by_month(merge_paths, analysis.shop_name, max_rows, max_cols)
-        if month_key not in merged_by_month:
-            continue
-        headers, rows = merged_by_month[month_key]
-        final_path = target_dir / f"{order_data_filename(analysis.shop_name, month_key)}.xlsx"
-        archive_index = find_header_index(headers, ["汇总_最新归档文件"])
-        if archive_index is not None:
-            for row in rows:
-                if archive_index < len(row):
-                    row[archive_index] = final_path.name
-        write_xlsx_table(final_path, headers, rows)
-        for path in existing_paths:
-            if path.resolve() != final_path.resolve() and path.exists():
-                path.unlink()
-        outputs.append((final_path, len(merge_paths), len(rows)))
-
+    outputs = [
+        (final_path, len(merge_paths), row_count)
+        for _staged_path, final_path, row_count in staged_outputs
+    ]
     if outputs:
-        for path in source_paths_to_remove:
-            if path.exists():
-                path.unlink()
         analysis.target_path = outputs[-1][0]
+    print(
+        "order row integrity verified:",
+        f"source_rows={source_scan.read_rows}",
+        f"all_read={total_read}",
+        f"valid={total_valid}",
+        f"ignored={total_ignored}",
+        f"duplicates={duplicate_rows}",
+        f"written={sum(row_count for _path, _sources, row_count in outputs)}",
+    )
     return outputs
 
 
@@ -2088,7 +2604,15 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--dry-run", action="store_true", help="Preview only. This is the default.")
     mode.add_argument("--apply", action="store_true", help="Move and rename files.")
-    parser.add_argument("--max-rows", type=int, default=100000, help="Maximum rows to inspect per file (default: 100000).")
+    parser.add_argument(
+        "--max-rows",
+        type=int,
+        default=PREVIEW_MAX_ROWS,
+        help=(
+            "Maximum rows used for preview/classification (default: 100000). "
+            "Formal order merging always streams and validates every row."
+        ),
+    )
     parser.add_argument("--max-cols", type=int, default=120, help="Maximum columns to inspect per file.")
     parser.add_argument("--no-update-map", action="store_true", help="Do not update shop_product_map.csv on apply.")
     parser.add_argument(
@@ -2201,14 +2725,19 @@ def main(argv: list[str]) -> int:
         return 1
 
     if apply:
-        apply_actions(
-            analyses,
-            database_root=database_root,
-            update_map=not args.no_update_map,
-            product_map=product_map,
-            max_rows=args.max_rows,
-            max_cols=args.max_cols,
-        )
+        try:
+            validate_order_merge_inputs(analyses, database_root, args.max_cols)
+            apply_actions(
+                analyses,
+                database_root=database_root,
+                update_map=not args.no_update_map,
+                product_map=product_map,
+                max_rows=args.max_rows,
+                max_cols=args.max_cols,
+            )
+        except RuntimeError as exc:
+            print(f"apply stopped: {exc}", file=sys.stderr)
+            return 2
 
     print_missing_reminders(reminder_rows, reminder_path)
     print_summary(rows, manifest_path)
