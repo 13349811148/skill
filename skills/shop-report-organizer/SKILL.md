@@ -22,9 +22,9 @@ Follow this order exactly. Do not scan, classify, preview, or archive downloaded
 1. Run the **Update Gate** and reread this file when the installed release is current or updated.
 2. Confirm the database root and input folder, then run only `scripts/organize_reports.py --dry-run` as the entry point. Its first input-preparation action must safely extract every ZIP in `下载未分类` and move each successfully processed ZIP to `_已解压ZIP`.
 3. If any ZIP cannot be extracted, contains no supported spreadsheet, or fails the safety check, stop immediately, report the ZIP filename and error in the chat, and do not scan the remaining reports or run `--apply`.
-4. After ZIP preparation succeeds, let the script inspect workbook contents, classify reports, and produce the preview and reminder logs. Do not classify reports from filenames alone.
+4. After ZIP preparation succeeds, let the script inspect workbook contents, classify reports, and compare file contents. For files with identical SHA-256 content, retain one deterministic source for processing and mark every other copy as `duplicate_file`; do not classify reports from filenames alone.
 5. Review every preview/reminder row with the user. Run `--apply` only after the preview is acceptable and all required reports are present, unless the user explicitly approves `--allow-missing-required` for a supplemental batch.
-6. Verify the apply result, then send every required reminder and unresolved item in the current Codex or Work Buddy conversation.
+6. Verify the apply result, including every `duplicate_file` moved to `下载未分类\_重复文件`, then send every required reminder and unresolved item in the current Codex or Work Buddy conversation.
 
 ## Workflow
 
@@ -42,7 +42,7 @@ $databaseRoot = Join-Path $env:USERPROFILE "Desktop\运营数据库"
 python ".\scripts\organize_reports.py" --database-root "$databaseRoot" --dry-run
 ```
 
-3. Review `整理记录_预览.csv`, `缺失提醒_预览.csv`, and the console summary. Pay attention to files marked `pending` and reminders marked `missing`. Copy every row of the reminder log into the chat response as required by **Chat Reminder Output** below.
+3. Review `整理记录_预览.csv`, `缺失提醒_预览.csv`, and the console summary. Pay attention to files marked `pending` or `duplicate_file` and reminders marked `missing`. Copy every row of the reminder log into the chat response as required by **Chat Reminder Output** below.
 4. For order reports, remember that each download usually covers the latest 7 days, so repeated downloads overlap. On `--apply`, merge order rows into cumulative shop/month tables by transaction month.
    - Use at most the first 100,000 rows only for preview, report recognition, and shop/period inference. This is a script-side preview guard, not an AI row-processing limit.
    - During formal order merging, stream and validate every row in every source and existing monthly table. Never truncate formal processing at 100,000 rows, and never load the entire order table into the AI context.
@@ -119,7 +119,7 @@ Rules:
 
 The CSV reminder files are an audit copy, not the primary way the user should learn the result. After every `--dry-run` and `--apply` run:
 
-- Show every reminder-log row in the chat window. This includes `missing`, `new_product_id`, `historical_product_id`, `pending`, and `ok` rows.
+- Show every reminder-log row in the chat window. This includes `missing`, `new_product_id`, `historical_product_id`, `duplicate_file`, `pending`, and `ok` rows.
 - For each row, include its status, shop name, report type, source filename, product IDs when present, and the complete `message` text. Do not replace these rows with only a count, a CSV path, or a general summary.
 - When the only row is `status=ok`, explicitly tell the user that no required report, new-product, historical-product, or pending-file reminder was found.
 - Show the complete reminder log after preview. If apply is run, show the complete apply reminder log in the final response; do not assume the preview message was enough.

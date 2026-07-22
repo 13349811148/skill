@@ -7,6 +7,7 @@ import argparse
 import codecs
 import csv
 import datetime as dt
+import hashlib
 import json
 import math
 import os
@@ -32,6 +33,7 @@ EXPECTED_REPORTS_PATH = REFERENCES_DIR / "expected_reports.csv"
 SUPPORTED_EXTENSIONS = {".csv", ".xlsx", ".xls"}
 SUPPORTED_ARCHIVE_EXTENSIONS = {".zip"}
 EXTRACTED_ZIP_FOLDER_NAME = "_已解压ZIP"
+DUPLICATE_INPUT_FOLDER_NAME = "_重复文件"
 INVALID_FILENAME_CHARS = r'<>:"/\|?*'
 PRODUCT_ID_CHECK_REPORT_TYPES = {"订单数据", "售后数据", "推广数据"}
 PRODUCT_DATA_REQUIRED_SOURCE_REPORT_TYPES = {"订单数据", "推广数据"}
@@ -1874,6 +1876,36 @@ def file_crc32(path: Path) -> int:
     return checksum & 0xFFFFFFFF
 
 
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def mark_exact_duplicate_inputs(analyses: list[Analysis], input_dir: Path) -> None:
+    """Keep one deterministically chosen source per identical-content group."""
+    groups: dict[tuple[int, str], list[Analysis]] = {}
+    for analysis in analyses:
+        if not analysis.source.is_file():
+            continue
+        key = (analysis.source.stat().st_size, file_sha256(analysis.source))
+        groups.setdefault(key, []).append(analysis)
+
+    duplicate_dir = input_dir / DUPLICATE_INPUT_FOLDER_NAME
+    for group in groups.values():
+        if len(group) < 2:
+            continue
+        group.sort(key=lambda item: (item.status != "ready", item.source.name.lower()))
+        retained = group[0]
+        for duplicate in group[1:]:
+            duplicate.status = "duplicate_file"
+            duplicate.reason = f"exact_duplicate_of:{retained.source.name}"
+            duplicate.target_folder = DUPLICATE_INPUT_FOLDER_NAME
+            duplicate.target_path = unique_path(duplicate_dir / duplicate.source.name)
+
+
 def zip_member_filename(info: zipfile.ZipInfo) -> str:
     raw_name = info.filename.replace("\\", "/")
     member_path = PurePosixPath(raw_name)
@@ -2136,6 +2168,8 @@ def missing_report_reminder_rows(
 
     product_id_groups: dict[str, dict[str, dict[str, set[str]]]] = {}
     for analysis in analyses:
+        if analysis.status == "duplicate_file":
+            continue
         if analysis.report_type not in PRODUCT_ID_CHECK_REPORT_TYPES or not analysis.new_product_ids:
             continue
         shop_key = analysis.shop_name or "未识别店铺"
@@ -2247,6 +2281,28 @@ def missing_report_reminder_rows(
                 "文件已保留在原位置，可能需要按单日重新下载该店铺推广数据。"
             )
         return f"文件未整理，保留在原位置：{analysis.reason}；缺少字段：{analysis.missing_fields}"
+
+    for analysis in analyses:
+        if analysis.status != "duplicate_file":
+            continue
+        retained_name = analysis.reason.removeprefix("exact_duplicate_of:")
+        rows.append(
+            {
+                "action": action,
+                "status": "duplicate_file",
+                "report_type": analysis.report_type,
+                "detected_count": "1",
+                "shop_name": analysis.shop_name,
+                "source_name": analysis.source.name,
+                "source_path": str(analysis.source),
+                "new_product_ids": "",
+                "message": (
+                    f"文件内容与 {retained_name} 完全相同；仅保留该文件参与归档/合并，"
+                    f"本文件在正式处理时将移至 {DUPLICATE_INPUT_FOLDER_NAME}。"
+                ),
+                "input_path": str(input_dir),
+            }
+        )
 
     for analysis in analyses:
         if analysis.status != "pending":
@@ -2593,6 +2649,19 @@ def apply_actions(
         if update_map:
             for product_id, shop_name in analysis.map_updates:
                 product_map[product_id] = shop_name
+
+    for analysis in analyses:
+        if analysis.status != "duplicate_file":
+            continue
+        target = analysis.target_path
+        if target.exists():
+            target = unique_path(target)
+            analysis.target_path = target
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(analysis.source), str(target))
+        retained_name = analysis.reason.removeprefix("exact_duplicate_of:")
+        print(f"exact duplicate moved: {analysis.source} -> {target}; retained={retained_name}")
+
     if update_map:
         save_product_map(product_map)
 
@@ -2680,6 +2749,11 @@ def main(argv: list[str]) -> int:
     file_download_dates = {path: download_date(path) for path in files}
     apply_batch_shop_inference(database_root, analyses, signatures, file_download_dates)
     reserve_unique_targets(analyses)
+    try:
+        mark_exact_duplicate_inputs(analyses, input_dir)
+    except OSError as exc:
+        print(f"duplicate-file precheck failed: {exc}", file=sys.stderr)
+        return 2
 
     preliminary_action = "apply" if apply else "dry-run"
     preliminary_reminder_rows = missing_report_reminder_rows(expected_reports, analyses, preliminary_action, input_dir)
