@@ -24,6 +24,12 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Iterable
 
+from order_line_protection import (
+    ORDER_SALES_MARK_HEADERS,
+    apply_order_sales_marks,
+    classify_order_line,
+)
+
 
 SKILL_DIR = Path(__file__).resolve().parents[1]
 REFERENCES_DIR = SKILL_DIR / "references"
@@ -123,6 +129,8 @@ class Analysis:
     map_updates: list[tuple[str, str]]
     product_ids: list[str]
     new_product_ids: list[str]
+    supplementary_price_rows: int = 0
+    supplementary_price_examples: str = ""
 
 
 @dataclass
@@ -899,7 +907,13 @@ def iter_promotion_rows_full(path: Path, max_cols: int) -> Iterable[PromotionRow
     raise RuntimeError(f"unsupported extension: {suffix}")
 
 
-def collect_product_ids(rows: list[list[str]], header_row_index: int, headers: list[str], signature: Signature | None) -> list[str]:
+def collect_product_ids(
+    rows: list[list[str]],
+    header_row_index: int,
+    headers: list[str],
+    signature: Signature | None,
+    exclude_supplementary_price_order_lines: bool = False,
+) -> list[str]:
     candidates = signature.product_id_headers if signature else ["商品ID", "商品id"]
     column_index = find_header_index(headers, candidates)
     if column_index is None:
@@ -911,11 +925,15 @@ def collect_product_ids(rows: list[list[str]], header_row_index: int, headers: l
     product_ids: list[str] = []
     if column_index is not None:
         for row in rows[header_row_index + 1 :]:
+            if exclude_supplementary_price_order_lines:
+                record = row_to_dict(headers, row)
+                if classify_order_line(record).is_supplementary_price:
+                    continue
             if column_index < len(row):
                 product_id = normalize_product_id(row[column_index])
                 if product_id:
                     product_ids.append(product_id)
-    if not product_ids:
+    if not product_ids and not exclude_supplementary_price_order_lines:
         product_id_pattern = re.compile(r"\u5546\u54c1\s*ID[\uff1a:]\s*(\d{6,})", flags=re.IGNORECASE)
         for row in rows[header_row_index + 1 :]:
             for cell in row:
@@ -924,6 +942,30 @@ def collect_product_ids(rows: list[list[str]], header_row_index: int, headers: l
                     if product_id:
                         product_ids.append(product_id)
     return product_ids
+
+
+def preview_supplementary_price_order_rows(
+    rows: list[list[str]], header_row_index: int, headers: list[str], signature: Signature
+) -> tuple[int, str]:
+    """Return preview-only count and examples for order lines excluded from sales."""
+    if signature.report_type != ORDER_REPORT_TYPE:
+        return 0, ""
+    count = 0
+    examples: list[str] = []
+    for physical_row, row in enumerate(rows[header_row_index + 1 :], start=header_row_index + 2):
+        values = [normalize_text(value) for value in row]
+        if not any(values) or is_ignorable_order_row(values):
+            continue
+        classification = classify_order_line(row_to_dict(headers, values))
+        if not classification.is_supplementary_price:
+            continue
+        count += 1
+        if len(examples) < 3:
+            examples.append(
+                f"第{physical_row}行，{classification.title_header or '订单性质'}="
+                f"{classification.original_title or '补差价'}"
+            )
+    return count, "；".join(examples)
 
 
 def shop_from_product_archive_path(path: Path, database_root: Path) -> str:
@@ -2130,6 +2172,7 @@ def load_order_merge_database(
         path_read = 0
         path_valid = 0
         path_ignored = 0
+        supplementary_price_rows = 0
 
         for order_row in iter_order_rows_full(path, max_cols):
             row_number = order_row.row_number
@@ -2175,8 +2218,12 @@ def load_order_merge_database(
                 final_headers,
                 [header for header in headers if header not in ORDER_SUMMARY_METADATA_HEADERS],
             )
+            append_headers(final_headers, ORDER_SALES_MARK_HEADERS)
             append_headers(final_headers, ORDER_SUMMARY_METADATA_HEADERS)
             record = row_to_dict(headers, row)
+            classification = apply_order_sales_marks(record)
+            if classification.is_supplementary_price:
+                supplementary_price_rows += 1
             if is_current_source:
                 source_time = current_file_creation_time
                 record["汇总_最新下载时间"] = source_time
@@ -2283,6 +2330,13 @@ def load_order_merge_database(
         total_read += path_read
         total_valid += path_valid
         total_ignored += path_ignored
+        if supplementary_price_rows:
+            print(
+                "supplementary-price order lines:",
+                "已识别为补差价，不计销售",
+                f"file={path}",
+                f"rows={supplementary_price_rows}",
+            )
 
     connection.commit()
     unique_rows = int(connection.execute("SELECT COUNT(*) FROM order_records").fetchone()[0])
@@ -2738,8 +2792,10 @@ def merge_order_rows_by_month(
             month_key = parsed_time.strftime("%Y-%m")
             final_headers = month_headers.setdefault(month_key, [])
             append_headers(final_headers, [header for header in headers if header not in ORDER_SUMMARY_METADATA_HEADERS])
+            append_headers(final_headers, ORDER_SALES_MARK_HEADERS)
             append_headers(final_headers, ORDER_SUMMARY_METADATA_HEADERS)
             record = row_to_dict(headers, row)
+            apply_order_sales_marks(record)
             record["汇总_店铺名称"] = shop_name
             record["汇总_最新下载时间"] = source_time
             record["汇总_最新来源文件"] = path.name
@@ -2995,9 +3051,34 @@ def analyze_file(
         )
 
     product_ids = collect_product_ids(rows, header_row_index, headers, signature)
+    sales_product_ids = collect_product_ids(
+        rows,
+        header_row_index,
+        headers,
+        signature,
+        exclude_supplementary_price_order_lines=(
+            signature.report_type == ORDER_REPORT_TYPE
+        ),
+    )
+    supplementary_price_rows, supplementary_price_examples = (
+        preview_supplementary_price_order_rows(
+            rows, header_row_index, headers, signature
+        )
+    )
     new_product_ids = []
     if signature.report_type in PRODUCT_ID_CHECK_REPORT_TYPES:
-        new_product_ids = sorted({product_id for product_id in product_ids if product_id not in product_map})
+        product_ids_for_reminder = (
+            sales_product_ids
+            if signature.report_type == ORDER_REPORT_TYPE
+            else product_ids
+        )
+        new_product_ids = sorted(
+            {
+                product_id
+                for product_id in product_ids_for_reminder
+                if product_id not in product_map
+            }
+        )
     shop_name, shop_source, product_counts = decide_shop(
         source, signature.report_type, rows, product_ids, product_map, shops
     )
@@ -3062,6 +3143,8 @@ def analyze_file(
             map_updates=map_updates,
             product_ids=product_ids,
             new_product_ids=new_product_ids,
+            supplementary_price_rows=supplementary_price_rows,
+            supplementary_price_examples=supplementary_price_examples,
         )
 
     target = target_for_success(database_root, source, signature, shop_name, period, file_download_date, product_ids)
@@ -3083,6 +3166,8 @@ def analyze_file(
         map_updates=map_updates,
         product_ids=product_ids,
         new_product_ids=new_product_ids,
+        supplementary_price_rows=supplementary_price_rows,
+        supplementary_price_examples=supplementary_price_examples,
     )
 
 
@@ -3332,6 +3417,13 @@ def manifest_row(analysis: Analysis, action: str) -> dict[str, str]:
         "missing_fields": analysis.missing_fields,
         "map_updates": ";".join(f"{product_id}:{shop}" for product_id, shop in analysis.map_updates),
         "new_product_ids": "|".join(analysis.new_product_ids),
+        "supplementary_price_rows": str(analysis.supplementary_price_rows),
+        "supplementary_price_message": (
+            "已识别为补差价，不计销售；不触发新商品ID提醒或商品映射。"
+            if analysis.supplementary_price_rows
+            else ""
+        ),
+        "supplementary_price_examples": analysis.supplementary_price_examples,
     }
 
 
@@ -3384,6 +3476,28 @@ def missing_report_reminder_rows(
                         "input_path": str(input_dir),
                     }
                 )
+
+    for analysis in analyses:
+        if not analysis.supplementary_price_rows:
+            continue
+        rows.append(
+            {
+                "action": action,
+                "status": "supplementary_price_excluded",
+                "report_type": ORDER_REPORT_TYPE,
+                "detected_count": str(analysis.supplementary_price_rows),
+                "shop_name": analysis.shop_name,
+                "source_name": analysis.source.name,
+                "source_path": str(analysis.source),
+                "new_product_ids": "",
+                "message": (
+                    "已识别为补差价，不计销售；按订单明细排除，"
+                    "混合订单中的正常商品仍照常处理；"
+                    "不触发新商品ID提醒或商品映射。"
+                ),
+                "input_path": str(input_dir),
+            }
+        )
 
     def preview_product_ids(product_ids: list[str]) -> str:
         preview_ids = "、".join(product_ids[:10])
@@ -3894,6 +4008,12 @@ def print_summary(rows: list[dict[str, str]], manifest_path: Path) -> None:
         print(f"[{row['status']}] {row['source_name']} -> {row['target_path']}")
         if row["reason"] != "ok":
             print(f"  reason: {row['reason']} missing={row['missing_fields']}")
+        if row.get("supplementary_price_rows", "0") != "0":
+            print(
+                "  已识别为补差价，不计销售："
+                f"明细={row['supplementary_price_rows']}；"
+                "不触发新商品ID提醒或商品映射。"
+            )
 
 
 def apply_actions(
@@ -4087,6 +4207,9 @@ def main(argv: list[str]) -> int:
             "missing_fields",
             "map_updates",
             "new_product_ids",
+            "supplementary_price_rows",
+            "supplementary_price_message",
+            "supplementary_price_examples",
         ],
     )
     reminder_path = missing_reminder_path(database_root, apply)

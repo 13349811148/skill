@@ -43,6 +43,7 @@ from handoff_protection import (
     numbered_dict_rows,
     resolve_order_date,
 )
+from order_line_protection import classify_order_line
 from promotion_protection import (
     PromotionProtectionError,
     PromotionSnapshotRow,
@@ -790,6 +791,8 @@ def load_order_aggregates(
     review_details: list[str] = []
     small_receipt_count = 0
     below_cost_count = 0
+    supplementary_price_lines = 0
+    marked_non_sales_lines = 0
     missing_cost_rows: set[tuple[str, str, str, str, str]] = set()
     seen_order_lines: dict[tuple[str, str, str, str, str], Path] = {}
     order_paths, duplicate_file_warnings = deduplicate_exact_files(
@@ -878,6 +881,13 @@ def load_order_aggregates(
                         f"订单={order_id or '未提供'}，日期字段={raw_dates or '未找到'}"
                     )
                 if date not in target_dates:
+                    continue
+                sales_classification = classify_order_line(row)
+                if sales_classification.sales_excluded:
+                    if sales_classification.is_supplementary_price:
+                        supplementary_price_lines += 1
+                    else:
+                        marked_non_sales_lines += 1
                     continue
                 style_id = text(row.get(required["style_id"]))
                 product_id = text(row.get(required["product_id"]))
@@ -1008,6 +1018,17 @@ def load_order_aggregates(
     for date, shop, product_id, style_id, merchant_spec_code in sorted(missing_cost_rows):
         warnings.append(
             f"订单成本缺失，未执行低于成本10%检查,{date},{shop},{product_id},{style_id},{merchant_spec_code}"
+        )
+    if supplementary_price_lines:
+        warnings.append(
+            "已识别为补差价，不计销售；"
+            f"已按订单明细从天猫经营统计中排除{supplementary_price_lines}条，"
+            "混合订单中的正常商品仍照常计入。"
+        )
+    if marked_non_sales_lines:
+        warnings.append(
+            "订单已标记为不计销售；"
+            f"已按订单明细从天猫经营统计中排除{marked_non_sales_lines}条。"
         )
     return aggregates, warnings
 

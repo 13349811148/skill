@@ -167,6 +167,15 @@ Period detection:
 
 Download date comes from the source file's filesystem creation time: use `st_birthtime` on macOS and the Windows creation time on Windows; fall back to modified time only when the platform has no creation-time field. Dates written in filenames never replace the filesystem creation time.
 
+## 补差价订单明细保护
+
+Apply this rule to every current and future platform's order-detail import. Classify one order detail at a time; never classify, exclude, or retain an entire order merely because another detail has the same order number.
+
+- Standardize `商品标题`/`商品名称` (and equivalent title fields) by trimming surrounding whitespace, normalizing full-width and half-width characters, and removing square-bracketed marketing prompts. When the standardized title contains `补差价` or `补收差价`, mark that detail as `订单性质=补差价` and `是否计销售=否`. Do not use 商品ID、金额、数量 or SKU/specification for this decision.
+- Preserve the marked detail in its raw monthly order archive. Set ordinary details to `订单性质=正常` and `是否计销售=是` unless the source already provides a non-sales mark.
+- Exclude only the marked detail from new-product-ID reminders and product-map requirements. Keep product IDs available for shop inference; do not create a new-product reminder, require a product export, or add a product mapping solely for a 补差价 detail.
+- In preview manifests, reminder logs, formal merge output, and the current Codex or Work Buddy conversation, state `已识别为补差价，不计销售`, include the detail count, and state that normal details in a mixed order remain unchanged.
+
 ## Order Data Monthly Merge
 
 Maintain de-duplicated monthly order tables by shop and transaction month:
