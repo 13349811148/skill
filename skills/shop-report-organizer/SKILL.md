@@ -87,6 +87,13 @@ Special filename format and merge rule for `售后数据`:
 
 For `售后数据`, keep one cumulative table per shop in the current download-month archive folder. On `--apply`, read every row from the new source and every existing cumulative table without the 100,000-row preview cap, merge them, de-duplicate by `售后编号`, keep the row from the later source when the same `售后编号` appears again, sort by `申请时间` newest first, and rename the cumulative table so the filename's `更新至YYYY-MM-DD` matches the latest `申请时间` in the merged rows. Print the merged target file, source file count, and de-duplicated row count in the message window.
 
+Special validation and merge rule for `推广数据`:
+
+- Require every non-summary promotion detail row to contain both a valid specific date and a valid product ID. Never use a filename date as a fallback for promotion archiving. If either field is missing from the header or any detail row, keep the source in its original location, mark it `pending`, and tell the user to re-download the promotion detail with both fields.
+- Keep exactly one cumulative promotion workbook per shop at `推广数据/<店铺>/<店铺>—推广数据.xlsx`; do not create one workbook per product ID.
+- Preserve each source column and add normalized `归档日期` and `归档商品ID` columns, so the combined shop workbook always contains the date and product ID used for filing.
+- On `--apply`, validate every row of the new source before moving any file. Then merge the source with the shop's existing cumulative promotion workbook, de-duplicate only completely identical rows, sort by `归档日期` and `归档商品ID`, and replace the workbook transactionally. Print the target file, source file count, and de-duplicated row count in the message window.
+
 Use the existing archive layout:
 
 ```text
@@ -154,8 +161,8 @@ Period detection:
 
 - For every order row, prefer a valid `订单支付时间`、`支付时间` or `订单付款时间`; when that row's preferred value is blank or invalid, fall back to `订单成交时间`; for Tmall, fall back once more to `订单创建时间`. If both payment and transaction times are valid, use the payment/付款 time. A valid fallback means the row is valid and must not stop processing.
 - Pinduoduo `售后数据`: min and max of `申请时间`; Tmall refund exports use `退款申请时间`, falling back to `退款完结时间`.
-- `推广数据`: first use a spreadsheet date column if one exists; otherwise use the filename date range such as `20260627至20260627`.
-- `推广数据`: single-day files may be archived. A multi-day file may also be archived when the spreadsheet has a recognized date column, the non-summary data rows cover multiple valid dates, and every such row contains a valid product ID; use the actual full date range rather than the download date. The filename (including whether it contains `分天数据`) is not a condition. Other multi-day summary files, or files that fail either content check, must remain pending and must not be archived. The reminder must name the detected shop and say the shop may need to re-download promotion data by single day.
+- `推广数据`: use only the actual spreadsheet date column. Do not use a filename date range as a fallback.
+- `推广数据`: archive single-day or multi-day detail only when every non-summary row has a valid date and product ID. Keep a file pending when its date or product ID field is missing, blank, or invalid in any detail row, and tell the user to re-download a promotion detail export that includes both fields. The filename (including whether it contains `分天数据`) is not a condition.
 - `商品数据`: use the download date as a one-day period when no content period exists.
 
 Download date comes from the source file's filesystem creation time: use `st_birthtime` on macOS and the Windows creation time on Windows; fall back to modified time only when the platform has no creation-time field. Dates written in filenames never replace the filesystem creation time.

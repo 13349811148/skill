@@ -42,6 +42,10 @@ ORDER_REPORT_TYPE = "订单数据"
 ORDER_DATA_PREFIX = "订单数据"
 AFTER_SALE_REPORT_TYPE = "售后数据"
 AFTER_SALE_UPDATE_PREFIX = "售后数据更新至"
+PROMOTION_REPORT_TYPE = "推广数据"
+PROMOTION_DATA_PREFIX = "推广数据"
+PROMOTION_ARCHIVE_DATE_HEADER = "归档日期"
+PROMOTION_ARCHIVE_PRODUCT_ID_HEADER = "归档商品ID"
 PROMOTION_ADJUSTMENT_REPORT_TYPE = "推广调整日志"
 PROMOTION_ADJUSTMENT_UPDATE_PREFIX = "推广调整日志更新至"
 ORDER_SUMMARY_PREFIX = "订单汇总表"
@@ -117,6 +121,24 @@ class Analysis:
     map_updates: list[tuple[str, str]]
     product_ids: list[str]
     new_product_ids: list[str]
+
+
+@dataclass
+class PromotionRow:
+    sheet_name: str
+    row_number: int
+    headers: list[str]
+    values: list[str]
+    signature: Signature
+
+
+@dataclass
+class PromotionValidation:
+    data_rows: int
+    valid_rows: int
+    missing_date_rows: int
+    missing_product_id_rows: int
+    examples: list[str]
 
 
 @dataclass
@@ -730,6 +752,150 @@ def match_signature(rows: list[list[str]], signatures: list[Signature]) -> tuple
     return best[1], best[2], best[3], best[4]
 
 
+def promotion_signatures() -> list[Signature]:
+    return [
+        signature
+        for signature in load_signatures()
+        if signature.report_type == PROMOTION_REPORT_TYPE
+    ]
+
+
+def promotion_signature_for_headers(headers: list[str], signatures: list[Signature]) -> Signature | None:
+    for signature in signatures:
+        if all(header_contains(headers, required) for required in signature.required_headers):
+            return signature
+    return None
+
+
+def find_promotion_header(
+    numbered_rows: Iterable[tuple[int, list[str]]], signatures: list[Signature]
+) -> tuple[int, list[str], Signature] | None:
+    nonblank_seen = 0
+    for row_number, values in numbered_rows:
+        if not any(normalize_text(value) for value in values):
+            continue
+        nonblank_seen += 1
+        signature = promotion_signature_for_headers(values, signatures)
+        if signature is not None:
+            return row_number, values, signature
+        if nonblank_seen >= ORDER_HEADER_SEARCH_ROWS:
+            break
+    return None
+
+
+def iter_promotion_rows_full(path: Path, max_cols: int) -> Iterable[PromotionRow]:
+    signatures = promotion_signatures()
+    suffix = path.suffix.lower()
+
+    if suffix == ".csv":
+        encoding = detect_csv_encoding(path)
+        delimiter = csv_delimiter(path, encoding)
+        with path.open("r", encoding=encoding, errors="strict", newline="") as handle:
+            header_match = find_promotion_header(
+                (
+                    (row_number, trim_trailing_empty_cells(row))
+                    for row_number, row in enumerate(
+                        csv.reader(handle, delimiter=delimiter), start=1
+                    )
+                ),
+                signatures,
+            )
+        if header_match is None:
+            raise RuntimeError(f"推广文件没有找到有效推广表头：{path}")
+        header_row_number, headers, signature = header_match
+        with path.open("r", encoding=encoding, errors="strict", newline="") as handle:
+            for row_number, row in enumerate(csv.reader(handle, delimiter=delimiter), start=1):
+                if row_number <= header_row_number:
+                    continue
+                values = trim_trailing_empty_cells(row)
+                if any(values):
+                    yield PromotionRow("CSV", row_number, headers, values, signature)
+        return
+
+    if suffix == ".xlsx":
+        try:
+            import openpyxl
+        except ImportError as exc:  # pragma: no cover - environment specific
+            raise RuntimeError("openpyxl is required for .xlsx files") from exc
+
+        workbook = openpyxl.load_workbook(path, read_only=True, data_only=True)
+        valid_sheet_count = 0
+        try:
+            for worksheet in workbook.worksheets:
+                if hasattr(worksheet, "reset_dimensions"):
+                    try:
+                        dimension = worksheet.calculate_dimension()
+                    except ValueError:
+                        worksheet.reset_dimensions()
+                    else:
+                        if dimension == "A1:A1":
+                            worksheet.reset_dimensions()
+                header_match = find_promotion_header(
+                    (
+                        (row_number, trim_trailing_empty_cells(row))
+                        for row_number, row in enumerate(
+                            worksheet.iter_rows(min_row=1, values_only=True), start=1
+                        )
+                    ),
+                    signatures,
+                )
+                if header_match is None:
+                    continue
+                valid_sheet_count += 1
+                header_row_number, headers, signature = header_match
+                for row_number, row in enumerate(
+                    worksheet.iter_rows(min_row=header_row_number + 1, values_only=True),
+                    start=header_row_number + 1,
+                ):
+                    values = trim_trailing_empty_cells(row)
+                    if any(values):
+                        yield PromotionRow(worksheet.title, row_number, headers, values, signature)
+        finally:
+            workbook.close()
+        if valid_sheet_count == 0:
+            raise RuntimeError(f"推广文件没有找到有效推广工作表或表头：{path}")
+        return
+
+    if suffix == ".xls":
+        rows = read_xls_rows(
+            path,
+            EXCEL_MAX_DATA_ROWS + 1,
+            XLS_MAX_COLUMNS,
+            all_worksheets=True,
+            include_sheet_markers=True,
+        )
+        sheets: list[tuple[str, list[tuple[int, list[str]]]]] = []
+        sheet_name = "工作表"
+        sheet_rows: list[tuple[int, list[str]]] = []
+        for row in rows:
+            if row and row[0] == ORDER_XLS_SHEET_MARKER:
+                if sheet_rows:
+                    sheets.append((sheet_name, sheet_rows))
+                sheet_name = row[1] if len(row) > 1 and row[1] else "未命名工作表"
+                sheet_rows = []
+                continue
+            sheet_rows.append((len(sheet_rows) + 1, trim_trailing_empty_cells(row)))
+        if sheet_rows:
+            sheets.append((sheet_name, sheet_rows))
+
+        valid_sheet_count = 0
+        for current_sheet_name, numbered_rows in sheets:
+            header_match = find_promotion_header(numbered_rows, signatures)
+            if header_match is None:
+                continue
+            valid_sheet_count += 1
+            header_row_number, headers, signature = header_match
+            for row_number, values in numbered_rows:
+                if row_number <= header_row_number or not any(values):
+                    continue
+                yield PromotionRow(current_sheet_name, row_number, headers, values, signature)
+        if valid_sheet_count == 0:
+            raise RuntimeError(f"推广文件没有找到有效推广工作表或表头：{path}")
+        return
+
+    raise RuntimeError(f"unsupported extension: {suffix}")
+
+
 def collect_product_ids(rows: list[list[str]], header_row_index: int, headers: list[str], signature: Signature | None) -> list[str]:
     candidates = signature.product_id_headers if signature else ["商品ID", "商品id"]
     column_index = find_header_index(headers, candidates)
@@ -946,6 +1112,124 @@ def parse_date(text: object) -> dt.date | None:
     return None
 
 
+def promotion_column_indices(headers: list[str], signature: Signature) -> tuple[int | None, int | None]:
+    return (
+        find_header_index(headers, signature.period_headers),
+        find_header_index(headers, signature.product_id_headers),
+    )
+
+
+def is_ignorable_promotion_row(headers: list[str], row: list[str]) -> bool:
+    values = [normalize_text(value) for value in row]
+    first_cell = values[0] if values else ""
+    normalized_headers = [normalize_text(header) for header in headers]
+    repeated_header = bool(normalized_headers) and (
+        values[: len(normalized_headers)] == normalized_headers
+    )
+    return (
+        repeated_header
+        or first_cell in {"总计", "合计", "汇总"}
+        or first_cell.startswith("注")
+        or first_cell.startswith("说明")
+    )
+
+
+def promotion_preview_missing_fields(
+    rows: list[list[str]],
+    header_row_index: int,
+    headers: list[str],
+    signature: Signature,
+) -> list[str]:
+    date_index, product_id_index = promotion_column_indices(headers, signature)
+    missing: list[str] = []
+    if date_index is None:
+        missing.append("具体日期")
+    if product_id_index is None:
+        missing.append("商品ID")
+    data_rows = 0
+    missing_date = False
+    missing_product_id = False
+    if date_index is not None and product_id_index is not None:
+        for row in rows[header_row_index + 1 :]:
+            if not any(normalize_text(value) for value in row):
+                continue
+            if is_ignorable_promotion_row(headers, row):
+                continue
+            data_rows += 1
+            if date_index >= len(row) or parse_date(row[date_index]) is None:
+                missing_date = True
+            if product_id_index >= len(row) or not normalize_product_id(row[product_id_index]):
+                missing_product_id = True
+    if date_index is not None and product_id_index is not None and data_rows == 0:
+        missing.append("推广明细")
+    if missing_date:
+        missing.append("具体日期")
+    if missing_product_id:
+        missing.append("商品ID")
+    return list(dict.fromkeys(missing))
+
+
+def scan_promotion_file_full(path: Path, max_cols: int) -> PromotionValidation:
+    data_rows = 0
+    valid_rows = 0
+    missing_date_rows = 0
+    missing_product_id_rows = 0
+    examples: list[str] = []
+
+    for promotion_row in iter_promotion_rows_full(path, max_cols):
+        row = promotion_row.values
+        if is_ignorable_promotion_row(promotion_row.headers, row):
+            continue
+        data_rows += 1
+        date_index, product_id_index = promotion_column_indices(
+            promotion_row.headers, promotion_row.signature
+        )
+        parsed_date = (
+            parse_date(row[date_index])
+            if date_index is not None and date_index < len(row)
+            else None
+        )
+        product_id = (
+            normalize_product_id(row[product_id_index])
+            if product_id_index is not None and product_id_index < len(row)
+            else ""
+        )
+        row_missing: list[str] = []
+        if parsed_date is None:
+            missing_date_rows += 1
+            row_missing.append("具体日期")
+        if not product_id:
+            missing_product_id_rows += 1
+            row_missing.append("商品ID")
+        if row_missing:
+            if len(examples) < 10:
+                examples.append(
+                    f"工作表={promotion_row.sheet_name}，行={promotion_row.row_number}，缺少{'、'.join(row_missing)}"
+                )
+            continue
+        valid_rows += 1
+
+    if data_rows == 0:
+        raise RuntimeError(f"推广文件没有可归档的明细行：{path}")
+    if missing_date_rows or missing_product_id_rows:
+        missing_fields: list[str] = []
+        if missing_date_rows:
+            missing_fields.append("具体日期")
+        if missing_product_id_rows:
+            missing_fields.append("商品ID")
+        raise RuntimeError(
+            f"推广数据缺少{'、'.join(missing_fields)}，请重新下载包含逐行日期和商品ID的推广明细："
+            f"文件={path}；{'；'.join(examples)}"
+        )
+    return PromotionValidation(
+        data_rows=data_rows,
+        valid_rows=valid_rows,
+        missing_date_rows=missing_date_rows,
+        missing_product_id_rows=missing_product_id_rows,
+        examples=examples,
+    )
+
+
 def date_range_from_column(rows: list[list[str]], header_row_index: int, headers: list[str], period_headers: list[str]) -> tuple[str, str] | None:
     columns = find_header_indices(headers, period_headers)
     if not columns:
@@ -1013,11 +1297,6 @@ def decide_period(
 
     if signature.period_mode == "filename_range_then_date_column":
         column_range = date_range_from_column(rows, header_row_index, headers, signature.period_headers)
-        if "分天数据" in normalize_text(path.name) and column_range and column_range[0] != column_range[1]:
-            return f"{column_range[0]}至{column_range[1]}", "date_column"
-        filename_range = date_range_from_filename(path)
-        if filename_range:
-            return f"{filename_range[0]}至{filename_range[1]}", "filename_range"
         if column_range:
             return f"{column_range[0]}至{column_range[1]}", "date_column"
         return "", ""
@@ -1118,6 +1397,22 @@ def product_ids_filename_part(product_ids: list[str]) -> str:
     if len(unique_ids) > 3:
         preview += f"等{len(unique_ids)}个"
     return preview
+
+
+def promotion_data_folder(database_root: Path, shop_name: str) -> Path:
+    return (
+        database_root
+        / PROMOTION_REPORT_TYPE
+        / sanitize_filename_part(shop_name)
+    )
+
+
+def promotion_data_filename(shop_name: str) -> str:
+    return f"{sanitize_filename_part(shop_name)}—{PROMOTION_DATA_PREFIX}.xlsx"
+
+
+def promotion_data_existing_paths(target_path: Path) -> list[Path]:
+    return [target_path] if target_path.exists() else []
 
 
 def promotion_adjustment_update_date(period: str, fallback_date: dt.date) -> str:
@@ -1534,6 +1829,20 @@ def validate_order_merge_inputs(
             checked.add(resolved)
     if checked:
         print(f"order input integrity preflight passed: files={len(checked)}")
+
+
+def validate_promotion_merge_inputs(analyses: list[Analysis], max_cols: int) -> None:
+    checked: set[Path] = set()
+    for analysis in analyses:
+        if analysis.status != "ready" or analysis.report_type != PROMOTION_REPORT_TYPE:
+            continue
+        resolved = analysis.source.resolve()
+        if resolved in checked:
+            continue
+        scan_promotion_file_full(analysis.source, max_cols)
+        checked.add(resolved)
+    if checked:
+        print(f"promotion input integrity preflight passed: files={len(checked)}")
 
 
 def create_order_merge_database(path: Path) -> sqlite3.Connection:
@@ -2131,7 +2440,12 @@ def merge_after_sale_rows(paths: list[Path], max_rows: int, max_cols: int) -> tu
     return headers, normalized_rows, latest_date
 
 
-def write_xlsx_table(path: Path, headers: list[str], rows: list[list[str]]) -> None:
+def write_xlsx_table(
+    path: Path,
+    headers: list[str],
+    rows: list[list[str]],
+    sheet_name: str = "推广调整日志",
+) -> None:
     try:
         from openpyxl import Workbook
     except ImportError as exc:  # pragma: no cover - environment specific
@@ -2140,7 +2454,7 @@ def write_xlsx_table(path: Path, headers: list[str], rows: list[list[str]]) -> N
     path.parent.mkdir(parents=True, exist_ok=True)
     workbook = Workbook()
     worksheet = workbook.active
-    worksheet.title = "推广调整日志"
+    worksheet.title = sheet_name
     worksheet.append(headers)
     for row in rows:
         worksheet.append(row)
@@ -2153,6 +2467,98 @@ def write_xlsx_table(path: Path, headers: list[str], rows: list[list[str]]) -> N
     workbook.save(temp_path)
     workbook.close()
     os.replace(temp_path, path)
+
+
+def promotion_records(
+    paths: list[Path], max_cols: int
+) -> tuple[list[str], list[dict[str, str]]]:
+    headers = [PROMOTION_ARCHIVE_DATE_HEADER, PROMOTION_ARCHIVE_PRODUCT_ID_HEADER]
+    records: list[dict[str, str]] = []
+    seen_records: set[tuple[tuple[str, str], ...]] = set()
+
+    for path in paths:
+        scan_promotion_file_full(path, max_cols)
+        for promotion_row in iter_promotion_rows_full(path, max_cols):
+            row = promotion_row.values
+            if is_ignorable_promotion_row(promotion_row.headers, row):
+                continue
+            date_index, product_id_index = promotion_column_indices(
+                promotion_row.headers, promotion_row.signature
+            )
+            parsed_date = (
+                parse_date(row[date_index])
+                if date_index is not None and date_index < len(row)
+                else None
+            )
+            product_id = (
+                normalize_product_id(row[product_id_index])
+                if product_id_index is not None and product_id_index < len(row)
+                else ""
+            )
+            if parsed_date is None or not product_id:
+                raise RuntimeError(
+                    f"推广数据缺少具体日期或商品ID：文件={path}，工作表={promotion_row.sheet_name}，"
+                    f"行={promotion_row.row_number}；停止整理并保留源文件。"
+                )
+            record = row_to_dict(promotion_row.headers, row)
+            record[PROMOTION_ARCHIVE_DATE_HEADER] = parsed_date.isoformat()
+            record[PROMOTION_ARCHIVE_PRODUCT_ID_HEADER] = product_id
+            append_headers(headers, promotion_row.headers)
+            record_key = tuple(sorted((key, normalize_text(value)) for key, value in record.items()))
+            if record_key in seen_records:
+                continue
+            seen_records.add(record_key)
+            records.append(record)
+
+    records.sort(
+        key=lambda record: (
+            record.get(PROMOTION_ARCHIVE_DATE_HEADER, ""),
+            record.get(PROMOTION_ARCHIVE_PRODUCT_ID_HEADER, ""),
+            tuple(sorted((key, normalize_text(value)) for key, value in record.items())),
+        ),
+        reverse=True,
+    )
+    return headers, records
+
+
+def merge_promotion_data(analysis: Analysis, max_cols: int) -> tuple[Path, int, int]:
+    final_path = analysis.target_path
+    final_path.parent.mkdir(parents=True, exist_ok=True)
+    existing_paths = promotion_data_existing_paths(final_path)
+    merge_paths = [*existing_paths, analysis.source]
+    headers, records = promotion_records(merge_paths, max_cols)
+    rows = [[normalize_text(record.get(header, "")) for header in headers] for record in records]
+
+    with tempfile.TemporaryDirectory(prefix=".promotion-merge-", dir=final_path.parent) as temp_name:
+        transaction_root = Path(temp_name)
+        staged_path = transaction_root / final_path.name
+        write_xlsx_table(staged_path, headers, rows, sheet_name=PROMOTION_REPORT_TYPE)
+        old_output_backup = transaction_root / "old-output.xlsx"
+        source_backup = transaction_root / "source" / analysis.source.name
+        old_output_moved = False
+        source_moved = False
+        installed = False
+        try:
+            if final_path.exists():
+                os.replace(final_path, old_output_backup)
+                old_output_moved = True
+            source_backup.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(analysis.source, source_backup)
+            source_moved = True
+            os.replace(staged_path, final_path)
+            installed = True
+        except Exception:
+            if installed and final_path.exists():
+                final_path.unlink()
+            if source_moved and source_backup.exists():
+                analysis.source.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(source_backup, analysis.source)
+            if old_output_moved and old_output_backup.exists():
+                final_path.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(old_output_backup, final_path)
+            raise
+
+    return final_path, len(merge_paths), len(rows)
 
 
 def merge_promotion_adjustment_log(analysis: Analysis, max_rows: int, max_cols: int) -> tuple[Path, int, int]:
@@ -2385,7 +2791,12 @@ def reserve_unique_targets(analyses: list[Analysis]) -> None:
     for analysis in analyses:
         if analysis.status != "ready":
             continue
-        if analysis.report_type in {ORDER_REPORT_TYPE, AFTER_SALE_REPORT_TYPE, PROMOTION_ADJUSTMENT_REPORT_TYPE}:
+        if analysis.report_type in {
+            ORDER_REPORT_TYPE,
+            AFTER_SALE_REPORT_TYPE,
+            PROMOTION_REPORT_TYPE,
+            PROMOTION_ADJUSTMENT_REPORT_TYPE,
+        }:
             continue
         original = analysis.target_path
         candidate = original
@@ -2410,6 +2821,10 @@ def target_for_success(
     file_download_date: dt.date,
     product_ids: list[str] | None = None,
 ) -> Path:
+    if signature.report_type == PROMOTION_REPORT_TYPE:
+        target_dir = promotion_data_folder(database_root, shop_name)
+        return target_dir / promotion_data_filename(shop_name)
+
     target_dir = (
         database_root
         / signature.target_folder
@@ -2513,11 +2928,17 @@ def analyze_file(
     period, period_source = decide_period(source, signature, rows, header_row_index, headers, file_download_date)
 
     missing: list[str] = []
+    promotion_missing_fields: list[str] = []
+    if signature.report_type == PROMOTION_REPORT_TYPE:
+        promotion_missing_fields = promotion_preview_missing_fields(
+            rows, header_row_index, headers, signature
+        )
     if not shop_name:
         missing.append("shop_name")
-    if not period:
+    if not period and "具体日期" not in promotion_missing_fields:
         missing.append("period")
-    if is_multi_day_promotion_summary(
+    missing.extend(promotion_missing_fields)
+    if not promotion_missing_fields and is_multi_day_promotion_summary(
         source,
         signature.report_type,
         period,
@@ -2537,7 +2958,12 @@ def analyze_file(
 
     if missing:
         target = target_for_pending(database_root, source, file_download_date)
-        reason = "multi_day_promotion_summary" if missing == ["single_day_period"] else "missing_required_fields"
+        if signature.report_type == PROMOTION_REPORT_TYPE and promotion_missing_fields:
+            reason = "promotion_missing_date_or_product_id"
+        elif missing == ["single_day_period"]:
+            reason = "multi_day_promotion_summary"
+        else:
+            reason = "missing_required_fields"
         return Analysis(
             source=source,
             status="pending",
@@ -2992,6 +3418,12 @@ def missing_report_reminder_rows(
         )
 
     def pending_reminder_message(analysis: Analysis) -> str:
+        if analysis.reason == "promotion_missing_date_or_product_id":
+            missing_fields = analysis.missing_fields or "具体日期或商品ID"
+            return (
+                f"{analysis.shop_name or '未识别店铺'} 的推广数据缺少逐行有效的{missing_fields}，"
+                "文件已保留在原位置且不会归档；请重新下载包含具体日期和商品ID的推广明细。"
+            )
         if analysis.reason == "multi_day_promotion_summary":
             shop_name = analysis.shop_name or "未识别店铺"
             period_text = f"（{analysis.period}）" if analysis.period else ""
@@ -3414,6 +3846,15 @@ def apply_actions(
                 f"rows={row_count}",
             )
             continue
+        if analysis.report_type == PROMOTION_REPORT_TYPE:
+            final_path, source_count, row_count = merge_promotion_data(analysis, max_cols)
+            print(
+                "promotion data merged:",
+                f"{final_path}",
+                f"sources={source_count}",
+                f"rows={row_count}",
+            )
+            continue
         if analysis.report_type == PROMOTION_ADJUSTMENT_REPORT_TYPE:
             final_path, source_count, row_count = merge_promotion_adjustment_log(analysis, max_rows, max_cols)
             print(
@@ -3581,6 +4022,7 @@ def main(argv: list[str]) -> int:
     if apply:
         try:
             validate_order_merge_inputs(analyses, database_root, args.max_cols)
+            validate_promotion_merge_inputs(analyses, args.max_cols)
             apply_actions(
                 analyses,
                 database_root=database_root,
