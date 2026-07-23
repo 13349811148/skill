@@ -53,6 +53,8 @@ ORDER_PAYMENT_TIME_HEADERS = [
 ]
 ORDER_TRANSACTION_TIME_HEADERS = ["订单成交时间"]
 ORDER_CREATION_TIME_HEADERS = ["订单创建时间"]
+ORDER_STATUS_HEADERS = ["订单状态", "交易状态"]
+UNPAID_OR_CANCELLED_STATUS_KEYWORDS = ("已取消", "待付款", "待支付", "未付款", "交易关闭", "已关闭")
 ORDER_TIME_HEADERS = [
     *ORDER_PAYMENT_TIME_HEADERS,
     *ORDER_TRANSACTION_TIME_HEADERS,
@@ -1268,6 +1270,16 @@ def is_ignorable_order_row(row: list[str]) -> bool:
     )
 
 
+def is_explicit_unpaid_or_cancelled_order(headers: list[str], row: list[str]) -> bool:
+    for index, header in enumerate(headers):
+        if normalize_text(header) not in ORDER_STATUS_HEADERS:
+            continue
+        status = normalize_text(row[index]) if index < len(row) else ""
+        if any(keyword in status for keyword in UNPAID_OR_CANCELLED_STATUS_KEYWORDS):
+            return True
+    return False
+
+
 def resolve_order_row_datetime(
     headers: list[str], row: list[str]
 ) -> tuple[dt.datetime | None, str, str]:
@@ -1391,6 +1403,9 @@ def scan_order_file_full(path: Path, max_cols: int) -> OrderFileScan:
             row, order_row.time_columns
         )
         if parsed_time is None:
+            if is_explicit_unpaid_or_cancelled_order(order_row.headers, row):
+                ignored_rows += 1
+                continue
             invalid_count += 1
             if len(invalid_examples) < 10:
                 invalid_examples.append(
@@ -1764,6 +1779,9 @@ def load_order_merge_database(
                 row, order_row.time_columns
             )
             if parsed_time is None:
+                if is_explicit_unpaid_or_cancelled_order(headers, row):
+                    path_ignored += 1
+                    continue
                 raise RuntimeError(
                     f"订单时间无法识别：文件={path}，工作表={order_row.sheet_name}，行={row_number}，"
                     f"订单号={order_id}，时间字段={raw_values}；"
@@ -2224,6 +2242,8 @@ def merge_order_rows_by_month(
                 resolve_order_row_datetime_from_columns(row, order_row.time_columns)
             )
             if parsed_time is None:
+                if is_explicit_unpaid_or_cancelled_order(headers, row):
+                    continue
                 raise RuntimeError(
                     f"订单时间无法识别：文件={path}，工作表={order_row.sheet_name}，行={row_number}，"
                     f"订单号={order_id}，时间字段={raw_time_values}；"
