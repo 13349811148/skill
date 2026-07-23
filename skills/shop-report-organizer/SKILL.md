@@ -91,8 +91,8 @@ Special validation and merge rule for `推广数据`:
 
 - Require every non-summary promotion detail row to contain both a valid specific date and a valid product ID. Never use a filename date as a fallback for promotion archiving. If either field is missing from the header or any detail row, keep the source in its original location, mark it `pending`, and tell the user to re-download the promotion detail with both fields.
 - Keep exactly one cumulative promotion workbook per shop at `推广数据/<店铺>/<店铺>—推广数据.xlsx`; do not create one workbook per product ID.
-- Preserve each source column and add normalized `归档日期` and `归档商品ID` columns, so the combined shop workbook always contains the date and product ID used for filing.
-- On `--apply`, validate every row of the new source before moving any file. Then merge the source with the shop's existing cumulative promotion workbook, de-duplicate only completely identical rows, sort by `归档日期` and `归档商品ID`, and replace the workbook transactionally. Print the target file, source file count, and de-duplicated row count in the message window.
+- Preserve each source column and add normalized `归档日期`、`归档商品ID` and `归档推广类型` columns, so the combined shop workbook always contains the date, product ID and promotion type used for filing. Write Pinduoduo rows as `拼多多-商品推广`; write Tmall rows as `万相台`、`新客加速` or `老客加速`. Classify legacy 品牌新享 as `新客加速` while preserving its original columns.
+- On `--apply`, validate every row of the new source before moving any file. Then merge the source with the shop's existing cumulative promotion workbook, de-duplicate only completely identical rows, sort by `归档日期`、`归档商品ID` and `归档推广类型`, and replace the workbook transactionally. Print the target file, source file count, and de-duplicated row count in the message window.
 
 Use the existing archive layout:
 

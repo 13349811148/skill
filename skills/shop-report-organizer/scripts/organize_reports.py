@@ -46,6 +46,7 @@ PROMOTION_REPORT_TYPE = "推广数据"
 PROMOTION_DATA_PREFIX = "推广数据"
 PROMOTION_ARCHIVE_DATE_HEADER = "归档日期"
 PROMOTION_ARCHIVE_PRODUCT_ID_HEADER = "归档商品ID"
+PROMOTION_ARCHIVE_TYPE_HEADER = "归档推广类型"
 PROMOTION_ADJUSTMENT_REPORT_TYPE = "推广调整日志"
 PROMOTION_ADJUSTMENT_UPDATE_PREFIX = "推广调整日志更新至"
 ORDER_SUMMARY_PREFIX = "订单汇总表"
@@ -99,6 +100,7 @@ class Signature:
     product_id_headers: list[str]
     period_headers: list[str]
     period_mode: str
+    promotion_type: str
     notes: str
 
 
@@ -200,6 +202,7 @@ def load_signatures(path: Path = SIGNATURES_PATH) -> list[Signature]:
                 product_id_headers=split_cell(row.get("product_id_headers")),
                 period_headers=split_cell(row.get("period_headers")),
                 period_mode=row.get("period_mode", "").strip(),
+                promotion_type=normalize_text(row.get("promotion_type", "")),
                 notes=row.get("notes", "").strip(),
             )
         )
@@ -1119,6 +1122,63 @@ def promotion_column_indices(headers: list[str], signature: Signature) -> tuple[
     )
 
 
+def promotion_effective_column_indices(
+    headers: list[str], signature: Signature
+) -> tuple[int | None, int | None]:
+    """Prefer standardized archive keys while remaining compatible with raw exports."""
+    date_index = find_header_index(headers, [PROMOTION_ARCHIVE_DATE_HEADER])
+    product_id_index = find_header_index(headers, [PROMOTION_ARCHIVE_PRODUCT_ID_HEADER])
+    signature_date_index, signature_product_id_index = promotion_column_indices(
+        headers, signature
+    )
+    return (
+        date_index if date_index is not None else signature_date_index,
+        product_id_index if product_id_index is not None else signature_product_id_index,
+    )
+
+
+def promotion_type_for_row(
+    headers: list[str], row: list[str], fallback_signature: Signature
+) -> str:
+    """Resolve the explicit archive type, or safely recover it from an old archive row."""
+    type_index = find_header_index(headers, [PROMOTION_ARCHIVE_TYPE_HEADER])
+    signatures = promotion_signatures()
+    known_types = {signature.promotion_type for signature in signatures if signature.promotion_type}
+    if type_index is not None:
+        promotion_type = normalize_text(row[type_index]) if type_index < len(row) else ""
+        if promotion_type in known_types:
+            return promotion_type
+        if promotion_type:
+            raise RuntimeError(f"推广类型无效：{promotion_type}")
+        raise RuntimeError("推广数据缺少归档推广类型")
+
+    # Old cumulative workbooks did not record the type. Infer it only when one
+    # signature's complete discriminator fields are populated on this row.
+    matched_types: set[str] = set()
+    for signature in signatures:
+        if not signature.promotion_type:
+            continue
+        required_indices = [
+            find_header_index(headers, [required]) for required in signature.required_headers
+        ]
+        if required_indices and all(
+            index is not None and index < len(row) and normalize_text(row[index])
+            for index in required_indices
+        ):
+            matched_types.add(signature.promotion_type)
+    if len(matched_types) == 1:
+        return next(iter(matched_types))
+
+    # A raw source has one promotion signature and does not need row inference.
+    has_archive_keys = (
+        find_header_index(headers, [PROMOTION_ARCHIVE_DATE_HEADER]) is not None
+        and find_header_index(headers, [PROMOTION_ARCHIVE_PRODUCT_ID_HEADER]) is not None
+    )
+    if fallback_signature.promotion_type and not has_archive_keys:
+        return fallback_signature.promotion_type
+    raise RuntimeError("旧归档推广数据无法识别推广类型")
+
+
 def is_ignorable_promotion_row(headers: list[str], row: list[str]) -> bool:
     values = [normalize_text(value) for value in row]
     first_cell = values[0] if values else ""
@@ -1181,7 +1241,7 @@ def scan_promotion_file_full(path: Path, max_cols: int) -> PromotionValidation:
         if is_ignorable_promotion_row(promotion_row.headers, row):
             continue
         data_rows += 1
-        date_index, product_id_index = promotion_column_indices(
+        date_index, product_id_index = promotion_effective_column_indices(
             promotion_row.headers, promotion_row.signature
         )
         parsed_date = (
@@ -1207,6 +1267,18 @@ def scan_promotion_file_full(path: Path, max_cols: int) -> PromotionValidation:
                     f"工作表={promotion_row.sheet_name}，行={promotion_row.row_number}，缺少{'、'.join(row_missing)}"
                 )
             continue
+        try:
+            promotion_type_for_row(
+                promotion_row.headers, row, promotion_row.signature
+            )
+        except RuntimeError as exc:
+            if len(examples) < 10:
+                examples.append(
+                    f"工作表={promotion_row.sheet_name}，行={promotion_row.row_number}，{exc}"
+                )
+            raise RuntimeError(
+                f"推广数据无法识别推广类型：文件={path}；{'；'.join(examples)}"
+            ) from exc
         valid_rows += 1
 
     if data_rows == 0:
@@ -2472,7 +2544,11 @@ def write_xlsx_table(
 def promotion_records(
     paths: list[Path], max_cols: int
 ) -> tuple[list[str], list[dict[str, str]]]:
-    headers = [PROMOTION_ARCHIVE_DATE_HEADER, PROMOTION_ARCHIVE_PRODUCT_ID_HEADER]
+    headers = [
+        PROMOTION_ARCHIVE_DATE_HEADER,
+        PROMOTION_ARCHIVE_PRODUCT_ID_HEADER,
+        PROMOTION_ARCHIVE_TYPE_HEADER,
+    ]
     records: list[dict[str, str]] = []
     seen_records: set[tuple[tuple[str, str], ...]] = set()
 
@@ -2482,7 +2558,7 @@ def promotion_records(
             row = promotion_row.values
             if is_ignorable_promotion_row(promotion_row.headers, row):
                 continue
-            date_index, product_id_index = promotion_column_indices(
+            date_index, product_id_index = promotion_effective_column_indices(
                 promotion_row.headers, promotion_row.signature
             )
             parsed_date = (
@@ -2503,6 +2579,9 @@ def promotion_records(
             record = row_to_dict(promotion_row.headers, row)
             record[PROMOTION_ARCHIVE_DATE_HEADER] = parsed_date.isoformat()
             record[PROMOTION_ARCHIVE_PRODUCT_ID_HEADER] = product_id
+            record[PROMOTION_ARCHIVE_TYPE_HEADER] = promotion_type_for_row(
+                promotion_row.headers, row, promotion_row.signature
+            )
             append_headers(headers, promotion_row.headers)
             record_key = tuple(sorted((key, normalize_text(value)) for key, value in record.items()))
             if record_key in seen_records:
@@ -2514,6 +2593,7 @@ def promotion_records(
         key=lambda record: (
             record.get(PROMOTION_ARCHIVE_DATE_HEADER, ""),
             record.get(PROMOTION_ARCHIVE_PRODUCT_ID_HEADER, ""),
+            record.get(PROMOTION_ARCHIVE_TYPE_HEADER, ""),
             tuple(sorted((key, normalize_text(value)) for key, value in record.items())),
         ),
         reverse=True,

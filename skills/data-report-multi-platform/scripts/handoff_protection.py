@@ -16,6 +16,7 @@ ORDER_PAYMENT_DATE_CANDIDATES = (
 ORDER_TRANSACTION_DATE_CANDIDATES = ("订单成交时间",)
 ORDER_CREATION_DATE_CANDIDATES = ("订单创建时间",)
 PROMOTION_DATE_CANDIDATES = (
+    "归档日期",
     "日期",
     "业务日期",
     "统计日期",
@@ -24,6 +25,7 @@ PROMOTION_DATE_CANDIDATES = (
     "报表日期",
 )
 PRODUCT_ID_CANDIDATES = (
+    "归档商品ID",
     "商品ID",
     "商品id",
     "商品Id",
@@ -33,6 +35,7 @@ PRODUCT_ID_CANDIDATES = (
     "商品编码",
     "商品ID（必填）",
 )
+PROMOTION_ARCHIVE_TYPE_CANDIDATES = ("归档推广类型",)
 SKU_ID_CANDIDATES = (
     "样式ID",
     "样式id",
@@ -159,6 +162,21 @@ def classify_promotion_headers(headers: Iterable[Any]) -> str | None:
     ):
         return PROMOTION_PDD
     return None
+
+
+def classify_promotion_row(headers: Iterable[Any], row: dict[str, Any]) -> str | None:
+    """Use the organizer's row-level type when present; fall back to raw headers."""
+    archive_type_header = find_header(headers, PROMOTION_ARCHIVE_TYPE_CANDIDATES)
+    if archive_type_header:
+        archive_type = normalize_header(row.get(archive_type_header))
+        archive_type_map = {
+            "拼多多-商品推广": PROMOTION_PDD,
+            "万相台": PROMOTION_TMALL_WANXIANG,
+            "新客加速": PROMOTION_TMALL_NEW,
+            "老客加速": PROMOTION_TMALL_OLD,
+        }
+        return archive_type_map.get(archive_type)
+    return classify_promotion_headers(headers)
 
 
 def has_promotion_amount_header(headers: Iterable[Any]) -> bool:

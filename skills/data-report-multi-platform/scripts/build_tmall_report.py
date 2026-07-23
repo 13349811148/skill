@@ -26,6 +26,7 @@ from data_quality_protection import (
 )
 from handoff_protection import (
     PRODUCT_ID_CANDIDATES,
+    PROMOTION_ARCHIVE_TYPE_CANDIDATES,
     PROMOTION_DATE_CANDIDATES,
     PROMOTION_TMALL_BRAND,
     PROMOTION_TMALL_NEW,
@@ -35,6 +36,7 @@ from handoff_protection import (
     SPEC_CODE_CANDIDATES,
     ProductExportIndex,
     classify_promotion_headers,
+    classify_promotion_row,
     find_header_row,
     has_promotion_amount_header,
     is_excluded_order_path,
@@ -1070,10 +1072,11 @@ def load_promo_costs(
             if header_index is None:
                 continue
             headers = [text(value) for value in sheet.rows[header_index]]
+            archive_type_col = find_col(headers, list(PROMOTION_ARCHIVE_TYPE_CANDIDATES))
             promotion_type = classify_promotion_headers(headers)
-            if promotion_type and promotion_type != expected_type:
+            if not archive_type_col and promotion_type and promotion_type != expected_type:
                 continue
-            if promotion_type is None:
+            if not archive_type_col and promotion_type is None:
                 raise ReportError(
                     "推广文件含费用字段但无法识别平台或推广类型，已停止生成日报："
                     f"文件={path}，工作表={sheet.sheet_name}。"
@@ -1081,23 +1084,23 @@ def load_promo_costs(
             product_col = find_col(
                 headers, product_candidates or list(PRODUCT_ID_CANDIDATES)
             )
-            cost_col = find_col(
-                headers,
-                cost_candidates
-                or [
-                    "总花费(元)",
-                    "成交花费(元)",
-                    "消耗",
-                    "花费",
-                    "总消耗",
-                    "预估老客加速费用",
-                    "预估新客加速费用",
-                    "预估抽佣金额",
-                ],
-            )
+            cost_columns: list[str] = []
+            for candidate in cost_candidates or [
+                "总花费(元)",
+                "成交花费(元)",
+                "消耗",
+                "花费",
+                "总消耗",
+                "预估老客加速费用",
+                "预估新客加速费用",
+                "预估抽佣金额",
+            ]:
+                column = find_col(headers, [candidate])
+                if column and column not in cost_columns:
+                    cost_columns.append(column)
             date_col = find_col(headers, list(PROMOTION_DATE_CANDIDATES))
             shop_col = find_col(headers, list(PROMOTION_SHOP_CANDIDATES))
-            if not product_col or not cost_col:
+            if not product_col or not cost_columns:
                 raise ReportError(
                     f"{fee_name}文件缺字段，已停止生成日报,{path},{sheet.sheet_name},商品ID或花费"
                 )
@@ -1111,6 +1114,21 @@ def load_promo_costs(
                     f"{fee_name}推广文件既没有日期列，文件名也没有单日日期，已停止：{path}。"
                 )
             for row_number, row in numbered_dict_rows(sheet.rows, header_index):
+                if archive_type_col:
+                    promotion_type = classify_promotion_row(headers, row)
+                    if promotion_type is None:
+                        raise ReportError(
+                            "推广归档行缺少或包含无效归档推广类型，已停止生成日报："
+                            f"文件={path}，工作表={sheet.sheet_name}，行={row_number}。"
+                        )
+                    if promotion_type != expected_type:
+                        continue
+                    cost_col = next(
+                        (column for column in cost_columns if text(row.get(column))),
+                        cost_columns[0],
+                    )
+                else:
+                    cost_col = cost_columns[0]
                 try:
                     amount = parse_number_strict(
                         row.get(cost_col),
@@ -1351,7 +1369,7 @@ def build_report(
         "新客加速费用",
         False,
         ["商品ID", "商品id", "宝贝ID", "商品编号"],
-        ["预估新客加速费用"],
+        ["预估新客加速费用", "预估抽佣金额", "品牌新享费用"],
         ["预估新客加速费用"],
     )
     old_acceleration_costs, old_acceleration_warnings = load_promo_costs(
