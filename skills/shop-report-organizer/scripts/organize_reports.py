@@ -19,7 +19,7 @@ import sys
 import tempfile
 import zipfile
 import zlib
-from collections import Counter
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Iterable
@@ -28,6 +28,11 @@ from order_line_protection import (
     ORDER_SALES_MARK_HEADERS,
     apply_order_sales_marks,
     classify_order_line,
+)
+from marketing_activity_maintenance import (
+    apply_marketing_activity_plan,
+    change_details_from_plan,
+    prepare_marketing_activity_plan,
 )
 
 
@@ -94,6 +99,15 @@ MISSING_REMINDER_FIELDNAMES = [
     "new_product_ids",
     "message",
     "input_path",
+]
+UNRECORDED_PRODUCT_MAPPING_HEADERS = [
+    "提醒类型",
+    "店铺",
+    "商品ID",
+    "样式ID",
+    "商家编码-规格维度",
+    "商品名称/售后SKU",
+    "来源",
 ]
 
 
@@ -3350,23 +3364,29 @@ def apply_batch_shop_inference(
         if prefix and analysis.shop_name:
             prefix_shops.setdefault(prefix, analysis.shop_name)
 
-    batch_product_shops: dict[str, str] = {}
+    # Keep every product ID observed in an identified single-shop report. Some
+    # promotion adjustment logs expose their product ID only in free-text
+    # fields, so batch inference must not depend on new-product reminders.
+    # Retain conflicts as sets and never use an ambiguous ID automatically.
+    batch_product_shops: dict[str, set[str]] = {}
     for analysis in analyses:
         if not analysis.shop_name:
             continue
-        for product_id in analysis.new_product_ids:
-            batch_product_shops.setdefault(product_id, analysis.shop_name)
+        for product_id in analysis.product_ids:
+            if product_id:
+                batch_product_shops.setdefault(product_id, set()).add(analysis.shop_name)
 
     for analysis in analyses:
         if analysis.shop_name or not analysis.report_type or not analysis.period:
             continue
         prefix = input_file_prefix(analysis.source)
         shop_name = prefix_shops.get(prefix, "")
-        if not shop_name and analysis.new_product_ids:
+        if not shop_name and analysis.product_ids:
             counts = Counter(
-                batch_product_shops[product_id]
-                for product_id in analysis.new_product_ids
-                if product_id in batch_product_shops
+                next(iter(candidate_shops))
+                for product_id in dict.fromkeys(analysis.product_ids)
+                for candidate_shops in [batch_product_shops.get(product_id, set())]
+                if len(candidate_shops) == 1
             )
             if counts:
                 top_shop, top_count = counts.most_common(1)[0]
@@ -3429,6 +3449,488 @@ def manifest_row(analysis: Analysis, action: str) -> dict[str, str]:
 
 def missing_reminder_path(database_root: Path, apply: bool) -> Path:
     return database_root / ("缺失提醒.csv" if apply else "缺失提醒_预览.csv")
+
+
+def unrecorded_product_mapping_path(database_root: Path, apply: bool) -> Path:
+    name = "未收录商品ID对照表.xlsx" if apply else "未收录商品ID对照表_预览.xlsx"
+    return database_root / name
+
+
+def unrecorded_product_targets(
+    reminder_rows: list[dict[str, str]],
+) -> dict[tuple[str, str], tuple[str, str]]:
+    targets: dict[tuple[str, str], tuple[str, str]] = {}
+    for reminder in reminder_rows:
+        if reminder.get("status") not in {"new_product_id", "historical_product_id"}:
+            continue
+        shop_name = normalize_text(reminder.get("shop_name", ""))
+        label = "需补导商品数据" if reminder["status"] == "new_product_id" else "售后核对（无需补导）"
+        for product_id in reminder.get("new_product_ids", "").split("|"):
+            product_id = normalize_product_id(product_id)
+            if shop_name and product_id:
+                targets[(shop_name, product_id)] = (label, reminder["status"])
+    return targets
+
+
+def exact_header_index(headers: list[str], candidates: Iterable[str]) -> int | None:
+    normalized = {normalize_header(candidate) for candidate in candidates}
+    return next(
+        (
+            index
+            for index, header in enumerate(headers)
+            if normalize_header(header) in normalized
+        ),
+        None,
+    )
+
+
+def product_data_rows(
+    path: Path,
+    max_rows: int,
+    max_cols: int,
+) -> Iterable[tuple[list[str], list[str]]]:
+    rows = read_rows(path, max_rows, max_cols)
+    header_index: int | None = None
+    headers: list[str] = []
+    for index, row in enumerate(rows):
+        product_index = exact_header_index(
+            row,
+            ("商品ID（必填）", "商品ID", "商品id", "商品Id"),
+        )
+        title_index = exact_header_index(
+            row,
+            ("商品名称", "商品标题", "宝贝标题"),
+        )
+        if product_index is not None and title_index is not None:
+            header_index = index
+            headers = row
+            break
+    if header_index is None:
+        return
+    for row in rows[header_index + 1 :]:
+        if any(normalize_text(cell) for cell in row):
+            yield headers, row
+
+
+def collect_unrecorded_product_records(
+    database_root: Path,
+    analyses: list[Analysis],
+    reminder_rows: list[dict[str, str]],
+    max_rows: int = PREVIEW_MAX_ROWS,
+    max_cols: int = XLS_MAX_COLUMNS,
+) -> list[dict[str, str]]:
+    """Collect exact shop/product/style/SKU evidence for mapping and marketing maintenance."""
+    targets = unrecorded_product_targets(reminder_rows)
+    if not targets:
+        return []
+
+    found: dict[
+        tuple[str, str],
+        dict[tuple[str, str], dict[str, set[str]]],
+    ] = defaultdict(lambda: defaultdict(lambda: {"titles": set(), "sources": set()}))
+
+    def add_record(
+        shop_name: str,
+        product_id: str,
+        style_id: str,
+        sku: str,
+        title: str,
+        source_name: str,
+    ) -> None:
+        key = (normalize_text(shop_name), normalize_product_id(product_id))
+        if key not in targets:
+            return
+        detail_key = (normalize_text(style_id), normalize_text(sku))
+        if title:
+            found[key][detail_key]["titles"].add(normalize_text(title))
+        if source_name:
+            found[key][detail_key]["sources"].add(normalize_text(source_name))
+
+    order_root = database_root / ORDER_REPORT_TYPE
+    current_order_shops = {
+        analysis.source.resolve(): analysis.shop_name
+        for analysis in analyses
+        if analysis.report_type == ORDER_REPORT_TYPE and analysis.shop_name
+    }
+    order_paths = {
+        path
+        for path in order_root.rglob("*")
+        if order_root.exists()
+        and path.is_file()
+        and path.suffix.lower() in SUPPORTED_EXTENSIONS
+    }
+    order_paths.update(current_order_shops)
+    for path in sorted(order_paths, key=lambda item: str(item).casefold()):
+        try:
+            resolved = path.resolve()
+            source_shop = current_order_shops.get(resolved, "")
+            if not source_shop:
+                source_shop = path.relative_to(order_root).parts[0]
+            for order_row in iter_order_rows_full(path, max_cols):
+                headers = order_row.headers
+                values = order_row.values
+                record = row_to_dict(headers, values)
+                if classify_order_line(record).is_supplementary_price:
+                    continue
+                product_index = exact_header_index(headers, ("商品ID", "商品id", "商品Id"))
+                if product_index is None or product_index >= len(values):
+                    continue
+                product_id = normalize_product_id(values[product_index])
+                if (source_shop, product_id) not in targets:
+                    continue
+                style_index = exact_header_index(
+                    headers,
+                    ("样式ID", "样式id", "款式ID", "款式id", "SKUID", "skuId"),
+                )
+                code_index = exact_header_index(
+                    headers,
+                    ("商家编码-规格维度", "商家编码（规格维度）"),
+                )
+                title_index = exact_header_index(
+                    headers,
+                    ("商品", "商品名称", "商品标题", "宝贝标题"),
+                )
+                style_id = (
+                    normalize_text(values[style_index])
+                    if style_index is not None and style_index < len(values)
+                    else ""
+                )
+                merchant_code = (
+                    normalize_text(values[code_index])
+                    if code_index is not None and code_index < len(values)
+                    else ""
+                )
+                title = (
+                    normalize_text(values[title_index])
+                    if title_index is not None and title_index < len(values)
+                    else ""
+                )
+                add_record(
+                    source_shop,
+                    product_id,
+                    style_id,
+                    merchant_code,
+                    title,
+                    path.name,
+                )
+        except Exception:
+            continue
+
+    product_root = database_root / "商品数据"
+    current_product_shops = {
+        analysis.source.resolve(): analysis.shop_name
+        for analysis in analyses
+        if analysis.report_type == "商品数据" and analysis.shop_name
+    }
+    product_paths = {
+        path
+        for path in product_root.rglob("*")
+        if product_root.exists()
+        and path.is_file()
+        and path.suffix.lower() in SUPPORTED_EXTENSIONS
+    }
+    product_paths.update(current_product_shops)
+    for path in sorted(product_paths, key=lambda item: str(item).casefold()):
+        try:
+            resolved = path.resolve()
+            source_shop = current_product_shops.get(resolved, "")
+            if not source_shop:
+                source_shop = shop_from_product_archive_path(path, database_root)
+            if not source_shop:
+                continue
+            for headers, values in product_data_rows(path, max_rows, max_cols):
+                product_index = exact_header_index(
+                    headers,
+                    ("商品ID（必填）", "商品ID", "商品id", "商品Id"),
+                )
+                if product_index is None or product_index >= len(values):
+                    continue
+                product_id = normalize_product_id(values[product_index])
+                if (source_shop, product_id) not in targets:
+                    continue
+                style_index = exact_header_index(
+                    headers,
+                    (
+                        "SKUID（必填，注意不是SKU编码）",
+                        "SKUID",
+                        "skuId",
+                        "样式ID",
+                    ),
+                )
+                code_index = exact_header_index(headers, ("规格编码",))
+                title_index = exact_header_index(
+                    headers,
+                    ("商品名称", "商品标题", "宝贝标题"),
+                )
+                style_id = (
+                    normalize_text(values[style_index])
+                    if style_index is not None and style_index < len(values)
+                    else ""
+                )
+                merchant_code = (
+                    normalize_text(values[code_index])
+                    if code_index is not None and code_index < len(values)
+                    else ""
+                )
+                title = (
+                    normalize_text(values[title_index])
+                    if title_index is not None and title_index < len(values)
+                    else ""
+                )
+                add_record(
+                    source_shop,
+                    product_id,
+                    style_id,
+                    merchant_code,
+                    title,
+                    path.name,
+                )
+        except Exception:
+            continue
+
+    records: list[dict[str, str]] = []
+    for (shop_name, product_id), (label, reminder_status) in sorted(targets.items()):
+        details = found.get((shop_name, product_id), {})
+        if not details:
+            records.append(
+                {
+                    "reminder_label": label,
+                    "reminder_status": reminder_status,
+                    "shop_name": shop_name,
+                    "product_id": product_id,
+                    "style_id": "",
+                    "sku": "",
+                    "title": "",
+                    "source_name": "订单/商品数据中未找到对应明细",
+                }
+            )
+            continue
+        nonblank_skus_by_style: dict[str, set[str]] = defaultdict(set)
+        has_nonblank_style = any(style_id for style_id, _sku in details)
+        for style_id, sku in details:
+            if style_id and sku:
+                nonblank_skus_by_style[style_id].add(sku)
+        for (style_id, sku), evidence in sorted(details.items()):
+            if not style_id and has_nonblank_style:
+                continue
+            if style_id and not sku and nonblank_skus_by_style.get(style_id):
+                continue
+            records.append(
+                {
+                    "reminder_label": label,
+                    "reminder_status": reminder_status,
+                    "shop_name": shop_name,
+                    "product_id": product_id,
+                    "style_id": style_id,
+                    "sku": sku,
+                    "title": "；".join(sorted(evidence["titles"])),
+                    "source_name": "；".join(sorted(evidence["sources"])),
+                }
+            )
+    return records
+
+
+def write_unrecorded_product_mapping(
+    database_root: Path,
+    records: list[dict[str, str]],
+    apply: bool,
+) -> tuple[Path | None, int]:
+    """Write the product/style/merchant-code lookup for every new or historical ID reminder."""
+    if not records:
+        return None, 0
+
+    table_rows: list[list[str]] = []
+    for record in records:
+        table_rows.append(
+            [
+                record["reminder_label"],
+                record["shop_name"],
+                record["product_id"],
+                record["style_id"],
+                record["sku"],
+                record["title"],
+                record["source_name"],
+            ]
+        )
+    path = unrecorded_product_mapping_path(database_root, apply)
+    try:
+        write_xlsx_table(path, UNRECORDED_PRODUCT_MAPPING_HEADERS, table_rows, sheet_name="未收录商品ID对照")
+    except PermissionError:
+        path = unique_path(path)
+        write_xlsx_table(path, UNRECORDED_PRODUCT_MAPPING_HEADERS, table_rows, sheet_name="未收录商品ID对照")
+    return path, len(table_rows)
+
+
+def marketing_activity_reminder_rows(
+    plan: dict[str, object],
+    action: str,
+    input_dir: Path,
+    *,
+    apply_result: dict[str, object] | None = None,
+    error: str = "",
+    apply_blocked: bool = False,
+) -> list[dict[str, str]]:
+    candidates = list(plan.get("candidates", []))
+    issues = list(plan.get("issues", []))
+    manual_items = list(plan.get("manual_items", []))
+    candidate_ids = sorted(
+        {
+            normalize_product_id(candidate.get("product_id", ""))
+            for candidate in candidates
+            if normalize_product_id(candidate.get("product_id", ""))
+        }
+        | {
+            normalize_product_id(issue.get("product_id", ""))
+            for issue in issues
+            if normalize_product_id(issue.get("product_id", ""))
+        }
+    )
+    if not candidates and not issues:
+        return []
+
+    schema = plan.get("schema") or {}
+    workbook_path = normalize_text(schema.get("path", ""))
+    workbook_name = Path(workbook_path).name if workbook_path else ""
+    layout = normalize_text(schema.get("layout", ""))
+    layout_text = {"compact": "简版", "tracking": "跟踪版"}.get(layout, "未识别格式")
+    product_ids_text = "|".join(candidate_ids)
+
+    def row(status: str, message: str, detected_count: int | str = "") -> dict[str, str]:
+        return {
+            "action": action,
+            "status": status,
+            "report_type": "营销活动表",
+            "detected_count": str(detected_count),
+            "shop_name": "",
+            "source_name": workbook_name,
+            "source_path": workbook_path,
+            "new_product_ids": product_ids_text,
+            "message": message,
+            "input_path": str(input_dir),
+        }
+
+    if apply_blocked:
+        return [
+            row(
+                "marketing_activity_skipped",
+                "正式整理已因必备报表缺失而中断，营销活动表未维护，营销活动表未发生变更。",
+                len(candidate_ids),
+            )
+        ]
+    if error:
+        return [
+            row(
+                "marketing_activity_error",
+                f"营销活动表写入失败：{error}；报表归档结果不回滚，请按本提醒核对。营销活动表未发生变更。",
+                len(candidate_ids),
+            )
+        ]
+
+    rows: list[dict[str, str]] = []
+    if plan.get("status") == "skipped":
+        message = "；".join(normalize_text(issue.get("message", "")) for issue in issues if issue.get("message"))
+        rows.append(
+            row(
+                "marketing_activity_skipped",
+                f"{message} 营销活动表未发生变更。",
+                len(candidate_ids),
+            )
+        )
+        return rows
+
+    if apply_result is not None:
+        grouped: dict[tuple[str, str, str, bool], set[str]] = defaultdict(set)
+        for change in apply_result.get("changes", []):
+            key = (
+                normalize_product_id(change.get("product_id", "")),
+                normalize_text(change.get("style_id", "")),
+                normalize_text(change.get("sku", "")),
+                bool(change.get("new_row", False)),
+            )
+            field = normalize_text(change.get("field", ""))
+            if key[0] and field:
+                grouped[key].add(field)
+        details = [
+            {
+                "product_id": key[0],
+                "style_id": key[1],
+                "sku": key[2],
+                "new_row": key[3],
+                "fields": sorted(fields),
+            }
+            for key, fields in sorted(grouped.items())
+        ]
+    else:
+        details = change_details_from_plan(plan)
+
+    if details:
+        detail_messages = []
+        for detail in details:
+            detail_messages.append(
+                (
+                    f"商品ID {detail['product_id']}｜样式ID {detail['style_id'] or '空'}｜"
+                    f"商品SKU {detail['sku'] or '空'}｜"
+                    f"{'新增行' if detail['new_row'] else '补充已有行'}｜"
+                    f"字段：{'、'.join(detail['fields'])}"
+                )
+            )
+        if apply_result is None:
+            status = "marketing_activity_preview"
+            lead = f"营销活动表预览：将维护{layout_text}“{workbook_name}”"
+            detail_label = "计划字段明细"
+        else:
+            status = "marketing_activity_updated"
+            lead = f"已维护{layout_text}营销活动表“{workbook_name}”"
+            detail_label = "实际字段明细"
+        rows.append(
+            row(
+                status,
+                f"{lead}；共 {len(details)} 个商品/样式记录。{detail_label}：" + "；".join(detail_messages),
+                len(details),
+            )
+        )
+    else:
+        rows.append(
+            row(
+                "marketing_activity_no_change",
+                (
+                    f"已检查{layout_text}营销活动表“{workbook_name}”；候选商品ID："
+                    f"{'、'.join(candidate_ids) or '无'}。营销活动表未发生变更。"
+                ),
+                0,
+            )
+        )
+
+    combined_issues = [*issues]
+    if apply_result is not None:
+        combined_issues.extend(apply_result.get("issues", []))
+    issue_messages = [
+        normalize_text(issue.get("message", ""))
+        for issue in combined_issues
+        if normalize_text(issue.get("message", ""))
+    ]
+    if issue_messages:
+        rows.append(
+            row(
+                "marketing_activity_manual",
+                "营销活动表需人工核对：" + "；".join(dict.fromkeys(issue_messages)),
+                len(issue_messages),
+            )
+        )
+    manual_messages = [
+        normalize_text(item.get("message", ""))
+        for item in manual_items
+        if normalize_text(item.get("message", ""))
+    ]
+    if manual_messages:
+        rows.append(
+            row(
+                "marketing_activity_manual_fields",
+                "本次候选记录仍需人工维护：" + "；".join(dict.fromkeys(manual_messages)),
+                len(manual_messages),
+            )
+        )
+    return rows
 
 
 def manifest_output_path(database_root: Path, apply: bool, apply_blocked: bool) -> Path:
@@ -3516,11 +4018,11 @@ def missing_report_reminder_rows(
         for product_id in analysis.new_product_ids:
             product_group = shop_group.setdefault(
                 product_id,
-                {"report_types": set(), "source_names": set(), "source_paths": set()},
+                {"report_types": set(), "source_names_by_type": {}, "source_paths_by_type": {}},
             )
             product_group["report_types"].add(analysis.report_type)
-            product_group["source_names"].add(analysis.source.name)
-            product_group["source_paths"].add(str(analysis.source))
+            product_group["source_names_by_type"].setdefault(analysis.report_type, set()).add(analysis.source.name)
+            product_group["source_paths_by_type"].setdefault(analysis.report_type, set()).add(str(analysis.source))
 
     for shop_name in sorted(product_id_groups):
         group = product_id_groups[shop_name]
@@ -3542,20 +4044,34 @@ def missing_report_reminder_rows(
                 {
                     source_name
                     for product_id in product_ids
-                    for source_name in group[product_id]["source_names"]
+                    for report_type in PRODUCT_DATA_REQUIRED_SOURCE_REPORT_TYPES
+                    for source_name in group[product_id]["source_names_by_type"].get(report_type, set())
                 }
             )
             source_paths = sorted(
                 {
                     source_path
                     for product_id in product_ids
-                    for source_path in group[product_id]["source_paths"]
+                    for report_type in PRODUCT_DATA_REQUIRED_SOURCE_REPORT_TYPES
+                    for source_path in group[product_id]["source_paths_by_type"].get(report_type, set())
+                }
+            )
+            after_sale_source_names = sorted(
+                {
+                    source_name
+                    for product_id in product_ids
+                    for source_name in group[product_id]["source_names_by_type"].get(AFTER_SALE_REPORT_TYPE, set())
                 }
             )
             message = (
                 f"{shop_name} 的{'/'.join(report_types)}中出现商品数据未收录的商品ID：{preview_product_ids(product_ids)}；"
                 "请更新或补导该店铺的商品数据。"
             )
+            if after_sale_source_names:
+                message += (
+                    f"同批售后文件（{'、'.join(after_sale_source_names)}）也出现这些ID，"
+                    "仅用于售后核对，不是本条补导商品数据提醒的触发依据。"
+                )
             rows.append(
                 {
                     "action": action,
@@ -3580,16 +4096,16 @@ def missing_report_reminder_rows(
             continue
         source_names = sorted(
             {
-                source_name
-                for product_id in historical_product_ids
-                for source_name in group[product_id]["source_names"]
+                    source_name
+                    for product_id in historical_product_ids
+                    for source_name in group[product_id]["source_names_by_type"].get(AFTER_SALE_REPORT_TYPE, set())
             }
         )
         source_paths = sorted(
             {
-                source_path
-                for product_id in historical_product_ids
-                for source_path in group[product_id]["source_paths"]
+                    source_path
+                    for product_id in historical_product_ids
+                    for source_path in group[product_id]["source_paths_by_type"].get(AFTER_SALE_REPORT_TYPE, set())
             }
         )
         message = (
@@ -4214,6 +4730,75 @@ def main(argv: list[str]) -> int:
     )
     reminder_path = missing_reminder_path(database_root, apply)
     reminder_rows = missing_report_reminder_rows(expected_reports, analyses, action, input_dir)
+    unrecorded_records = collect_unrecorded_product_records(
+        database_root,
+        analyses,
+        reminder_rows,
+        max_rows=args.max_rows,
+        max_cols=max(args.max_cols, XLS_MAX_COLUMNS),
+    )
+    mapping_path, mapping_rows = write_unrecorded_product_mapping(
+        database_root, unrecorded_records, apply
+    )
+    if mapping_path:
+        reminder_rows.append(
+            {
+                "action": action,
+                "status": "unrecorded_product_mapping",
+                "report_type": "商品数据",
+                "detected_count": str(mapping_rows),
+                "shop_name": "",
+                "source_name": mapping_path.name,
+                "source_path": str(mapping_path),
+                "new_product_ids": "",
+                "message": "已生成未收录商品对照表，包含商品ID、样式ID及订单/商品数据存在时的商家编码-规格维度。",
+                "input_path": str(input_dir),
+            }
+        )
+
+    marketing_candidates = [
+        record
+        for record in unrecorded_records
+        if record.get("reminder_status") == "new_product_id"
+    ]
+    try:
+        marketing_plan = prepare_marketing_activity_plan(
+            database_root,
+            marketing_candidates,
+            xls_reader=read_xls_rows,
+            xls_sheet_marker=ORDER_XLS_SHEET_MARKER,
+        )
+    except Exception as exc:
+        marketing_plan = {
+            "status": "skipped",
+            "schema": None,
+            "candidates": marketing_candidates,
+            "writes": [],
+            "manual_items": [],
+            "issues": [
+                {
+                    "kind": "planning_error",
+                    "message": f"营销活动表预检查失败：{exc}",
+                }
+            ],
+        }
+    if not apply:
+        reminder_rows.extend(
+            marketing_activity_reminder_rows(
+                marketing_plan,
+                action,
+                input_dir,
+            )
+        )
+    elif apply_blocked:
+        reminder_rows.extend(
+            marketing_activity_reminder_rows(
+                marketing_plan,
+                action,
+                input_dir,
+                apply_blocked=True,
+            )
+        )
     write_utf8_sig_csv(reminder_path, reminder_rows, MISSING_REMINDER_FIELDNAMES)
 
     if apply_blocked:
@@ -4237,6 +4822,30 @@ def main(argv: list[str]) -> int:
         except RuntimeError as exc:
             print(f"apply stopped: {exc}", file=sys.stderr)
             return 2
+        try:
+            marketing_result = apply_marketing_activity_plan(
+                marketing_plan,
+                SKILL_DIR / "scripts" / "update-marketing-activity.ps1",
+            )
+        except Exception as exc:
+            reminder_rows.extend(
+                marketing_activity_reminder_rows(
+                    marketing_plan,
+                    action,
+                    input_dir,
+                    error=str(exc),
+                )
+            )
+        else:
+            reminder_rows.extend(
+                marketing_activity_reminder_rows(
+                    marketing_plan,
+                    action,
+                    input_dir,
+                    apply_result=marketing_result,
+                )
+            )
+        write_utf8_sig_csv(reminder_path, reminder_rows, MISSING_REMINDER_FIELDNAMES)
 
     print_missing_reminders(reminder_rows, reminder_path)
     print_summary(rows, manifest_path)

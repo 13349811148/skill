@@ -121,10 +121,68 @@ Rules:
 - Count a report type as present when it is recognized from table content, even if the file later becomes `pending` because store name or period is missing.
 - Do not require `商品数据` by default, because product files are not exported every day or every month.
 - If `订单数据` or `推广数据` contains a product ID that is not found in `references/shop_product_map.csv` or already archived `商品数据/<店铺>/...`, print a reminder to update or re-export that shop's `商品数据`.
+- Before creating an order-based product-data reminder, inspect each order detail's title column, including the common header `商品`. If the normalized title contains `补差价` or `补收差价` (for example `补收差价专用商品`), classify that detail as a supplementary-price link: keep it available for shop inference and raw order archiving, but exclude its product ID from product-map requirements and `new_product_id` reminders. Do not require product-data maintenance for it.
 - If only `售后数据` contains a product ID that is not found in the product map or archived product data, treat it as a historical or likely delisted product. Write it as `status=historical_product_id`; do not ask the user to re-export product data for that reason alone.
+- Build `new_product_id` reminders only from the order and promotion sources that require product data. If the same IDs also occur in after-sale files, list those files separately as after-sale-only verification; never present them as the source that triggered the product-data reminder.
+- For promotion-adjustment logs, extract product IDs from dedicated columns or free-text fields such as `商品ID：123...`. When the same batch gives one unambiguous shop for an extracted ID, use it to infer the log's shop. Keep the file pending if an ID maps to multiple shops or the vote is tied.
 - Write new-product and historical-product reminders into the same reminder files, including `shop_name`, `source_name`, and `new_product_ids`. These reminders must also be printed in the message window every run, so the user does not need to open the CSV to understand what is missing or only historical.
+- Whenever a `new_product_id` or `historical_product_id` reminder exists, generate an Excel lookup table at the database root (`未收录商品ID对照表_预览.xlsx` for preview; `未收录商品ID对照表.xlsx` for apply). Include `商品ID`, `样式ID`, and `商家编码-规格维度` when that order column exists, plus shop, product title/SKU, and source. Keep blank fields blank when the item appears only in after-sale data or the order export has no such column. Add the generated table as a reminder-log row and state its path in the chat response.
 - Do not run missing-report reminders during `--rebuild-order-summary`, because that mode rebuilds summaries from archived files and does not inspect a new input batch.
 - To change which report types trigger reminders, edit `references/expected_reports.csv`.
+
+## 未收录商品与营销活动表维护
+
+Only use workbooks inside `%USERPROFILE%\Desktop\运营数据库` as business data. A workbook outside that database may be inspected only when the user explicitly provides it as a schema reference; never copy its business rows into the database.
+
+When a `new_product_id` reminder is generated, use the same exact evidence collected for `未收录商品ID对照表` to preview or maintain the marketing-activity workbook. A `historical_product_id` that occurs only in after-sale data is lookup-only and must not create a marketing row. A supplementary-price order detail must not create a product-master or marketing row.
+
+### Layout selection
+
+Inspect only the workbooks directly under `运营数据库\营销活动监控` and recognize these two mutually exclusive layouts:
+
+- 简版: `样式ID, 商品ID, 品牌, 所属运营, 平台, 店铺名称, 大类, 商品SKU, 产品成本, 活动价, 报名价, 促销机制`.
+- 跟踪版: `品牌, 所属运营, 平台, 店铺名称, 大类, 商品ID, 样式ID, 商品SKU, 产品成本, 营销活动ID, 活动名称, 活动价, 报名价, 其他店铺优惠, 单件预估实收, 多件折扣, 多件预估实收, 排期开始日期, 排期结束日期, 补贴金额, 单件预估实收（补贴后）, 单件预估毛利, 单件预估毛利率, 多件预估实收（补贴后）, 多件预估毛利, 多件预估毛利率`.
+
+If only one layout exists, maintain that layout only. When multiple files have the same layout, select the newest matching workbook by modified time, preferring `.xlsx` only when times tie; do not treat old and new files of the same schema as two layouts. If both layouts exist, or neither layout is recognizable, do not choose or write a workbook automatically; add a reminder but continue the ordinary report organization.
+
+### Field equivalence and evidence
+
+- `SKUID` equals `样式ID`.
+- `规格编码`, `商家编码-规格维度`, and `商品SKU` are the same key.
+- The cost-table `商品编码` is also that same `商品SKU` key.
+- Never use order level-1 through level-4 categories for the marketing `大类`.
+- Derive `店铺名称` from the product ID's identified order/product source shop. Never derive a shop from SKU text.
+- Derive `商品ID`, `样式ID`, and `商品SKU` only from exact order/product fields. Do not infer missing identifiers from titles.
+- Fill `品牌`, `所属运营`, `平台`, and `大类` only from a unique, exact same-`商品SKU` historical row in the selected marketing workbook. If a field is missing or conflicting, leave it blank and remind the user; do not use order categories, store names, SKU prefixes, cost-table brands, or majority voting.
+- Fill `产品成本` only by exact `商品SKU` = cost-table `商品编码`. If the cost is missing or conflicting, leave it blank and remind the user. Never fall back to a cost already present on an unrelated marketing row.
+- Fill only blank automatic fields. Never overwrite a conflicting nonblank value; preserve it and add a field-level manual-review reminder. If the same product/style maps to multiple SKUs or multiple target rows, skip that candidate and remind rather than guessing.
+
+### Manual and ignored fields
+
+- 简版 manual fields: `活动价`, `报名价`, `促销机制`.
+- 跟踪版 manual fields: `营销活动ID`, `活动名称`, `活动价`, `报名价`, `单件预估实收`, `多件预估实收`.
+- Do not use any standalone workbook under `运营数据库\单件实收` to populate the tracking layout. Its single-item and multiple-item estimated receipts remain manual.
+- In the tracking layout, `其他店铺优惠`, `多件折扣`, `排期开始日期`, and `排期结束日期` are intentionally out of scope. Do not add, change, clear, validate, or remind about these four fields.
+
+For the tracking layout, preserve an existing row formula and add/inherit a formula only when the formula cell is blank:
+
+- `补贴金额 = 报名价 - 活动价`.
+- `单件预估实收（补贴后） = 单件预估实收 + 补贴金额`.
+- `单件预估毛利 = 单件预估实收（补贴后） - 产品成本`.
+- `单件预估毛利率 = 单件预估毛利 / 单件预估实收（补贴后）`.
+- `多件预估实收（补贴后） = 多件预估实收 + 补贴金额`.
+- `多件预估毛利 = 多件预估实收（补贴后） - 产品成本`.
+- `多件预估毛利率 = 多件预估毛利 / 多件预估实收（补贴后）`.
+
+Keep the workbook's existing `IFERROR` and zero-as-blank behavior. Prefilled formulas are unchanged and must not be reported as updates.
+
+### Preview, apply, and reporting
+
+- During `--dry-run`, inspect the selected workbook and show planned field changes; do not modify the marketing workbook.
+- During `--apply`, update the marketing workbook only after ordinary report validation and archival succeed. Back up the original workbook under `营销活动监控\备份` before replacing it.
+- After apply, report only actual changes, grouped by `商品ID + 样式ID + 商品SKU`, and list the exact changed fields. For a new row, list every populated field. List formula fields only when formulas were actually added.
+- Report the changed record count and exact product IDs. If candidates exist but no cell changes, say exactly `营销活动表未发生变更`.
+- Manual reminders must name the affected product/style/SKU and only the confirmed manual or unresolved automatic fields. Never mention the four intentionally ignored tracking fields.
 
 ## Chat Reminder Output
 
@@ -221,6 +279,8 @@ Rules:
 ## Resources
 
 - `scripts/organize_reports.py`: preview or apply classification, renaming, movement, manifest generation, and cumulative order/after-sale/promotion-adjustment updates.
+- `scripts/marketing_activity_maintenance.py`: recognize the active marketing layout, plan exact-SKU field maintenance, and transactionally replace the selected workbook.
+- `scripts/update-marketing-activity.ps1`: preserve Excel formatting and formulas while applying an approved marketing maintenance plan through local Excel.
 - `scripts/update-skills.ps1`: check the shared public GitHub repository and transactionally update both Skills before business work.
 - `references/report_signatures.csv`: content signatures and period rules.
 - `references/shop_product_map.csv`: product ID to shop name map seeded from the provided examples and updated from newly archived product data.
