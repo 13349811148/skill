@@ -1,9 +1,13 @@
 ---
 name: shop-report-organizer
-description: "固定口令触发：仅当用户明确输入完整短语“整理数据库V2版本”时使用；没有这个完整短语时不要使用。触发后按本 Skill 的流程执行。"
+description: "触发规则：用户明确输入完整短语“整理数据库V2版本”时使用；或用户显式通过 @shop-report-organizer 调用插件时立即使用。显式 @ 调用即视为已确认授权，不要求再次输入固定口令。"
 ---
 
 # 整理数据库V2版本
+
+## Trigger Rule
+
+When the user explicitly invokes `@shop-report-organizer`, treat that invocation as the required confirmation and execute this Skill without asking for the fixed phrase. When the plugin is not explicitly invoked, use this Skill only when the user provides the complete phrase `整理数据库V2版本`.
 
 Use this skill to organize files downloaded from shop backends into the operations database. The workflow supports multiple platforms, currently Pinduoduo and Tmall. It must inspect spreadsheet content first; do not identify report type from filename keywords alone.
 
