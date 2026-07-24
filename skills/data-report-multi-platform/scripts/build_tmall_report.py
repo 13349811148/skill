@@ -13,16 +13,17 @@ from typing import Any
 
 from data_quality_protection import (
     COST_SOURCE_LOG_COLUMNS,
-    COST_TABLE_CODE_CANDIDATES,
+    COST_METADATA_FIELDS,
     COST_TABLE_MAX_ROWS,
     ORDER_SPEC_CODE_CANDIDATES,
     DataQualityError,
     cost_source_log,
     duplicate_identifier_warnings,
+    load_cost_table_records,
     marketing_price_warnings,
-    normalize_match_code,
     optional_number,
     parse_number_strict,
+    resolve_final_cost,
 )
 from handoff_protection import (
     PRODUCT_ID_CANDIDATES,
@@ -77,7 +78,6 @@ REFERENCE_TABLE_EXTENSIONS = {".xls", ".xlsx"}
 PROMOTION_MECHANISM_COLUMN = "促销机制        (天猫参加活动填万人团\n淘宝参加活动填百亿补贴)"
 TEMPLATE_SHEET = "每日销售数据"
 BRAND_ENJOY_KEYWORDS = ("品牌新享", "品牌心享", "品牌心想")
-COST_METADATA_FIELDS = ("产线", "项目组", "管理类型", "品种")
 ORDER_MAX_ROWS = 100_000
 SMALL_RECEIPT_UPPER_BOUND = 1.0
 COST_LOW_DEVIATION_THRESHOLD = 0.10
@@ -550,69 +550,15 @@ def load_marketing_products(marketing_rows: list[dict[str, Any]]) -> dict[tuple[
 
 
 def load_costs_by_merchant_code(cost_table_path: Path) -> tuple[dict[str, dict[str, Any]], list[str]]:
-    costs: dict[str, dict[str, Any]] = {}
-    warnings: list[str] = []
     try:
-        sheets = read_all_workbook_sheets(cost_table_path)
+        return load_cost_table_records(
+            cost_table_path,
+            read_all_workbook_sheets(cost_table_path),
+        )
+    except DataQualityError as exc:
+        raise ReportError(str(exc)) from exc
     except Exception as exc:
         raise ReportError(f"成本表读取失败，已停止生成日报,{cost_table_path},{exc}") from exc
-
-    for data in sheets:
-        if data.truncated:
-            warnings.append(
-                f"成本表工作表超过{COST_TABLE_MAX_ROWS}行，仅读取前{COST_TABLE_MAX_ROWS}行,{cost_table_path},{data.sheet_name}"
-            )
-        header_index = find_header_row(
-            data.rows,
-            lambda headers: bool(find_col(headers, list(COST_TABLE_CODE_CANDIDATES)))
-            and bool(find_col(headers, ["6.11成本价", "成本价", "产品成本", "成本"])),
-        )
-        if header_index is None:
-            continue
-        headers = [text(value) for value in data.rows[header_index]]
-        code_col = find_col(headers, list(COST_TABLE_CODE_CANDIDATES))
-        cost_col = find_col(headers, ["6.11成本价", "成本价", "产品成本", "成本"])
-        if not code_col or not cost_col:
-            continue
-        for _row_number, row in numbered_dict_rows(data.rows, header_index):
-            raw_code = text(row.get(code_col))
-            match_code = normalize_match_code(raw_code)
-            if not match_code:
-                continue
-            if text(row.get(cost_col)) == "":
-                warnings.append(f"成本表成本为空,{data.sheet_name},{raw_code}")
-                continue
-            try:
-                cost_value = parse_number_strict(
-                    row.get(cost_col),
-                    field_name="成本",
-                    context=f"文件={cost_table_path}，工作表={data.sheet_name}，编码={raw_code}",
-                )
-            except DataQualityError as exc:
-                warnings.append(f"成本表成本无效，已忽略并尝试营销活动表兜底,{exc}")
-                continue
-            if cost_value <= 0.0:
-                warnings.append(
-                    f"成本表成本必须大于0，已忽略并尝试营销活动表兜底,{data.sheet_name},{raw_code},{cost_value:.2f}"
-                )
-                continue
-            if match_code in costs:
-                previous = costs[match_code]
-                warnings.append(
-                    "成本表匹配编码重复，请检查；"
-                    f"标准化编码={match_code}，前一来源={previous['来源']}，"
-                    f"后一来源={cost_table_path.name}/{data.sheet_name}/{code_col}={raw_code}"
-                )
-            costs[match_code] = {
-                "产品成本": cost_value,
-                **{field: row.get(field, "") for field in COST_METADATA_FIELDS},
-                "来源": f"成本表:{cost_table_path.name}/{data.sheet_name}/{code_col}={raw_code}/{cost_col}",
-                "原始编码": raw_code,
-            }
-
-    if not costs:
-        raise ReportError(f"成本表未读取到可用正数成本，已停止生成日报,{cost_table_path}")
-    return costs, warnings
 
 
 def load_product_exports(
@@ -708,18 +654,16 @@ def resolve_order_unit_cost(
     template_styles: dict[str, dict[str, Any]],
     cost_by_merchant_code: dict[str, dict[str, Any]],
 ) -> float | None:
-    match_code = normalize_match_code(merchant_spec_code)
-    cost_record = cost_by_merchant_code.get(match_code, {}) if match_code else {}
-    cost_value = cost_record.get("产品成本", "") if cost_record else ""
-    if text(cost_value) != "" and number(cost_value) > 0.0:
-        return number(cost_value)
-    marketing_row = matching_marketing_row(
-        style_id, product_id, sku, template_products, template_styles
+    resolution = resolve_final_cost(
+        style_id=style_id,
+        product_id=product_id,
+        final_order_sku=merchant_spec_code or sku,
+        cost_by_merchant_code=cost_by_merchant_code,
+        template_products=template_products,
+        template_styles=template_styles,
+        marketing_source_prefix="营销活动表",
     )
-    cost_value = marketing_row.get("产品成本", "")
-    if text(cost_value) != "" and number(cost_value) > 0.0:
-        return number(cost_value)
-    return None
+    return resolution.cost
 
 
 def effective_receipt_for_cost_review(
@@ -1448,6 +1392,7 @@ def build_report(
     unmatched_cost_merchant_codes: set[str] = set()
     negative_gross_missing_price_product_ids: set[str] = set()
     cost_data_warnings: list[str] = []
+    cost_specification_conflicts: set[str] = set()
     cost_source_logs: list[dict[str, str]] = []
     for key, aggregate in order_rows.items():
         date, _style_id = key
@@ -1477,28 +1422,23 @@ def build_report(
         subsidy = number(row.get("总补贴金额"))
         merchant_spec_code = text(row.get("商品SKU"))
         marketing_cost = row.get("产品成本", "")
-        marketing_cost_value = optional_number(marketing_cost)
-        normalized_spec_code = normalize_match_code(merchant_spec_code)
-        cost_record = (
-            cost_by_merchant_code.get(normalized_spec_code, {})
-            if normalized_spec_code
-            else {}
+        style_id = text(row.get("样式ID"))
+        product_id = text(row.get("商品ID"))
+        cost_resolution = resolve_final_cost(
+            style_id=style_id,
+            product_id=product_id,
+            final_order_sku=merchant_spec_code,
+            cost_by_merchant_code=cost_by_merchant_code,
+            template_products=template_products,
+            template_styles=template_styles,
+            marketing_source_prefix=f"营销活动表:{marketing_path.name}",
         )
-        if cost_record:
-            row["产品成本"] = cost_record["产品成本"]
-            selected_cost_source = cost_record["来源"]
-        elif marketing_cost_value is not None and marketing_cost_value > 0.0:
-            row["产品成本"] = marketing_cost_value
-            selected_cost_source = (
-                f"营销活动表:{marketing_path.name}/"
-                + marketing_cost_source(
-                    style_id,
-                    text(row.get("商品ID")),
-                    text(row.get("商品SKU")),
-                    template_products,
-                    template_styles,
-                )
-            )
+        cost_record = cost_resolution.cost_record
+        if cost_resolution.cost is not None:
+            row["产品成本"] = cost_resolution.cost
+            selected_cost_source = cost_resolution.source
+            if cost_resolution.specification_conflict_warning:
+                cost_specification_conflicts.add(cost_resolution.specification_conflict_warning)
         else:
             row["产品成本"] = ""
             selected_cost_source = "未匹配"
@@ -1514,7 +1454,6 @@ def build_report(
             row[field] = cost_record.get(field, "")
         has_cost = text(row.get("产品成本")) != ""
         cost = number(row.get("产品成本"))
-        product_id = text(row.get("商品ID"))
         cost_source_logs.append(
             cost_source_log(
                 platform="天猫",
@@ -1644,6 +1583,7 @@ def build_report(
         + cost_warnings
         + product_warnings
         + cost_data_warnings
+        + sorted(cost_specification_conflicts)
         + empty_burn_warnings
     )
     for product_id in sorted(negative_gross_missing_price_product_ids):
@@ -1759,6 +1699,15 @@ def write_cost_log(path: Path, cost_source_logs: list[dict[str, str]]) -> Path:
     return log_path
 
 
+def print_cost_specification_dialogue_reminders(warnings: list[str]) -> None:
+    reminders = [warning for warning in warnings if warning.startswith("订单SKU与营销表样式SKU冲突")]
+    if not reminders:
+        return
+    print("规格冲突对话提醒（请直接发送给用户）:")
+    for reminder in reminders:
+        print(f"- {reminder}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Generate 天猫店铺数据报表.xlsx")
     parser.add_argument("--database-root", default=str(DEFAULT_DATABASE_ROOT))
@@ -1820,6 +1769,7 @@ def main() -> int:
             print(f"- {warning}")
         if len(visible_warnings) > 20:
             print(f"- 还有 {len(visible_warnings) - 20} 条提醒，见生成日志。")
+    print_cost_specification_dialogue_reminders(warnings)
     return 0
 
 
