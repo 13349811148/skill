@@ -111,6 +111,19 @@ def optional_number(value: Any) -> float | None:
         return None
 
 
+def unit_subsidy_amount(marketing_row: Mapping[str, Any]) -> float:
+    """Return the valid per-unit subsidy recorded by the marketing activity row."""
+    activity_price = optional_number(marketing_row.get("活动价"))
+    registration_price = optional_number(marketing_row.get("报名价"))
+    if (
+        activity_price is None
+        or registration_price is None
+        or registration_price <= activity_price
+    ):
+        return 0.0
+    return registration_price - activity_price
+
+
 def _header_key(value: Any) -> str:
     return normalize_match_code(value)
 

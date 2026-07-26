@@ -23,7 +23,9 @@ from data_quality_protection import (
     DataQualityError,
     cost_source_log,
     load_cost_table_records,
+    normalize_match_code,
     resolve_final_cost,
+    unit_subsidy_amount,
 )
 
 
@@ -229,6 +231,156 @@ def test_full_report_cost_regression_for_both_platforms() -> None:
         assert any("订单SKU与营销表样式SKU冲突" in warning for warning in warnings)
 
 
+def test_four_subsidized_orders_do_not_trigger_below_cost_confirmation() -> None:
+    """Reproduce the four 2026-07-06 orders that were previously false positives."""
+    product_id = "799165670865"
+    style_id = "1775212913235"
+    merchant_code = "黄小惠紫荆丝苗米5kg"
+    marketing_row = {
+        "商品ID": product_id,
+        "样式ID": style_id,
+        "商品SKU": merchant_code,
+        "产品成本": 24.5,
+        "活动价": 22.1,
+        "报名价": 26.5,
+        "店铺名称": "黄小惠庄芯专卖店",
+    }
+    products = {(product_id, merchant_code): marketing_row}
+    styles = {style_id: marketing_row}
+    costs = {
+        normalize_match_code(merchant_code): {
+            "产品成本": 24.5,
+            "来源": f"成本表:成本表.xlsx/成本/商家编码-规格维度={merchant_code}",
+        }
+    }
+    subsidy = unit_subsidy_amount(marketing_row)
+    assert abs(subsidy - 4.4) < 1e-9
+
+    for name, module in (("拼多多", pdd), ("天猫", tmall)):
+        raw_reason = module.below_cost_review_reason(21.1, 1, 24.5)
+        assert "偏差13.88%" in raw_reason, f"{name}测试前提不成立：{raw_reason}"
+        assert module.below_cost_review_reason(21.1, 1, 24.5, subsidy) == ""
+
+    pdd_headers = [
+        "订单号",
+        "订单支付时间",
+        "订单状态",
+        "售后状态",
+        "汇总_店铺名称",
+        "商品id",
+        "样式ID",
+        "商家编码-规格维度",
+        "商品数量(件)",
+        "商家实收金额(元)",
+    ]
+    pdd_rows = [
+        [
+            f"PDD-TEST-{index}",
+            "2026-07-06 12:00:00",
+            "已发货",
+            "",
+            "黄小惠庄芯专卖店",
+            product_id,
+            style_id,
+            merchant_code,
+            1,
+            21.1,
+        ]
+        for index in range(1, 5)
+    ]
+    pdd_source = Path("四条补贴订单_拼多多.xlsx")
+    with (
+        patch.object(pdd, "discover_files", return_value=[pdd_source]),
+        patch.object(pdd, "deduplicate_exact_files", return_value=([pdd_source], [])),
+        patch.object(
+            pdd,
+            "read_workbook_sheets",
+            return_value=[sheet(pdd_headers, pdd_rows, "订单明细")],
+        ),
+    ):
+        pdd_aggregates, _warnings = pdd.load_order_aggregates(
+            Path("数据库"),
+            {"2026-07-06"},
+            small_receipt_action="confirm",
+            template_products=products,
+            template_styles=styles,
+            cost_by_merchant_code=costs,
+            product_exports=pdd.ProductExportIndex(),
+        )
+    assert pdd_aggregates[("2026-07-06", style_id)][
+        "实际成交数量（去退款去补单后）"
+    ] == 4
+    assert abs(
+        pdd_aggregates[("2026-07-06", style_id)][
+            "实际成交金额（去退款去补单后）"
+        ]
+        - 84.4
+    ) < 1e-9
+
+    tmall_headers = [
+        "子订单编号",
+        "订单支付时间",
+        "交易状态",
+        "退款状态",
+        "店铺名称",
+        "商品ID",
+        "SKU ID",
+        "商家编码-规格维度",
+        "购买数量",
+        "商家实收金额(元)",
+    ]
+    tmall_rows = [
+        [
+            f"TMALL-TEST-{index}",
+            "2026-07-06 12:00:00",
+            "卖家已发货",
+            "",
+            "黄小惠庄芯专卖店",
+            product_id,
+            style_id,
+            merchant_code,
+            1,
+            21.1,
+        ]
+        for index in range(1, 5)
+    ]
+    tmall_source = Path("四条补贴订单_天猫.xlsx")
+    with (
+        patch.object(tmall, "discover_files", return_value=[tmall_source]),
+        patch.object(tmall, "deduplicate_exact_files", return_value=([tmall_source], [])),
+        patch.object(
+            tmall,
+            "read_workbook_sheets",
+            return_value=[sheet(tmall_headers, tmall_rows, "订单明细")],
+        ),
+    ):
+        tmall_aggregates, _warnings = tmall.load_order_aggregates(
+            Path("数据库"),
+            {"2026-07-06"},
+            "订单数据",
+            small_receipt_action="confirm",
+            template_products=products,
+            template_styles=styles,
+            cost_by_merchant_code=costs,
+            product_exports=tmall.ProductExportIndex(),
+        )
+    assert tmall_aggregates[("2026-07-06", style_id)][
+        "实际成交数量（去退款去补单后）"
+    ] == 4
+    assert abs(
+        tmall_aggregates[("2026-07-06", style_id)][
+            "实际成交金额（去退款去补单后）"
+        ]
+        - 84.4
+    ) < 1e-9
+
+    zero_receipt, additional_subsidy = tmall.effective_receipt_for_cost_review(
+        0.0, 1, style_id, product_id, merchant_code, products, styles
+    )
+    assert zero_receipt == 26.5
+    assert additional_subsidy == 0.0
+
+
 def main() -> None:
     assert "商家编码-规格维度" in COST_TABLE_CODE_CANDIDATES
     assert "商品SKU" in COST_TABLE_CODE_CANDIDATES
@@ -237,6 +389,7 @@ def main() -> None:
     test_per_row_fallback_and_duplicate_protection()
     test_marketing_fallback_only_when_cost_table_misses()
     test_full_report_cost_regression_for_both_platforms()
+    test_four_subsidized_orders_do_not_trigger_below_cost_confirmation()
     print("PASS: 拼多多与天猫共享成本匹配回归测试全部通过")
 
 

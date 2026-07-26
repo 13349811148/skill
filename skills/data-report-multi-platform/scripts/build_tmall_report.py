@@ -24,6 +24,7 @@ from data_quality_protection import (
     optional_number,
     parse_number_strict,
     resolve_final_cost,
+    unit_subsidy_amount,
 )
 from handoff_protection import (
     PRODUCT_ID_CANDIDATES,
@@ -436,13 +437,7 @@ def marketing_promotion_mechanism(row: dict[str, Any]) -> Any:
 
 
 def is_subsidy_activity(row: dict[str, Any]) -> bool:
-    activity_price = optional_number(row.get("活动价"))
-    registration_price = optional_number(row.get("报名价"))
-    return bool(
-        activity_price is not None
-        and registration_price is not None
-        and registration_price > activity_price
-    )
+    return unit_subsidy_amount(row) > 0.0
 
 
 def load_template_products(template_path: Path) -> dict[tuple[str, str], dict[str, Any]]:
@@ -623,10 +618,18 @@ def matching_marketing_row(
     template_products: dict[tuple[str, str], dict[str, Any]],
     template_styles: dict[str, dict[str, Any]],
 ) -> dict[str, Any]:
-    return template_styles.get(style_id) or template_products.get((product_id, sku)) or next(
-        (value for (candidate_product_id, _sku), value in template_products.items() if candidate_product_id == product_id),
-        {},
-    )
+    style_record = template_styles.get(style_id, {}) if style_id else {}
+    if style_record:
+        return style_record
+    exact_record = template_products.get((product_id, sku), {})
+    if exact_record:
+        return exact_record
+    candidates = [
+        value
+        for (candidate_product_id, _sku), value in template_products.items()
+        if candidate_product_id == product_id
+    ]
+    return candidates[0] if len(candidates) == 1 else {}
 
 
 def marketing_cost_source(
@@ -674,28 +677,42 @@ def effective_receipt_for_cost_review(
     sku: str,
     template_products: dict[tuple[str, str], dict[str, Any]],
     template_styles: dict[str, dict[str, Any]],
-) -> float:
+) -> tuple[float, float]:
     actual_amount = number(merchant_receipt)
-    if actual_amount != 0.0 or quantity <= 0.0:
-        return actual_amount
     marketing_row = matching_marketing_row(
         style_id, product_id, sku, template_products, template_styles
     )
+    unit_subsidy = unit_subsidy_amount(marketing_row)
+    if actual_amount != 0.0 or quantity <= 0.0:
+        return actual_amount, unit_subsidy
     registration_price = text(marketing_row.get("报名价"))
-    if is_subsidy_activity(marketing_row) and registration_price:
-        return quantity * number(registration_price)
-    return actual_amount
+    if unit_subsidy > 0.0 and registration_price:
+        # Preserve the existing Tmall zero-receipt rule: registration price is
+        # already the complete adjusted receipt, so do not add subsidy again.
+        return quantity * number(registration_price), 0.0
+    return actual_amount, 0.0
 
 
 def below_cost_review_reason(
-    actual_amount: float, quantity: float, unit_cost: float
+    actual_amount: float,
+    quantity: float,
+    unit_cost: float,
+    unit_subsidy: float = 0.0,
 ) -> str:
     if quantity <= 0.0 or unit_cost <= 0.0:
         return ""
     actual_unit_receipt = actual_amount / quantity
-    deviation = (unit_cost - actual_unit_receipt) / unit_cost
+    valid_unit_subsidy = max(unit_subsidy, 0.0)
+    adjusted_unit_receipt = actual_unit_receipt + valid_unit_subsidy
+    deviation = (unit_cost - adjusted_unit_receipt) / unit_cost
     if deviation <= COST_LOW_DEVIATION_THRESHOLD:
         return ""
+    if valid_unit_subsidy:
+        return (
+            f"补贴后单件实收{adjusted_unit_receipt:.2f}"
+            f"（实际实收{actual_unit_receipt:.2f}+每件补贴{valid_unit_subsidy:.2f}）"
+            f"低于单位成本{unit_cost:.2f}超过10%（偏差{deviation:.2%}）"
+        )
     return (
         f"单件实际实收{actual_unit_receipt:.2f}低于单位成本{unit_cost:.2f}超过10%"
         f"（偏差{deviation:.2%}）"
@@ -706,7 +723,8 @@ def order_review_confirmation_error(details: list[str]) -> ReportError:
     preview = "\n".join(f"- {detail}" for detail in details[:20])
     remainder = "" if len(details) <= 20 else f"\n- 另有 {len(details) - 20} 条。"
     return ReportError(
-        "发现需要人工确认的订单：单笔实收金额大于0且小于1元，或单件实际实收低于单位成本超过10%；"
+        "发现需要人工确认的订单：单笔实收金额大于0且小于1元，"
+        "或单件实际实收加有效补贴后仍低于单位成本超过10%；"
         "为避免误计入，尚未生成报表。请先询问用户是否计入这些订单；确认后以 "
         "--small-receipt-action include（计入）或 "
         "--small-receipt-action exclude（不计入）重新运行。\n"
@@ -901,7 +919,7 @@ def load_order_aggregates(
                 if quantity > 0.0 and unit_cost is None:
                     missing_cost_rows.add((date, shop, product_id, style_id, merchant_spec_code))
                 elif unit_cost is not None:
-                    effective_receipt = effective_receipt_for_cost_review(
+                    effective_receipt, unit_subsidy = effective_receipt_for_cost_review(
                         merchant_receipt,
                         quantity,
                         style_id,
@@ -910,7 +928,9 @@ def load_order_aggregates(
                         template_products,
                         template_styles,
                     )
-                    cost_reason = below_cost_review_reason(effective_receipt, quantity, unit_cost)
+                    cost_reason = below_cost_review_reason(
+                        effective_receipt, quantity, unit_cost, unit_subsidy
+                    )
                     if cost_reason:
                         below_cost_count += 1
                         review_reasons.append(cost_reason)
@@ -957,7 +977,7 @@ def load_order_aggregates(
         decision = "计入" if small_receipt_action == "include" else "不计入"
         warnings.append(
             f"异常订单已按确认{decision},{len(review_details)}条,"
-            f"小额实收{small_receipt_count}条,低于成本超过10%共{below_cost_count}条"
+            f"小额实收{small_receipt_count}条,补贴后低于成本超过10%共{below_cost_count}条"
         )
     for date, shop, product_id, style_id, merchant_spec_code in sorted(missing_cost_rows):
         warnings.append(
@@ -1729,7 +1749,7 @@ def main() -> int:
         "--small-receipt-action",
         choices=SMALL_RECEIPT_ACTIONS,
         default="confirm",
-        help="小额实收或单件实收低于成本超过10%%时的处理：confirm（先停止并等待确认）、include（计入）、exclude（不计入）。",
+        help="小额实收或单件实收加有效补贴后仍低于成本超过10%%时的处理：confirm（先停止并等待确认）、include（计入）、exclude（不计入）。",
     )
     args = parser.parse_args()
 
