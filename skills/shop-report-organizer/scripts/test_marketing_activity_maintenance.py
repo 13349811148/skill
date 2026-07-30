@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import csv
+import io
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 
 import openpyxl
@@ -359,6 +361,84 @@ class MarketingActivityMaintenanceTests(unittest.TestCase):
             "SKU-Z",
             7,
         ))
+
+    def test_chat_reminder_output_is_concise_but_audit_rows_stay_complete(self) -> None:
+        product_ids = [str(900000000000 + index) for index in range(1, 9)]
+        long_detail = "逐商品逐样式完整字段明细-" + ("很长" * 300)
+        rows = [
+            {
+                "status": "new_product_id",
+                "report_type": "商品数据",
+                "detected_count": "8",
+                "shop_name": "测试店铺",
+                "source_name": "订单.csv",
+                "new_product_ids": "|".join(product_ids),
+                "message": long_detail,
+            },
+            {
+                "status": "pending",
+                "report_type": "",
+                "detected_count": "",
+                "shop_name": "",
+                "source_name": "待确认.xlsx",
+                "new_product_ids": "",
+                "message": "文件格式未知，请确认用途。",
+            },
+            {
+                "status": "marketing_activity_preview",
+                "report_type": "营销活动表",
+                "detected_count": "87",
+                "shop_name": "",
+                "source_name": "营销活动.xlsx",
+                "new_product_ids": "|".join(product_ids),
+                "message": long_detail,
+            },
+            {
+                "status": "marketing_activity_manual",
+                "report_type": "营销活动表",
+                "detected_count": "25",
+                "shop_name": "",
+                "source_name": "营销活动.xlsx",
+                "new_product_ids": "|".join(product_ids),
+                "message": "品牌、所属运营、平台、大类、商品SKU和产品成本需要人工核对。" + long_detail,
+            },
+            {
+                "status": "marketing_activity_manual_fields",
+                "report_type": "营销活动表",
+                "detected_count": "87",
+                "shop_name": "",
+                "source_name": "营销活动.xlsx",
+                "new_product_ids": "|".join(product_ids),
+                "message": "活动价、报名价、促销机制需要人工填写。" + long_detail,
+            },
+            {
+                "status": "unrecorded_product_mapping",
+                "report_type": "商品数据",
+                "detected_count": "8",
+                "shop_name": "",
+                "source_name": "未收录商品ID对照表_预览.xlsx",
+                "new_product_ids": "",
+                "message": long_detail,
+            },
+        ]
+        original_rows = [dict(row) for row in rows]
+        reminder_path = self.database_root / "缺失提醒_预览.csv"
+
+        output = io.StringIO()
+        with redirect_stdout(output):
+            organize_reports.print_missing_reminders(rows, reminder_path)
+        chat_text = output.getvalue()
+
+        self.assertEqual(rows, original_rows)
+        self.assertNotIn(long_detail, chat_text)
+        self.assertEqual(chat_text.count("[营销活动]"), 1)
+        self.assertIn("计划维护 87 个商品/样式记录", chat_text)
+        self.assertIn("自动字段核对项 25 条", chat_text)
+        self.assertIn("需人工填写记录 87 条", chat_text)
+        self.assertIn("等8个", chat_text)
+        self.assertIn("文件格式未知，请确认用途。", chat_text)
+        self.assertIn("未收录商品ID对照表_预览.xlsx", chat_text)
+        self.assertIn(f"完整提醒文件：{reminder_path}", chat_text)
 
 
 if __name__ == "__main__":

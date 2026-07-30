@@ -27,7 +27,7 @@ Follow this order exactly. Do not scan, classify, preview, or archive downloaded
 2. Confirm the database root and input folder, then run only `scripts/organize_reports.py --dry-run` as the entry point. Its first input-preparation action must safely extract every ZIP in `下载未分类` and move each successfully processed ZIP to `_已解压ZIP`.
 3. If any ZIP cannot be extracted, contains no supported spreadsheet, or fails the safety check, stop immediately, report the ZIP filename and error in the chat, and do not scan the remaining reports or run `--apply`.
 4. After ZIP preparation succeeds, let the script inspect workbook contents, classify reports, and compare file contents. For files with identical SHA-256 content, retain one deterministic source for processing and mark every other copy as `duplicate_file`; do not classify reports from filenames alone.
-5. Review every preview/reminder row with the user. Run `--apply` only after the preview is acceptable and all required reports are present, unless the user explicitly approves `--allow-missing-required` for a supplemental batch.
+5. Review the concise preview summary and every blocking or actionable reminder category with the user. Keep row-level audit details in the generated CSV/XLSX files; do not paste the full audit log into chat. Run `--apply` only after the preview is acceptable and all required reports are present, unless the user explicitly approves `--allow-missing-required` for a supplemental batch.
 6. Verify the apply result, including every `duplicate_file` moved to `下载未分类\_重复文件`, then send every required reminder and unresolved item in the current Codex or Work Buddy conversation.
 
 ## Workflow
@@ -46,7 +46,7 @@ $databaseRoot = Join-Path $env:USERPROFILE "Desktop\运营数据库"
 python ".\scripts\organize_reports.py" --database-root "$databaseRoot" --dry-run
 ```
 
-3. Review `整理记录_预览.csv`, `缺失提醒_预览.csv`, and the console summary. Pay attention to files marked `pending` or `duplicate_file` and reminders marked `missing`. Copy every row of the reminder log into the chat response as required by **Chat Reminder Output** below.
+3. Review `整理记录_预览.csv`, `缺失提醒_预览.csv`, and the console summary. Pay attention to files marked `pending` or `duplicate_file` and reminders marked `missing`. Present the grouped, concise summary required by **Chat Reminder Output** below.
 4. For order reports, remember that each download usually covers the latest 7 days, so repeated downloads overlap. On `--apply`, merge order rows into cumulative shop/month tables by transaction month.
    - Use at most the first 100,000 rows only for preview, report recognition, and shop/period inference. This is a script-side preview guard, not an AI row-processing limit.
    - During every formal cumulative merge or rebuild, read every row and every effective spreadsheet column in every source and existing cumulative table. This applies to order monthly tables, after-sale cumulative tables, promotion-adjustment cumulative logs, and order-summary rebuilds. Never apply the 100,000-row or 120-column preview guards to formal processing, and never load the entire table into the AI context merely for reasoning.
@@ -125,7 +125,7 @@ Rules:
 - If only `售后数据` contains a product ID that is not found in the product map or archived product data, treat it as a historical or likely delisted product. Write it as `status=historical_product_id`; do not ask the user to re-export product data for that reason alone.
 - Build `new_product_id` reminders only from the order and promotion sources that require product data. If the same IDs also occur in after-sale files, list those files separately as after-sale-only verification; never present them as the source that triggered the product-data reminder.
 - For promotion-adjustment logs, extract product IDs from dedicated columns or free-text fields such as `商品ID：123...`. When the same batch gives one unambiguous shop for an extracted ID, use it to infer the log's shop. Keep the file pending if an ID maps to multiple shops or the vote is tied.
-- Write new-product and historical-product reminders into the same reminder files, including `shop_name`, `source_name`, and `new_product_ids`. These reminders must also be printed in the message window every run, so the user does not need to open the CSV to understand what is missing or only historical.
+- Write new-product and historical-product reminders into the same reminder files, including `shop_name`, `source_name`, and `new_product_ids`. In chat, group them by shop and status, show the count and at most five example IDs, and state the required action. Keep the complete ID list in the reminder file and lookup workbook.
 - Whenever a `new_product_id` or `historical_product_id` reminder exists, generate an Excel lookup table at the database root (`未收录商品ID对照表_预览.xlsx` for preview; `未收录商品ID对照表.xlsx` for apply). Include `商品ID`, `样式ID`, and `商家编码-规格维度` when that order column exists, plus shop, product title/SKU, and source. Keep blank fields blank when the item appears only in after-sale data or the order export has no such column. Add the generated table as a reminder-log row and state its path in the chat response.
 - Do not run missing-report reminders during `--rebuild-order-summary`, because that mode rebuilds summaries from archived files and does not inspect a new input batch.
 - To change which report types trigger reminders, edit `references/expected_reports.csv`.
@@ -180,20 +180,24 @@ Keep the workbook's existing `IFERROR` and zero-as-blank behavior. Prefilled for
 
 - During `--dry-run`, inspect the selected workbook and show planned field changes; do not modify the marketing workbook.
 - During `--apply`, update the marketing workbook only after ordinary report validation and archival succeed. Back up the original workbook under `营销活动监控\备份` before replacing it.
-- After apply, report only actual changes, grouped by `商品ID + 样式ID + 商品SKU`, and list the exact changed fields. For a new row, list every populated field. List formula fields only when formulas were actually added.
-- Report the changed record count and exact product IDs. If candidates exist but no cell changes, say exactly `营销活动表未发生变更`.
-- Manual reminders must name the affected product/style/SKU and only the confirmed manual or unresolved automatic fields. Never mention the four intentionally ignored tracking fields.
+- Record actual changes in the audit reminder file grouped by `商品ID + 样式ID + 商品SKU`, including the exact changed fields. For a new row, record every populated field. Record formula fields only when formulas were actually added.
+- In chat, report only the changed-record count, unique product-ID count, affected field categories, and at most five example product IDs. If candidates exist but no cell changes, say exactly `营销活动表未发生变更`.
+- Record item-level manual reminders in the audit file. In chat, combine them into one marketing summary with the affected-record count and unresolved field categories; do not repeat one sentence per product/style/SKU. Never mention the four intentionally ignored tracking fields.
 
 ## Chat Reminder Output
 
-The CSV reminder files are an audit copy, not the primary way the user should learn the result. After every `--dry-run` and `--apply` run:
+The CSV/XLSX reminder files are the complete audit record. Chat is a concise decision summary. After every `--dry-run` and `--apply` run:
 
-- Show every reminder-log row in the chat window. This includes `missing`, `new_product_id`, `historical_product_id`, `duplicate_file`, `pending`, and `ok` rows.
-- For each row, include its status, shop name, report type, source filename, product IDs when present, and the complete `message` text. Do not replace these rows with only a count, a CSV path, or a general summary.
-- When the only row is `status=ok`, explicitly tell the user that no required report, new-product, historical-product, or pending-file reminder was found.
-- Show the complete reminder log after preview. If apply is run, show the complete apply reminder log in the final response; do not assume the preview message was enough.
-- If console output is truncated or has encoding problems, read `缺失提醒_预览.csv` or `缺失提醒.csv` as UTF-8 and relay every row from the file.
-- Keep the response readable, but never require the user to open a spreadsheet to discover any reminder detail.
+- Start with one totals line: ready, pending, duplicate, missing-required, new-product-ID, historical-product-ID, and marketing candidate counts.
+- Always show every blocking item (`missing`, `pending`, ZIP/safety/integrity errors, and `marketing_activity_error`) with its full source filename, reason, and required next action. Never hide or truncate information needed to unblock the run.
+- Group `new_product_id` and `historical_product_id` by shop and status. Show the count, at most five example IDs followed by `等N个` when needed, and the action. Do not paste the complete ID list into chat.
+- Combine all `marketing_activity_*` rows into one marketing summary: selected workbook, planned or actual changed-record count, automatic-field issue count, manual-field record count, unresolved field categories, and at most five example product IDs. Do not list every product/style/SKU.
+- Fold `unrecorded_product_mapping` into one supporting-file line instead of treating it as a separate reminder bullet.
+- Combine supplementary-price notices by shop and report the excluded-detail count once per shop.
+- When the only status is `ok`, explicitly say that no required-report, new-product, historical-product, duplicate, or pending reminder was found.
+- If `--apply` follows a preview in the same task, do not repeat the full preview summary. Show the apply outcome plus new, changed, or unresolved items only.
+- End with the paths to the complete reminder CSV and any generated lookup workbook. The user should understand every required decision from chat, while opening the files is optional for row-level detail.
+- Keep the normal chat reminder section within 10 bullets and roughly 1,200 Chinese characters. Blocking error detail may exceed this limit when necessary for safe recovery.
 
 ## Recognition Rules
 
