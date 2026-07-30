@@ -21,6 +21,7 @@ import zipfile
 import zlib
 from collections import Counter, defaultdict
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from pathlib import Path, PurePosixPath
 from typing import Iterable
 
@@ -58,6 +59,12 @@ PROMOTION_DATA_PREFIX = "推广数据"
 PROMOTION_ARCHIVE_DATE_HEADER = "归档日期"
 PROMOTION_ARCHIVE_PRODUCT_ID_HEADER = "归档商品ID"
 PROMOTION_ARCHIVE_TYPE_HEADER = "归档推广类型"
+PROMOTION_SPEND_HEADERS_BY_TYPE = {
+    "拼多多-商品推广": ("总花费(元)", "成交花费(元)"),
+    "万相台": ("花费",),
+    "新客加速": ("预估新客加速费用", "预估抽佣金额"),
+    "老客加速": ("预估老客加速费用",),
+}
 PROMOTION_ADJUSTMENT_REPORT_TYPE = "推广调整日志"
 PROMOTION_ADJUSTMENT_UPDATE_PREFIX = "推广调整日志更新至"
 ORDER_SUMMARY_PREFIX = "订单汇总表"
@@ -97,6 +104,10 @@ MISSING_REMINDER_FIELDNAMES = [
     "source_name",
     "source_path",
     "new_product_ids",
+    "marketing_new_rows",
+    "marketing_updated_rows",
+    "marketing_unchanged_rows",
+    "marketing_backup_path",
     "message",
     "input_path",
 ]
@@ -2609,18 +2620,90 @@ def write_xlsx_table(
     os.replace(temp_path, path)
 
 
+def normalize_promotion_spend(value: object, context: str) -> str:
+    text = normalize_text(value)
+    if text in {"", "-", "--"}:
+        return "0"
+    cleaned = (
+        text.replace(",", "")
+        .replace("￥", "")
+        .replace("¥", "")
+        .replace("元", "")
+        .strip()
+    )
+    try:
+        amount = Decimal(cleaned)
+    except InvalidOperation as exc:
+        raise RuntimeError(f"推广花费无效：{context}，值={text}") from exc
+    if not amount.is_finite():
+        raise RuntimeError(f"推广花费无效：{context}，值={text}")
+    if amount == 0:
+        return "0"
+    return format(amount.normalize(), "f")
+
+
+def promotion_record_key(
+    record: dict[str, str], context: str = ""
+) -> tuple[str, str, str, str]:
+    archive_date = normalize_text(record.get(PROMOTION_ARCHIVE_DATE_HEADER, ""))
+    product_id = normalize_product_id(
+        record.get(PROMOTION_ARCHIVE_PRODUCT_ID_HEADER, "")
+    )
+    promotion_type = normalize_text(record.get(PROMOTION_ARCHIVE_TYPE_HEADER, ""))
+    if not archive_date or not product_id or not promotion_type:
+        raise RuntimeError(
+            f"推广累计去重键缺失：{context}，"
+            f"日期={archive_date or '空'}，商品ID={product_id or '空'}，"
+            f"推广类型={promotion_type or '空'}"
+        )
+    spend_headers = PROMOTION_SPEND_HEADERS_BY_TYPE.get(promotion_type)
+    if not spend_headers:
+        raise RuntimeError(f"推广类型没有配置花费字段：{context}，推广类型={promotion_type}")
+    spend_header = next(
+        (
+            header
+            for header in spend_headers
+            if header in record and normalize_text(record.get(header, ""))
+        ),
+        next((header for header in spend_headers if header in record), ""),
+    )
+    if not spend_header:
+        raise RuntimeError(
+            f"推广数据缺少花费字段：{context}，推广类型={promotion_type}，"
+            f"要求字段={'/'.join(spend_headers)}"
+        )
+    spend = normalize_promotion_spend(
+        record.get(spend_header, ""),
+        f"{context}，字段={spend_header}",
+    )
+    return archive_date, product_id, promotion_type, spend
+
+
+def promotion_record_completeness(record: dict[str, str]) -> int:
+    return sum(1 for value in record.values() if normalize_text(value))
+
+
 def promotion_records(
-    paths: list[Path], max_cols: int
-) -> tuple[list[str], list[dict[str, str]]]:
+    paths: list[Path],
+    max_cols: int,
+    preferred_paths: set[Path] | None = None,
+) -> tuple[list[str], list[dict[str, str]], int]:
     headers = [
         PROMOTION_ARCHIVE_DATE_HEADER,
         PROMOTION_ARCHIVE_PRODUCT_ID_HEADER,
         PROMOTION_ARCHIVE_TYPE_HEADER,
     ]
-    records: list[dict[str, str]] = []
-    seen_records: set[tuple[tuple[str, str], ...]] = set()
+    records_by_key: dict[tuple[str, str, str, str], dict[str, str]] = {}
+    source_by_key: dict[tuple[str, str, str, str], Path] = {}
+    preferred_keys = {
+        os.path.normcase(str(path.resolve(strict=False)))
+        for path in (preferred_paths or set())
+    }
+    duplicate_rows = 0
 
     for path in paths:
+        path_key = os.path.normcase(str(path.resolve(strict=False)))
+        path_is_preferred = path_key in preferred_keys
         scan_promotion_file_full(path, max_cols)
         for promotion_row in iter_promotion_rows_full(path, max_cols):
             row = promotion_row.values
@@ -2651,12 +2734,33 @@ def promotion_records(
                 promotion_row.headers, row, promotion_row.signature
             )
             append_headers(headers, promotion_row.headers)
-            record_key = tuple(sorted((key, normalize_text(value)) for key, value in record.items()))
-            if record_key in seen_records:
+            record_key = promotion_record_key(
+                record,
+                f"文件={path}，工作表={promotion_row.sheet_name}，行={promotion_row.row_number}",
+            )
+            existing = records_by_key.get(record_key)
+            if existing is None:
+                records_by_key[record_key] = record
+                source_by_key[record_key] = path
                 continue
-            seen_records.add(record_key)
-            records.append(record)
+            duplicate_rows += 1
+            existing_source_key = os.path.normcase(
+                str(source_by_key[record_key].resolve(strict=False))
+            )
+            existing_is_preferred = existing_source_key in preferred_keys
+            should_replace = (
+                (path_is_preferred and not existing_is_preferred)
+                or (
+                    path_is_preferred == existing_is_preferred
+                    and promotion_record_completeness(record)
+                    > promotion_record_completeness(existing)
+                )
+            )
+            if should_replace:
+                records_by_key[record_key] = record
+                source_by_key[record_key] = path
 
+    records = list(records_by_key.values())
     records.sort(
         key=lambda record: (
             record.get(PROMOTION_ARCHIVE_DATE_HEADER, ""),
@@ -2666,15 +2770,19 @@ def promotion_records(
         ),
         reverse=True,
     )
-    return headers, records
+    return headers, records, duplicate_rows
 
 
-def merge_promotion_data(analysis: Analysis, max_cols: int) -> tuple[Path, int, int]:
+def merge_promotion_data(analysis: Analysis, max_cols: int) -> tuple[Path, int, int, int]:
     final_path = analysis.target_path
     final_path.parent.mkdir(parents=True, exist_ok=True)
     existing_paths = promotion_data_existing_paths(final_path)
     merge_paths = [*existing_paths, analysis.source]
-    headers, records = promotion_records(merge_paths, max_cols)
+    headers, records, duplicate_rows = promotion_records(
+        merge_paths,
+        max_cols,
+        preferred_paths={analysis.source},
+    )
     rows = [[normalize_text(record.get(header, "")) for header in headers] for record in records]
 
     with tempfile.TemporaryDirectory(prefix=".promotion-merge-", dir=final_path.parent) as temp_name:
@@ -2706,7 +2814,7 @@ def merge_promotion_data(analysis: Analysis, max_cols: int) -> tuple[Path, int, 
                 os.replace(old_output_backup, final_path)
             raise
 
-    return final_path, len(merge_paths), len(rows)
+    return final_path, len(merge_paths), len(rows), duplicate_rows
 
 
 def merge_promotion_adjustment_log(analysis: Analysis, max_rows: int, max_cols: int) -> tuple[Path, int, int]:
@@ -3794,8 +3902,28 @@ def marketing_activity_reminder_rows(
     layout = normalize_text(schema.get("layout", ""))
     layout_text = {"compact": "简版", "tracking": "跟踪版"}.get(layout, "未识别格式")
     product_ids_text = "|".join(candidate_ids)
+    candidate_record_count = len(
+        {
+            (
+                normalize_product_id(candidate.get("product_id", "")),
+                normalize_text(candidate.get("style_id", "")),
+                normalize_text(candidate.get("sku", "")),
+            )
+            for candidate in candidates
+            if normalize_product_id(candidate.get("product_id", ""))
+        }
+    )
 
-    def row(status: str, message: str, detected_count: int | str = "") -> dict[str, str]:
+    def row(
+        status: str,
+        message: str,
+        detected_count: int | str = "",
+        *,
+        new_rows: int | str = "",
+        updated_rows: int | str = "",
+        unchanged_rows: int | str = "",
+        backup_path: str = "",
+    ) -> dict[str, str]:
         return {
             "action": action,
             "status": status,
@@ -3805,6 +3933,10 @@ def marketing_activity_reminder_rows(
             "source_name": workbook_name,
             "source_path": workbook_path,
             "new_product_ids": product_ids_text,
+            "marketing_new_rows": str(new_rows),
+            "marketing_updated_rows": str(updated_rows),
+            "marketing_unchanged_rows": str(unchanged_rows),
+            "marketing_backup_path": backup_path,
             "message": message,
             "input_path": str(input_dir),
         }
@@ -3813,16 +3945,22 @@ def marketing_activity_reminder_rows(
         return [
             row(
                 "marketing_activity_skipped",
-                "正式整理已因必备报表缺失而中断，营销活动表未维护，营销活动表未发生变更。",
+                "正式整理已因必备报表缺失而中断，营销活动表未维护；实际新增 0 行、实际更新已有 0 行。",
                 len(candidate_ids),
+                new_rows=0,
+                updated_rows=0,
+                unchanged_rows=candidate_record_count,
             )
         ]
     if error:
         return [
             row(
                 "marketing_activity_error",
-                f"营销活动表写入失败：{error}；报表归档结果不回滚，请按本提醒核对。营销活动表未发生变更。",
+                f"营销活动表写入失败：{error}；报表归档结果不回滚，请按本提醒核对。实际新增 0 行、实际更新已有 0 行。",
                 len(candidate_ids),
+                new_rows=0,
+                updated_rows=0,
+                unchanged_rows=candidate_record_count,
             )
         ]
 
@@ -3832,8 +3970,11 @@ def marketing_activity_reminder_rows(
         rows.append(
             row(
                 "marketing_activity_skipped",
-                f"{message} 营销活动表未发生变更。",
+                f"{message} 营销活动表未发生变更；实际新增 0 行、实际更新已有 0 行。",
                 len(candidate_ids),
+                new_rows=0,
+                updated_rows=0,
+                unchanged_rows=candidate_record_count,
             )
         )
         return rows
@@ -3863,6 +4004,15 @@ def marketing_activity_reminder_rows(
     else:
         details = change_details_from_plan(plan)
 
+    new_row_count = sum(1 for detail in details if detail["new_row"])
+    updated_row_count = len(details) - new_row_count
+    unchanged_row_count = max(candidate_record_count - len(details), 0)
+    backup_path = (
+        normalize_text(apply_result.get("backup_path", ""))
+        if apply_result is not None
+        else ""
+    )
+
     if details:
         detail_messages = []
         for detail in details:
@@ -3877,27 +4027,54 @@ def marketing_activity_reminder_rows(
         if apply_result is None:
             status = "marketing_activity_preview"
             lead = f"营销活动表预览：将维护{layout_text}“{workbook_name}”"
+            count_summary = (
+                f"计划新增 {new_row_count} 行，计划补充已有 {updated_row_count} 行，"
+                f"计划无变化 {unchanged_row_count} 行；尚未正式维护，"
+                "实际新增 0 行、实际更新已有 0 行"
+            )
             detail_label = "计划字段明细"
         else:
             status = "marketing_activity_updated"
             lead = f"已维护{layout_text}营销活动表“{workbook_name}”"
+            count_summary = (
+                f"实际新增 {new_row_count} 行，实际补充已有 {updated_row_count} 行，"
+                f"未变化 {unchanged_row_count} 行"
+            )
+            if backup_path:
+                count_summary += f"；备份文件：{backup_path}"
             detail_label = "实际字段明细"
         rows.append(
             row(
                 status,
-                f"{lead}；共 {len(details)} 个商品/样式记录。{detail_label}：" + "；".join(detail_messages),
+                f"{lead}；{count_summary}。{detail_label}：" + "；".join(detail_messages),
                 len(details),
+                new_rows=new_row_count,
+                updated_rows=updated_row_count,
+                unchanged_rows=unchanged_row_count,
+                backup_path=backup_path,
             )
         )
     else:
+        if apply_result is None:
+            no_change_message = (
+                f"营销活动表仅预览：已检查{layout_text}“{workbook_name}”；"
+                f"计划新增 0 行、计划补充已有 0 行、计划无变化 {unchanged_row_count} 行；"
+                "尚未正式维护，实际新增 0 行、实际更新已有 0 行。"
+            )
+        else:
+            no_change_message = (
+                f"已检查{layout_text}营销活动表“{workbook_name}”；"
+                f"实际新增 0 行、实际补充已有 0 行、未变化 {unchanged_row_count} 行。"
+            )
         rows.append(
             row(
                 "marketing_activity_no_change",
-                (
-                    f"已检查{layout_text}营销活动表“{workbook_name}”；候选商品ID："
-                    f"{'、'.join(candidate_ids) or '无'}。营销活动表未发生变更。"
-                ),
+                no_change_message + " 营销活动表未发生变更。",
                 0,
+                new_rows=0,
+                updated_rows=0,
+                unchanged_rows=unchanged_row_count,
+                backup_path=backup_path,
             )
         )
 
@@ -4201,20 +4378,260 @@ def missing_report_reminder_rows(
     return rows
 
 
+def parse_reminder_count(value: object, fallback: int = 0) -> int:
+    try:
+        return max(0, int(normalize_text(value)))
+    except (TypeError, ValueError):
+        return fallback
+
+
+def split_reminder_values(value: object, separator_pattern: str = r"[|]") -> list[str]:
+    values: list[str] = []
+    for item in re.split(separator_pattern, normalize_text(value)):
+        normalized = normalize_text(item)
+        if normalized and normalized not in values:
+            values.append(normalized)
+    return values
+
+
+def chat_value_preview(values: Iterable[str], limit: int = 5) -> str:
+    normalized = list(dict.fromkeys(normalize_text(value) for value in values if normalize_text(value)))
+    if not normalized:
+        return "无"
+    preview = "、".join(normalized[:limit])
+    if len(normalized) > limit:
+        preview += f" 等{len(normalized)}个"
+    return preview
+
+
+def reminder_field_categories(message: str) -> list[str]:
+    categories: list[str] = []
+    category_terms = [
+        ("商品SKU/规格编码", ("商品SKU", "商家编码-规格维度", "规格编码")),
+        ("产品成本", ("产品成本", "成本表")),
+        ("品牌/运营/平台/大类", ("品牌", "所属运营", "平台", "大类")),
+        ("营销活动ID", ("营销活动ID",)),
+        ("活动名称", ("活动名称",)),
+        ("活动价", ("活动价",)),
+        ("报名价", ("报名价",)),
+        ("促销机制", ("促销机制",)),
+        ("单件预估实收", ("单件预估实收",)),
+        ("多件预估实收", ("多件预估实收",)),
+        ("字段冲突", ("冲突", "多条匹配", "多个目标")),
+    ]
+    for label, terms in category_terms:
+        if any(term in message for term in terms):
+            categories.append(label)
+    return categories
+
+
+def concise_reminder_message(row: dict[str, str]) -> str:
+    status = normalize_text(row.get("status", "")) or "unknown"
+    shop_name = normalize_text(row.get("shop_name", "")) or "未识别店铺"
+    message = normalize_text(row.get("message", ""))
+    product_ids = split_reminder_values(row.get("new_product_ids", ""))
+    count = parse_reminder_count(row.get("detected_count", ""), len(product_ids))
+    id_preview = chat_value_preview(product_ids)
+
+    if status == "new_product_id":
+        return f"{shop_name}：需补导或更新商品数据；商品ID {count} 个，示例：{id_preview}。"
+    if status == "historical_product_id":
+        return f"{shop_name}：售后历史/疑似下架商品ID {count} 个，示例：{id_preview}；仅核对，无需补导。"
+    if status == "supplementary_price_excluded":
+        return f"{shop_name}：已识别补差价明细 {count} 条，不计销售；混合订单中的正常明细不受影响。"
+    if status == "unrecorded_product_mapping":
+        source_name = normalize_text(row.get("source_name", "")) or "未收录商品ID对照表"
+        return f"未收录商品逐项对照已写入 {source_name}。"
+    if status == "ok":
+        return "未发现必备报表缺失、新商品、售后历史商品、重复文件或待确认文件。"
+    return message
+
+
+def concise_marketing_summary(rows: list[dict[str, str]]) -> str:
+    if not rows:
+        return ""
+    source_names: list[str] = []
+    product_ids: list[str] = []
+    for row in rows:
+        source_names.extend(split_reminder_values(row.get("source_name", ""), r"[;]"))
+        product_ids.extend(split_reminder_values(row.get("new_product_ids", "")))
+    source_text = chat_value_preview(source_names, limit=1)
+    product_ids = list(dict.fromkeys(product_ids))
+
+    primary = next(
+        (
+            row
+            for row in rows
+            if row.get("status")
+            in {
+                "marketing_activity_preview",
+                "marketing_activity_updated",
+                "marketing_activity_no_change",
+                "marketing_activity_skipped",
+                "marketing_activity_error",
+            }
+        ),
+        rows[0],
+    )
+    primary_status = normalize_text(primary.get("status", ""))
+    primary_count = parse_reminder_count(primary.get("detected_count", ""), 0)
+    primary_message = normalize_text(primary.get("message", ""))
+    primary_action = normalize_text(primary.get("action", ""))
+    has_count_breakdown = any(
+        normalize_text(primary.get(field, ""))
+        for field in (
+            "marketing_new_rows",
+            "marketing_updated_rows",
+            "marketing_unchanged_rows",
+        )
+    )
+    new_rows = parse_reminder_count(primary.get("marketing_new_rows", ""), 0)
+    updated_rows = parse_reminder_count(primary.get("marketing_updated_rows", ""), 0)
+    unchanged_rows = parse_reminder_count(primary.get("marketing_unchanged_rows", ""), 0)
+    backup_path = normalize_text(primary.get("marketing_backup_path", ""))
+
+    if primary_status == "marketing_activity_preview":
+        if has_count_breakdown:
+            outcome = (
+                f"仅预览；计划新增 {new_rows} 行、计划补充已有 {updated_rows} 行、"
+                f"计划无变化 {unchanged_rows} 行；尚未正式维护，"
+                "实际新增 0 行、实际更新已有 0 行"
+            )
+        else:
+            outcome = (
+                f"仅预览；计划维护 {primary_count} 个商品/样式记录；"
+                "尚未正式维护，实际新增 0 行、实际更新已有 0 行"
+            )
+    elif primary_status == "marketing_activity_updated":
+        if has_count_breakdown:
+            outcome = (
+                f"正式维护完成；实际新增 {new_rows} 行、实际补充已有 {updated_rows} 行、"
+                f"未变化 {unchanged_rows} 行"
+            )
+        else:
+            outcome = f"正式维护完成；已维护 {primary_count} 个商品/样式记录"
+    elif primary_status == "marketing_activity_no_change":
+        if primary_action == "dry-run":
+            outcome = (
+                f"仅预览；计划新增 {new_rows} 行、计划补充已有 {updated_rows} 行、"
+                f"计划无变化 {unchanged_rows} 行；尚未正式维护，"
+                "实际新增 0 行、实际更新已有 0 行"
+            )
+        else:
+            outcome = (
+                f"营销活动表未发生变更；实际新增 {new_rows} 行、"
+                f"实际补充已有 {updated_rows} 行、未变化 {unchanged_rows} 行"
+            )
+    elif primary_status in {"marketing_activity_error", "marketing_activity_skipped"}:
+        outcome = primary_message
+    else:
+        outcome = f"候选商品/样式记录 {primary_count} 个"
+
+    manual_issue_count = sum(
+        parse_reminder_count(row.get("detected_count", ""), 0)
+        for row in rows
+        if row.get("status") == "marketing_activity_manual"
+    )
+    manual_field_count = sum(
+        parse_reminder_count(row.get("detected_count", ""), 0)
+        for row in rows
+        if row.get("status") == "marketing_activity_manual_fields"
+    )
+    category_message = " ".join(
+        normalize_text(row.get("message", ""))
+        for row in rows
+        if row.get("status") in {"marketing_activity_manual", "marketing_activity_manual_fields"}
+    )
+    categories = reminder_field_categories(category_message)
+
+    parts = [f"营销活动表 {source_text}：{outcome}"]
+    if manual_issue_count:
+        parts.append(f"自动字段核对项 {manual_issue_count} 条")
+    if manual_field_count:
+        parts.append(f"需人工填写记录 {manual_field_count} 条")
+    if categories:
+        parts.append(f"涉及字段：{'、'.join(categories)}")
+    if product_ids:
+        parts.append(f"商品ID {len(product_ids)} 个，示例：{chat_value_preview(product_ids)}")
+    if backup_path:
+        parts.append(f"备份文件：{backup_path}")
+    return "；".join(parts) + "；完整逐项明细见提醒表。"
+
+
+def chat_status_label(status: str) -> str:
+    return {
+        "missing": "缺少必备报表",
+        "new_product_id": "新商品ID",
+        "historical_product_id": "售后历史ID",
+        "duplicate_file": "重复文件",
+        "pending": "待确认",
+        "supplementary_price_excluded": "补差价排除",
+        "unrecorded_product_mapping": "未收录商品对照表",
+        "marketing_activity_preview": "营销活动预览",
+        "marketing_activity_updated": "营销活动已更新",
+        "marketing_activity_no_change": "营销活动无变更",
+        "marketing_activity_manual": "营销活动自动字段待核对",
+        "marketing_activity_manual_fields": "营销活动手工字段待填写",
+        "marketing_activity_skipped": "营销活动已跳过",
+        "marketing_activity_error": "营销活动错误",
+        "ok": "正常",
+    }.get(status, status or "未知")
+
+
 def print_missing_reminders(rows: list[dict[str, str]], reminder_path: Path) -> None:
     print(f"reminder log: {reminder_path}")
-    print("完整提醒日志已写入提醒表，并同步显示在当前消息窗口：")
-    for index, row in enumerate(rows, start=1):
-        status = row.get("status", "") or "unknown"
-        shop_name = row.get("shop_name", "") or "未指定"
-        report_type = row.get("report_type", "") or "未指定"
-        source_name = row.get("source_name", "") or "未指定"
-        product_ids = row.get("new_product_ids", "") or "无"
+    actions = {
+        normalize_text(row.get("action", ""))
+        for row in rows
+        if normalize_text(row.get("action", ""))
+    }
+    if "apply-blocked" in actions:
+        print("执行状态：正式整理已中断；营销活动表实际新增 0 行、实际更新已有 0 行。")
+    elif "apply" in actions:
+        print("执行状态：正式整理已执行。")
+    else:
+        print("执行状态：仅预览，尚未正式整理；营销活动表实际新增 0 行、实际更新已有 0 行。")
+    status_counts = Counter(normalize_text(row.get("status", "")) or "unknown" for row in rows)
+    status_summary = "，".join(
+        f"{chat_status_label(status)} {count}" for status, count in sorted(status_counts.items())
+    )
+    print(f"提醒摘要（完整逐项明细保留在提醒表）：{status_summary}")
+
+    marketing_rows = [
+        row for row in rows if normalize_text(row.get("status", "")).startswith("marketing_activity_")
+    ]
+    supporting_rows = [
+        row for row in rows if row.get("status") == "unrecorded_product_mapping"
+    ]
+    regular_rows = [
+        row
+        for row in rows
+        if row not in marketing_rows and row not in supporting_rows
+    ]
+
+    for row in regular_rows:
+        status = normalize_text(row.get("status", "")) or "unknown"
+        report_type = normalize_text(row.get("report_type", "")) or "未指定"
+        source_name = normalize_text(row.get("source_name", ""))
+        source_part = ""
+        if status in {"missing", "pending", "duplicate_file", "marketing_activity_error"} and source_name:
+            source_part = f"；来源={source_name}"
         print(
-            f"提醒日志 {index}/{len(rows)}：状态={status}；店铺={shop_name}；"
-            f"报表={report_type}；来源文件={source_name}；商品ID={product_ids}"
+            f"- [{chat_status_label(status)}] 报表={report_type}{source_part}；"
+            f"{concise_reminder_message(row)}"
         )
-        print(f"  内容：{row.get('message', '')}")
+
+    if marketing_rows:
+        print(f"- [营销活动] {concise_marketing_summary(marketing_rows)}")
+
+    support_names = [
+        normalize_text(row.get("source_name", ""))
+        for row in supporting_rows
+        if normalize_text(row.get("source_name", ""))
+    ]
+    if support_names:
+        print(f"配套明细：{chat_value_preview(support_names, limit=3)}")
+    print(f"完整提醒文件：{reminder_path}")
 
 
 def order_summary_month_key(value: dt.datetime) -> str:
@@ -4563,12 +4980,15 @@ def apply_actions(
             )
             continue
         if analysis.report_type == PROMOTION_REPORT_TYPE:
-            final_path, source_count, row_count = merge_promotion_data(analysis, max_cols)
+            final_path, source_count, row_count, duplicate_rows = merge_promotion_data(
+                analysis, max_cols
+            )
             print(
                 "promotion data merged:",
                 f"{final_path}",
                 f"sources={source_count}",
                 f"rows={row_count}",
+                f"overlap_duplicates_removed={duplicate_rows}",
             )
             continue
         if analysis.report_type == PROMOTION_ADJUSTMENT_REPORT_TYPE:
