@@ -1,6 +1,6 @@
 ---
 name: shop-report-organizer
-description: "触发规则：用户明确输入完整短语“整理数据库V2版本”时使用；或用户显式通过 @shop-report-organizer 调用插件时立即使用。显式 @ 调用即视为已确认授权，不要求再次输入固定口令。"
+description: "触发规则：用户明确输入完整短语“整理数据库V2版本”时使用；或用户显式通过 @shop-report-organizer 调用插件时立即使用。两种触发都视为要求完成“预览→正式整理”全流程：预览无阻塞项时无需再次索要固定口令，直接正式写入；存在阻塞项时只预览并明确报告实际写入为零。"
 ---
 
 # 整理数据库V2版本
@@ -27,7 +27,10 @@ Follow this order exactly. Do not scan, classify, preview, or archive downloaded
 2. Confirm the database root and input folder, then run only `scripts/organize_reports.py --dry-run` as the entry point. Its first input-preparation action must safely extract every ZIP in `下载未分类` and move each successfully processed ZIP to `_已解压ZIP`.
 3. If any ZIP cannot be extracted, contains no supported spreadsheet, or fails the safety check, stop immediately, report the ZIP filename and error in the chat, and do not scan the remaining reports or run `--apply`.
 4. After ZIP preparation succeeds, let the script inspect workbook contents, classify reports, and compare file contents. For files with identical SHA-256 content, retain one deterministic source for processing and mark every other copy as `duplicate_file`; do not classify reports from filenames alone.
-5. Review the concise preview summary and every blocking or actionable reminder category with the user. Keep row-level audit details in the generated CSV/XLSX files; do not paste the full audit log into chat. Run `--apply` only after the preview is acceptable and all required reports are present, unless the user explicitly approves `--allow-missing-required` for a supplemental batch.
+5. Review the concise preview summary and every blocking or actionable reminder category. Keep row-level audit details in the generated CSV/XLSX files; do not paste the full audit log into chat.
+   - Treat the original complete trigger phrase or explicit `@shop-report-organizer` invocation as authorization for the normal full workflow. When the preview has no `missing`, `pending`, ZIP/safety/integrity error, or other blocking item, run `--apply` automatically without asking for another fixed phrase.
+   - When any blocking item exists, do not run `--apply`. State prominently: `本次仅完成预览，尚未正式整理；营销活动表实际新增 0 行、实际更新已有 0 行。` List every blocker and its exact next action. Resume `--apply` only after the blocker is resolved or the user explicitly approves a supported exception such as `--allow-missing-required` for a supplemental batch.
+   - Marketing manual fields and non-conflicting automatic-field reminders do not by themselves block known safe automatic fields from being written during an otherwise valid `--apply`; report them as post-apply manual work.
 6. Verify the apply result, including every `duplicate_file` moved to `下载未分类\_重复文件`, then send every required reminder and unresolved item in the current Codex or Work Buddy conversation.
 
 ## Workflow
@@ -46,18 +49,18 @@ $databaseRoot = Join-Path $env:USERPROFILE "Desktop\运营数据库"
 python ".\scripts\organize_reports.py" --database-root "$databaseRoot" --dry-run
 ```
 
-3. Review `整理记录_预览.csv`, `缺失提醒_预览.csv`, and the console summary. Pay attention to files marked `pending` or `duplicate_file` and reminders marked `missing`. Present the grouped, concise summary required by **Chat Reminder Output** below.
+3. Review `整理记录_预览.csv`, `缺失提醒_预览.csv`, and the console summary. Pay attention to files marked `pending` or `duplicate_file` and reminders marked `missing`. Present the grouped, concise summary required by **Chat Reminder Output** below. Never describe planned changes as completed maintenance.
 4. For order reports, remember that each download usually covers the latest 7 days, so repeated downloads overlap. On `--apply`, merge order rows into cumulative shop/month tables by transaction month.
    - Use at most the first 100,000 rows only for preview, report recognition, and shop/period inference. This is a script-side preview guard, not an AI row-processing limit.
    - During every formal cumulative merge or rebuild, read every row and every effective spreadsheet column in every source and existing cumulative table. This applies to order monthly tables, after-sale cumulative tables, promotion-adjustment cumulative logs, and order-summary rebuilds. Never apply the 100,000-row or 120-column preview guards to formal processing, and never load the entire table into the AI context merely for reasoning.
-5. Only after the preview is acceptable and no required report is missing, run:
+5. After the preview is acceptable and no blocking item remains, run the following automatically when the task began with the complete trigger phrase or explicit plugin invocation:
 
 ```powershell
 $databaseRoot = Join-Path $env:USERPROFILE "Desktop\运营数据库"
 python ".\scripts\organize_reports.py" --database-root "$databaseRoot" --apply
 ```
 
-For supplemental batches that intentionally contain only one report type, use `--allow-missing-required` on `--apply` after confirming the preview.
+For supplemental batches that intentionally contain only one report type, use `--allow-missing-required` on `--apply` only after the user explicitly approves that exception.
 
 ## Naming And Filing
 
@@ -178,10 +181,10 @@ Keep the workbook's existing `IFERROR` and zero-as-blank behavior. Prefilled for
 
 ### Preview, apply, and reporting
 
-- During `--dry-run`, inspect the selected workbook and show planned field changes; do not modify the marketing workbook.
+- During `--dry-run`, inspect the selected workbook and show planned field changes; do not modify the marketing workbook. Split the preview count into `计划新增行数`, `计划补充已有行数`, and `计划无变化数`, then state that actual new and updated row counts are both zero.
 - During `--apply`, update the marketing workbook only after ordinary report validation and archival succeed. Back up the original workbook under `营销活动监控\备份` before replacing it.
-- Record actual changes in the audit reminder file grouped by `商品ID + 样式ID + 商品SKU`, including the exact changed fields. For a new row, record every populated field. Record formula fields only when formulas were actually added.
-- In chat, report only the changed-record count, unique product-ID count, affected field categories, and at most five example product IDs. If candidates exist but no cell changes, say exactly `营销活动表未发生变更`.
+- Record actual changes in the audit reminder file grouped by `商品ID + 样式ID + 商品SKU`, including the exact changed fields and whether each record is `新增行` or `补充已有行`. For a new row, record every populated field. Record formula fields only when formulas were actually added. Also record the backup path and the summary counts for new, updated, and unchanged candidate records.
+- In chat after `--apply`, report `实际新增行数`, `实际补充已有行数`, `未变化数`, unique product-ID count, affected field categories, manual-work count, and the backup path; show at most five example product IDs. If candidates exist but no cell changes, say exactly `营销活动表未发生变更`, followed by actual new and updated counts of zero.
 - Record item-level manual reminders in the audit file. In chat, combine them into one marketing summary with the affected-record count and unresolved field categories; do not repeat one sentence per product/style/SKU. Never mention the four intentionally ignored tracking fields.
 
 ## Chat Reminder Output
@@ -189,9 +192,10 @@ Keep the workbook's existing `IFERROR` and zero-as-blank behavior. Prefilled for
 The CSV/XLSX reminder files are the complete audit record. Chat is a concise decision summary. After every `--dry-run` and `--apply` run:
 
 - Start with one totals line: ready, pending, duplicate, missing-required, new-product-ID, historical-product-ID, and marketing candidate counts.
+- Immediately after the reminder-file path, print one execution-state line. Use `执行状态：仅预览，尚未正式整理；营销活动表实际新增 0 行、实际更新已有 0 行。` for `--dry-run`; use `执行状态：正式整理已执行。` for a successful `--apply`; use an explicit interrupted state for blocked apply.
 - Always show every blocking item (`missing`, `pending`, ZIP/safety/integrity errors, and `marketing_activity_error`) with its full source filename, reason, and required next action. Never hide or truncate information needed to unblock the run.
 - Group `new_product_id` and `historical_product_id` by shop and status. Show the count, at most five example IDs followed by `等N个` when needed, and the action. Do not paste the complete ID list into chat.
-- Combine all `marketing_activity_*` rows into one marketing summary: selected workbook, planned or actual changed-record count, automatic-field issue count, manual-field record count, unresolved field categories, and at most five example product IDs. Do not list every product/style/SKU.
+- Combine all `marketing_activity_*` rows into one marketing summary. Preview must show planned new, planned existing-row updates, planned unchanged, and actual zeros. Apply must show actual new, actual existing-row updates, unchanged, automatic-field issue count, manual-field record count, unresolved field categories, backup path, and at most five example product IDs. Do not list every product/style/SKU.
 - Fold `unrecorded_product_mapping` into one supporting-file line instead of treating it as a separate reminder bullet.
 - Combine supplementary-price notices by shop and report the excluded-detail count once per shop.
 - When the only status is `ok`, explicitly say that no required-report, new-product, historical-product, duplicate, or pending reminder was found.
