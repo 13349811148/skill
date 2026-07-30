@@ -97,6 +97,10 @@ MISSING_REMINDER_FIELDNAMES = [
     "source_name",
     "source_path",
     "new_product_ids",
+    "marketing_new_rows",
+    "marketing_updated_rows",
+    "marketing_unchanged_rows",
+    "marketing_backup_path",
     "message",
     "input_path",
 ]
@@ -3794,8 +3798,28 @@ def marketing_activity_reminder_rows(
     layout = normalize_text(schema.get("layout", ""))
     layout_text = {"compact": "简版", "tracking": "跟踪版"}.get(layout, "未识别格式")
     product_ids_text = "|".join(candidate_ids)
+    candidate_record_count = len(
+        {
+            (
+                normalize_product_id(candidate.get("product_id", "")),
+                normalize_text(candidate.get("style_id", "")),
+                normalize_text(candidate.get("sku", "")),
+            )
+            for candidate in candidates
+            if normalize_product_id(candidate.get("product_id", ""))
+        }
+    )
 
-    def row(status: str, message: str, detected_count: int | str = "") -> dict[str, str]:
+    def row(
+        status: str,
+        message: str,
+        detected_count: int | str = "",
+        *,
+        new_rows: int | str = "",
+        updated_rows: int | str = "",
+        unchanged_rows: int | str = "",
+        backup_path: str = "",
+    ) -> dict[str, str]:
         return {
             "action": action,
             "status": status,
@@ -3805,6 +3829,10 @@ def marketing_activity_reminder_rows(
             "source_name": workbook_name,
             "source_path": workbook_path,
             "new_product_ids": product_ids_text,
+            "marketing_new_rows": str(new_rows),
+            "marketing_updated_rows": str(updated_rows),
+            "marketing_unchanged_rows": str(unchanged_rows),
+            "marketing_backup_path": backup_path,
             "message": message,
             "input_path": str(input_dir),
         }
@@ -3813,16 +3841,22 @@ def marketing_activity_reminder_rows(
         return [
             row(
                 "marketing_activity_skipped",
-                "正式整理已因必备报表缺失而中断，营销活动表未维护，营销活动表未发生变更。",
+                "正式整理已因必备报表缺失而中断，营销活动表未维护；实际新增 0 行、实际更新已有 0 行。",
                 len(candidate_ids),
+                new_rows=0,
+                updated_rows=0,
+                unchanged_rows=candidate_record_count,
             )
         ]
     if error:
         return [
             row(
                 "marketing_activity_error",
-                f"营销活动表写入失败：{error}；报表归档结果不回滚，请按本提醒核对。营销活动表未发生变更。",
+                f"营销活动表写入失败：{error}；报表归档结果不回滚，请按本提醒核对。实际新增 0 行、实际更新已有 0 行。",
                 len(candidate_ids),
+                new_rows=0,
+                updated_rows=0,
+                unchanged_rows=candidate_record_count,
             )
         ]
 
@@ -3832,8 +3866,11 @@ def marketing_activity_reminder_rows(
         rows.append(
             row(
                 "marketing_activity_skipped",
-                f"{message} 营销活动表未发生变更。",
+                f"{message} 营销活动表未发生变更；实际新增 0 行、实际更新已有 0 行。",
                 len(candidate_ids),
+                new_rows=0,
+                updated_rows=0,
+                unchanged_rows=candidate_record_count,
             )
         )
         return rows
@@ -3863,6 +3900,15 @@ def marketing_activity_reminder_rows(
     else:
         details = change_details_from_plan(plan)
 
+    new_row_count = sum(1 for detail in details if detail["new_row"])
+    updated_row_count = len(details) - new_row_count
+    unchanged_row_count = max(candidate_record_count - len(details), 0)
+    backup_path = (
+        normalize_text(apply_result.get("backup_path", ""))
+        if apply_result is not None
+        else ""
+    )
+
     if details:
         detail_messages = []
         for detail in details:
@@ -3877,27 +3923,54 @@ def marketing_activity_reminder_rows(
         if apply_result is None:
             status = "marketing_activity_preview"
             lead = f"营销活动表预览：将维护{layout_text}“{workbook_name}”"
+            count_summary = (
+                f"计划新增 {new_row_count} 行，计划补充已有 {updated_row_count} 行，"
+                f"计划无变化 {unchanged_row_count} 行；尚未正式维护，"
+                "实际新增 0 行、实际更新已有 0 行"
+            )
             detail_label = "计划字段明细"
         else:
             status = "marketing_activity_updated"
             lead = f"已维护{layout_text}营销活动表“{workbook_name}”"
+            count_summary = (
+                f"实际新增 {new_row_count} 行，实际补充已有 {updated_row_count} 行，"
+                f"未变化 {unchanged_row_count} 行"
+            )
+            if backup_path:
+                count_summary += f"；备份文件：{backup_path}"
             detail_label = "实际字段明细"
         rows.append(
             row(
                 status,
-                f"{lead}；共 {len(details)} 个商品/样式记录。{detail_label}：" + "；".join(detail_messages),
+                f"{lead}；{count_summary}。{detail_label}：" + "；".join(detail_messages),
                 len(details),
+                new_rows=new_row_count,
+                updated_rows=updated_row_count,
+                unchanged_rows=unchanged_row_count,
+                backup_path=backup_path,
             )
         )
     else:
+        if apply_result is None:
+            no_change_message = (
+                f"营销活动表仅预览：已检查{layout_text}“{workbook_name}”；"
+                f"计划新增 0 行、计划补充已有 0 行、计划无变化 {unchanged_row_count} 行；"
+                "尚未正式维护，实际新增 0 行、实际更新已有 0 行。"
+            )
+        else:
+            no_change_message = (
+                f"已检查{layout_text}营销活动表“{workbook_name}”；"
+                f"实际新增 0 行、实际补充已有 0 行、未变化 {unchanged_row_count} 行。"
+            )
         rows.append(
             row(
                 "marketing_activity_no_change",
-                (
-                    f"已检查{layout_text}营销活动表“{workbook_name}”；候选商品ID："
-                    f"{'、'.join(candidate_ids) or '无'}。营销活动表未发生变更。"
-                ),
+                no_change_message + " 营销活动表未发生变更。",
                 0,
+                new_rows=0,
+                updated_rows=0,
+                unchanged_rows=unchanged_row_count,
+                backup_path=backup_path,
             )
         )
 
@@ -4201,20 +4274,260 @@ def missing_report_reminder_rows(
     return rows
 
 
+def parse_reminder_count(value: object, fallback: int = 0) -> int:
+    try:
+        return max(0, int(normalize_text(value)))
+    except (TypeError, ValueError):
+        return fallback
+
+
+def split_reminder_values(value: object, separator_pattern: str = r"[|]") -> list[str]:
+    values: list[str] = []
+    for item in re.split(separator_pattern, normalize_text(value)):
+        normalized = normalize_text(item)
+        if normalized and normalized not in values:
+            values.append(normalized)
+    return values
+
+
+def chat_value_preview(values: Iterable[str], limit: int = 5) -> str:
+    normalized = list(dict.fromkeys(normalize_text(value) for value in values if normalize_text(value)))
+    if not normalized:
+        return "无"
+    preview = "、".join(normalized[:limit])
+    if len(normalized) > limit:
+        preview += f" 等{len(normalized)}个"
+    return preview
+
+
+def reminder_field_categories(message: str) -> list[str]:
+    categories: list[str] = []
+    category_terms = [
+        ("商品SKU/规格编码", ("商品SKU", "商家编码-规格维度", "规格编码")),
+        ("产品成本", ("产品成本", "成本表")),
+        ("品牌/运营/平台/大类", ("品牌", "所属运营", "平台", "大类")),
+        ("营销活动ID", ("营销活动ID",)),
+        ("活动名称", ("活动名称",)),
+        ("活动价", ("活动价",)),
+        ("报名价", ("报名价",)),
+        ("促销机制", ("促销机制",)),
+        ("单件预估实收", ("单件预估实收",)),
+        ("多件预估实收", ("多件预估实收",)),
+        ("字段冲突", ("冲突", "多条匹配", "多个目标")),
+    ]
+    for label, terms in category_terms:
+        if any(term in message for term in terms):
+            categories.append(label)
+    return categories
+
+
+def concise_reminder_message(row: dict[str, str]) -> str:
+    status = normalize_text(row.get("status", "")) or "unknown"
+    shop_name = normalize_text(row.get("shop_name", "")) or "未识别店铺"
+    message = normalize_text(row.get("message", ""))
+    product_ids = split_reminder_values(row.get("new_product_ids", ""))
+    count = parse_reminder_count(row.get("detected_count", ""), len(product_ids))
+    id_preview = chat_value_preview(product_ids)
+
+    if status == "new_product_id":
+        return f"{shop_name}：需补导或更新商品数据；商品ID {count} 个，示例：{id_preview}。"
+    if status == "historical_product_id":
+        return f"{shop_name}：售后历史/疑似下架商品ID {count} 个，示例：{id_preview}；仅核对，无需补导。"
+    if status == "supplementary_price_excluded":
+        return f"{shop_name}：已识别补差价明细 {count} 条，不计销售；混合订单中的正常明细不受影响。"
+    if status == "unrecorded_product_mapping":
+        source_name = normalize_text(row.get("source_name", "")) or "未收录商品ID对照表"
+        return f"未收录商品逐项对照已写入 {source_name}。"
+    if status == "ok":
+        return "未发现必备报表缺失、新商品、售后历史商品、重复文件或待确认文件。"
+    return message
+
+
+def concise_marketing_summary(rows: list[dict[str, str]]) -> str:
+    if not rows:
+        return ""
+    source_names: list[str] = []
+    product_ids: list[str] = []
+    for row in rows:
+        source_names.extend(split_reminder_values(row.get("source_name", ""), r"[;]"))
+        product_ids.extend(split_reminder_values(row.get("new_product_ids", "")))
+    source_text = chat_value_preview(source_names, limit=1)
+    product_ids = list(dict.fromkeys(product_ids))
+
+    primary = next(
+        (
+            row
+            for row in rows
+            if row.get("status")
+            in {
+                "marketing_activity_preview",
+                "marketing_activity_updated",
+                "marketing_activity_no_change",
+                "marketing_activity_skipped",
+                "marketing_activity_error",
+            }
+        ),
+        rows[0],
+    )
+    primary_status = normalize_text(primary.get("status", ""))
+    primary_count = parse_reminder_count(primary.get("detected_count", ""), 0)
+    primary_message = normalize_text(primary.get("message", ""))
+    primary_action = normalize_text(primary.get("action", ""))
+    has_count_breakdown = any(
+        normalize_text(primary.get(field, ""))
+        for field in (
+            "marketing_new_rows",
+            "marketing_updated_rows",
+            "marketing_unchanged_rows",
+        )
+    )
+    new_rows = parse_reminder_count(primary.get("marketing_new_rows", ""), 0)
+    updated_rows = parse_reminder_count(primary.get("marketing_updated_rows", ""), 0)
+    unchanged_rows = parse_reminder_count(primary.get("marketing_unchanged_rows", ""), 0)
+    backup_path = normalize_text(primary.get("marketing_backup_path", ""))
+
+    if primary_status == "marketing_activity_preview":
+        if has_count_breakdown:
+            outcome = (
+                f"仅预览；计划新增 {new_rows} 行、计划补充已有 {updated_rows} 行、"
+                f"计划无变化 {unchanged_rows} 行；尚未正式维护，"
+                "实际新增 0 行、实际更新已有 0 行"
+            )
+        else:
+            outcome = (
+                f"仅预览；计划维护 {primary_count} 个商品/样式记录；"
+                "尚未正式维护，实际新增 0 行、实际更新已有 0 行"
+            )
+    elif primary_status == "marketing_activity_updated":
+        if has_count_breakdown:
+            outcome = (
+                f"正式维护完成；实际新增 {new_rows} 行、实际补充已有 {updated_rows} 行、"
+                f"未变化 {unchanged_rows} 行"
+            )
+        else:
+            outcome = f"正式维护完成；已维护 {primary_count} 个商品/样式记录"
+    elif primary_status == "marketing_activity_no_change":
+        if primary_action == "dry-run":
+            outcome = (
+                f"仅预览；计划新增 {new_rows} 行、计划补充已有 {updated_rows} 行、"
+                f"计划无变化 {unchanged_rows} 行；尚未正式维护，"
+                "实际新增 0 行、实际更新已有 0 行"
+            )
+        else:
+            outcome = (
+                f"营销活动表未发生变更；实际新增 {new_rows} 行、"
+                f"实际补充已有 {updated_rows} 行、未变化 {unchanged_rows} 行"
+            )
+    elif primary_status in {"marketing_activity_error", "marketing_activity_skipped"}:
+        outcome = primary_message
+    else:
+        outcome = f"候选商品/样式记录 {primary_count} 个"
+
+    manual_issue_count = sum(
+        parse_reminder_count(row.get("detected_count", ""), 0)
+        for row in rows
+        if row.get("status") == "marketing_activity_manual"
+    )
+    manual_field_count = sum(
+        parse_reminder_count(row.get("detected_count", ""), 0)
+        for row in rows
+        if row.get("status") == "marketing_activity_manual_fields"
+    )
+    category_message = " ".join(
+        normalize_text(row.get("message", ""))
+        for row in rows
+        if row.get("status") in {"marketing_activity_manual", "marketing_activity_manual_fields"}
+    )
+    categories = reminder_field_categories(category_message)
+
+    parts = [f"营销活动表 {source_text}：{outcome}"]
+    if manual_issue_count:
+        parts.append(f"自动字段核对项 {manual_issue_count} 条")
+    if manual_field_count:
+        parts.append(f"需人工填写记录 {manual_field_count} 条")
+    if categories:
+        parts.append(f"涉及字段：{'、'.join(categories)}")
+    if product_ids:
+        parts.append(f"商品ID {len(product_ids)} 个，示例：{chat_value_preview(product_ids)}")
+    if backup_path:
+        parts.append(f"备份文件：{backup_path}")
+    return "；".join(parts) + "；完整逐项明细见提醒表。"
+
+
+def chat_status_label(status: str) -> str:
+    return {
+        "missing": "缺少必备报表",
+        "new_product_id": "新商品ID",
+        "historical_product_id": "售后历史ID",
+        "duplicate_file": "重复文件",
+        "pending": "待确认",
+        "supplementary_price_excluded": "补差价排除",
+        "unrecorded_product_mapping": "未收录商品对照表",
+        "marketing_activity_preview": "营销活动预览",
+        "marketing_activity_updated": "营销活动已更新",
+        "marketing_activity_no_change": "营销活动无变更",
+        "marketing_activity_manual": "营销活动自动字段待核对",
+        "marketing_activity_manual_fields": "营销活动手工字段待填写",
+        "marketing_activity_skipped": "营销活动已跳过",
+        "marketing_activity_error": "营销活动错误",
+        "ok": "正常",
+    }.get(status, status or "未知")
+
+
 def print_missing_reminders(rows: list[dict[str, str]], reminder_path: Path) -> None:
     print(f"reminder log: {reminder_path}")
-    print("完整提醒日志已写入提醒表，并同步显示在当前消息窗口：")
-    for index, row in enumerate(rows, start=1):
-        status = row.get("status", "") or "unknown"
-        shop_name = row.get("shop_name", "") or "未指定"
-        report_type = row.get("report_type", "") or "未指定"
-        source_name = row.get("source_name", "") or "未指定"
-        product_ids = row.get("new_product_ids", "") or "无"
+    actions = {
+        normalize_text(row.get("action", ""))
+        for row in rows
+        if normalize_text(row.get("action", ""))
+    }
+    if "apply-blocked" in actions:
+        print("执行状态：正式整理已中断；营销活动表实际新增 0 行、实际更新已有 0 行。")
+    elif "apply" in actions:
+        print("执行状态：正式整理已执行。")
+    else:
+        print("执行状态：仅预览，尚未正式整理；营销活动表实际新增 0 行、实际更新已有 0 行。")
+    status_counts = Counter(normalize_text(row.get("status", "")) or "unknown" for row in rows)
+    status_summary = "，".join(
+        f"{chat_status_label(status)} {count}" for status, count in sorted(status_counts.items())
+    )
+    print(f"提醒摘要（完整逐项明细保留在提醒表）：{status_summary}")
+
+    marketing_rows = [
+        row for row in rows if normalize_text(row.get("status", "")).startswith("marketing_activity_")
+    ]
+    supporting_rows = [
+        row for row in rows if row.get("status") == "unrecorded_product_mapping"
+    ]
+    regular_rows = [
+        row
+        for row in rows
+        if row not in marketing_rows and row not in supporting_rows
+    ]
+
+    for row in regular_rows:
+        status = normalize_text(row.get("status", "")) or "unknown"
+        report_type = normalize_text(row.get("report_type", "")) or "未指定"
+        source_name = normalize_text(row.get("source_name", ""))
+        source_part = ""
+        if status in {"missing", "pending", "duplicate_file", "marketing_activity_error"} and source_name:
+            source_part = f"；来源={source_name}"
         print(
-            f"提醒日志 {index}/{len(rows)}：状态={status}；店铺={shop_name}；"
-            f"报表={report_type}；来源文件={source_name}；商品ID={product_ids}"
+            f"- [{chat_status_label(status)}] 报表={report_type}{source_part}；"
+            f"{concise_reminder_message(row)}"
         )
-        print(f"  内容：{row.get('message', '')}")
+
+    if marketing_rows:
+        print(f"- [营销活动] {concise_marketing_summary(marketing_rows)}")
+
+    support_names = [
+        normalize_text(row.get("source_name", ""))
+        for row in supporting_rows
+        if normalize_text(row.get("source_name", ""))
+    ]
+    if support_names:
+        print(f"配套明细：{chat_value_preview(support_names, limit=3)}")
+    print(f"完整提醒文件：{reminder_path}")
 
 
 def order_summary_month_key(value: dt.datetime) -> str:

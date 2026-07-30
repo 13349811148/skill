@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import csv
+import io
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 
 import openpyxl
@@ -288,21 +290,40 @@ class MarketingActivityMaintenanceTests(unittest.TestCase):
                 ]
             )
 
-        exit_code = organize_reports.main(
-            [
-                "--database-root",
-                str(self.database_root),
-                "--input",
-                str(input_dir),
-                "--dry-run",
-            ]
-        )
+        dry_run_output = io.StringIO()
+        with redirect_stdout(dry_run_output):
+            exit_code = organize_reports.main(
+                [
+                    "--database-root",
+                    str(self.database_root),
+                    "--input",
+                    str(input_dir),
+                    "--dry-run",
+                ]
+            )
         self.assertEqual(exit_code, 0)
+        self.assertIn(
+            "执行状态：仅预览，尚未正式整理；营销活动表实际新增 0 行、实际更新已有 0 行。",
+            dry_run_output.getvalue(),
+        )
+        self.assertIn("计划新增 1 行", dry_run_output.getvalue())
         reminder_text = (self.database_root / "缺失提醒_预览.csv").read_text(
             encoding="utf-8-sig"
         )
         self.assertIn("marketing_activity_preview", reminder_text)
         self.assertIn("988888888888", reminder_text)
+        with (self.database_root / "缺失提醒_预览.csv").open(
+            "r", encoding="utf-8-sig", newline=""
+        ) as handle:
+            preview_marketing_row = next(
+                row
+                for row in csv.DictReader(handle)
+                if row["status"] == "marketing_activity_preview"
+            )
+        self.assertEqual(preview_marketing_row["marketing_new_rows"], "1")
+        self.assertEqual(preview_marketing_row["marketing_updated_rows"], "0")
+        self.assertEqual(preview_marketing_row["marketing_unchanged_rows"], "0")
+        self.assertEqual(preview_marketing_row["marketing_backup_path"], "")
 
         mapping = openpyxl.load_workbook(
             self.database_root / "未收录商品ID对照表_预览.xlsx",
@@ -324,18 +345,22 @@ class MarketingActivityMaintenanceTests(unittest.TestCase):
             values,
         )
 
-        apply_exit_code = organize_reports.main(
-            [
-                "--database-root",
-                str(self.database_root),
-                "--input",
-                str(input_dir),
-                "--apply",
-                "--allow-missing-required",
-                "--no-update-map",
-            ]
-        )
+        apply_output = io.StringIO()
+        with redirect_stdout(apply_output):
+            apply_exit_code = organize_reports.main(
+                [
+                    "--database-root",
+                    str(self.database_root),
+                    "--input",
+                    str(input_dir),
+                    "--apply",
+                    "--allow-missing-required",
+                    "--no-update-map",
+                ]
+            )
         self.assertEqual(apply_exit_code, 0)
+        self.assertIn("执行状态：正式整理已执行。", apply_output.getvalue())
+        self.assertIn("实际新增 1 行", apply_output.getvalue())
         apply_reminder_text = (self.database_root / "缺失提醒.csv").read_text(
             encoding="utf-8-sig"
         )
@@ -344,6 +369,18 @@ class MarketingActivityMaintenanceTests(unittest.TestCase):
         self.assertIn("商品ID 988888888888", apply_reminder_text)
         self.assertIn("样式ID STYLE-Z", apply_reminder_text)
         self.assertIn("商品SKU SKU-Z", apply_reminder_text)
+        with (self.database_root / "缺失提醒.csv").open(
+            "r", encoding="utf-8-sig", newline=""
+        ) as handle:
+            applied_marketing_row = next(
+                row
+                for row in csv.DictReader(handle)
+                if row["status"] == "marketing_activity_updated"
+            )
+        self.assertEqual(applied_marketing_row["marketing_new_rows"], "1")
+        self.assertEqual(applied_marketing_row["marketing_updated_rows"], "0")
+        self.assertEqual(applied_marketing_row["marketing_unchanged_rows"], "0")
+        self.assertTrue(Path(applied_marketing_row["marketing_backup_path"]).exists())
 
         workbook = openpyxl.load_workbook(marketing_path, read_only=True, data_only=True)
         marketing_rows = list(workbook["营销数据"].values)
@@ -359,6 +396,195 @@ class MarketingActivityMaintenanceTests(unittest.TestCase):
             "SKU-Z",
             7,
         ))
+
+    def test_chat_reminder_output_is_concise_but_audit_rows_stay_complete(self) -> None:
+        product_ids = [str(900000000000 + index) for index in range(1, 9)]
+        long_detail = "逐商品逐样式完整字段明细-" + ("很长" * 300)
+        rows = [
+            {
+                "status": "new_product_id",
+                "report_type": "商品数据",
+                "detected_count": "8",
+                "shop_name": "测试店铺",
+                "source_name": "订单.csv",
+                "new_product_ids": "|".join(product_ids),
+                "message": long_detail,
+            },
+            {
+                "status": "pending",
+                "report_type": "",
+                "detected_count": "",
+                "shop_name": "",
+                "source_name": "待确认.xlsx",
+                "new_product_ids": "",
+                "message": "文件格式未知，请确认用途。",
+            },
+            {
+                "action": "dry-run",
+                "status": "marketing_activity_preview",
+                "report_type": "营销活动表",
+                "detected_count": "87",
+                "shop_name": "",
+                "source_name": "营销活动.xlsx",
+                "new_product_ids": "|".join(product_ids),
+                "marketing_new_rows": "60",
+                "marketing_updated_rows": "27",
+                "marketing_unchanged_rows": "5",
+                "marketing_backup_path": "",
+                "message": long_detail,
+            },
+            {
+                "status": "marketing_activity_manual",
+                "report_type": "营销活动表",
+                "detected_count": "25",
+                "shop_name": "",
+                "source_name": "营销活动.xlsx",
+                "new_product_ids": "|".join(product_ids),
+                "message": "品牌、所属运营、平台、大类、商品SKU和产品成本需要人工核对。" + long_detail,
+            },
+            {
+                "status": "marketing_activity_manual_fields",
+                "report_type": "营销活动表",
+                "detected_count": "87",
+                "shop_name": "",
+                "source_name": "营销活动.xlsx",
+                "new_product_ids": "|".join(product_ids),
+                "message": "活动价、报名价、促销机制需要人工填写。" + long_detail,
+            },
+            {
+                "status": "unrecorded_product_mapping",
+                "report_type": "商品数据",
+                "detected_count": "8",
+                "shop_name": "",
+                "source_name": "未收录商品ID对照表_预览.xlsx",
+                "new_product_ids": "",
+                "message": long_detail,
+            },
+        ]
+        original_rows = [dict(row) for row in rows]
+        reminder_path = self.database_root / "缺失提醒_预览.csv"
+
+        output = io.StringIO()
+        with redirect_stdout(output):
+            organize_reports.print_missing_reminders(rows, reminder_path)
+        chat_text = output.getvalue()
+
+        self.assertEqual(rows, original_rows)
+        self.assertNotIn(long_detail, chat_text)
+        self.assertEqual(chat_text.count("[营销活动]"), 1)
+        self.assertIn(
+            "执行状态：仅预览，尚未正式整理；营销活动表实际新增 0 行、实际更新已有 0 行。",
+            chat_text,
+        )
+        self.assertIn("计划新增 60 行", chat_text)
+        self.assertIn("计划补充已有 27 行", chat_text)
+        self.assertIn("计划无变化 5 行", chat_text)
+        self.assertIn("实际新增 0 行", chat_text)
+        self.assertIn("自动字段核对项 25 条", chat_text)
+        self.assertIn("需人工填写记录 87 条", chat_text)
+        self.assertIn("等8个", chat_text)
+        self.assertIn("文件格式未知，请确认用途。", chat_text)
+        self.assertIn("未收录商品ID对照表_预览.xlsx", chat_text)
+        self.assertIn(f"完整提醒文件：{reminder_path}", chat_text)
+
+    def test_marketing_summary_splits_new_updated_and_unchanged_counts(self) -> None:
+        plan = {
+            "status": "ready",
+            "schema": {
+                "path": str(self.folder / "营销活动.xlsx"),
+                "layout": "compact",
+            },
+            "candidates": [
+                candidate("900000000101", "STYLE-NEW", "SKU-NEW"),
+                candidate("900000000102", "STYLE-OLD", "SKU-OLD"),
+                candidate("900000000103", "STYLE-SAME", "SKU-SAME"),
+            ],
+            "writes": [
+                {
+                    "product_id": "900000000101",
+                    "style_id": "STYLE-NEW",
+                    "sku": "SKU-NEW",
+                    "new_row": True,
+                    "values": [{"field": "商品ID"}],
+                },
+                {
+                    "product_id": "900000000102",
+                    "style_id": "STYLE-OLD",
+                    "sku": "SKU-OLD",
+                    "new_row": False,
+                    "values": [{"field": "产品成本"}],
+                },
+            ],
+            "issues": [],
+            "manual_items": [],
+        }
+        input_dir = self.database_root / "下载未分类"
+        backup_path = self.folder / "备份" / "营销活动_更新前.xlsx"
+
+        preview_rows = organize_reports.marketing_activity_reminder_rows(
+            plan,
+            "dry-run",
+            input_dir,
+        )
+        preview = next(
+            row
+            for row in preview_rows
+            if row["status"] == "marketing_activity_preview"
+        )
+        self.assertEqual(preview["marketing_new_rows"], "1")
+        self.assertEqual(preview["marketing_updated_rows"], "1")
+        self.assertEqual(preview["marketing_unchanged_rows"], "1")
+        self.assertIn("计划新增 1 行", preview["message"])
+        self.assertIn("实际新增 0 行", preview["message"])
+
+        applied_rows = organize_reports.marketing_activity_reminder_rows(
+            plan,
+            "apply",
+            input_dir,
+            apply_result={
+                "status": "updated",
+                "changes": [
+                    {
+                        "product_id": "900000000101",
+                        "style_id": "STYLE-NEW",
+                        "sku": "SKU-NEW",
+                        "new_row": True,
+                        "field": "商品ID",
+                    },
+                    {
+                        "product_id": "900000000102",
+                        "style_id": "STYLE-OLD",
+                        "sku": "SKU-OLD",
+                        "new_row": False,
+                        "field": "产品成本",
+                    },
+                ],
+                "issues": [],
+                "backup_path": str(backup_path),
+            },
+        )
+        applied = next(
+            row
+            for row in applied_rows
+            if row["status"] == "marketing_activity_updated"
+        )
+        self.assertEqual(applied["marketing_new_rows"], "1")
+        self.assertEqual(applied["marketing_updated_rows"], "1")
+        self.assertEqual(applied["marketing_unchanged_rows"], "1")
+        self.assertEqual(applied["marketing_backup_path"], str(backup_path))
+
+        output = io.StringIO()
+        with redirect_stdout(output):
+            organize_reports.print_missing_reminders(
+                applied_rows,
+                self.database_root / "缺失提醒.csv",
+            )
+        chat_text = output.getvalue()
+        self.assertIn("执行状态：正式整理已执行。", chat_text)
+        self.assertIn("实际新增 1 行", chat_text)
+        self.assertIn("实际补充已有 1 行", chat_text)
+        self.assertIn("未变化 1 行", chat_text)
+        self.assertIn(str(backup_path), chat_text)
 
 
 if __name__ == "__main__":
