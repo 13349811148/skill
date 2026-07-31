@@ -238,6 +238,8 @@ def read_template_columns() -> list[str]:
         reader = csv.DictReader(fh)
         for row in reader:
             columns.append(row["column"])
+    if columns.count("SKU ID") != 1 or not columns or columns[-1] != "SKU ID":
+        raise ReportError("列模板必须且只能包含一个 SKU ID，并将其放在绝对最后一列。")
     return columns
 
 

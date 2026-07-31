@@ -160,6 +160,14 @@ def test_marketing_fallback_only_when_cost_table_misses() -> None:
     assert not resolution.specification_conflict_warning
 
 
+def test_template_places_sku_id_last() -> None:
+    expected_tail = ["项目组", "管理类型", "品种", "产线", "SKU ID"]
+    for name, module in (("拼多多", pdd), ("天猫", tmall)):
+        columns = module.read_template_columns()
+        assert columns[-5:] == expected_tail, f"{name}日报末尾列顺序错误: {columns[-5:]}"
+        assert columns.count("SKU ID") == 1, f"{name}日报的 SKU ID 列数量不是 1"
+
+
 def test_full_report_cost_regression_for_both_platforms() -> None:
     """Exercise each build_report pipeline without Excel/file I/O dependencies."""
     cost_rows, _warnings = load_cost_table_records(
@@ -193,12 +201,12 @@ def test_full_report_cost_regression_for_both_platforms() -> None:
                 "read_template_columns",
                 return_value=[
                     "商品ID",
-                    "SKU ID",
                     "商品SKU",
                     "产品成本",
                     "推广费用",
                     "实际成交数量（去退款去补单后）",
                     "实际成交金额（去退款去补单后）",
+                    "SKU ID",
                 ],
             ),
             patch.object(module, "load_marketing_rows", return_value=marketing_rows),
@@ -388,6 +396,7 @@ def main() -> None:
     test_product_sku_header_and_platform_loaders()
     test_per_row_fallback_and_duplicate_protection()
     test_marketing_fallback_only_when_cost_table_misses()
+    test_template_places_sku_id_last()
     test_full_report_cost_regression_for_both_platforms()
     test_four_subsidized_orders_do_not_trigger_below_cost_confirmation()
     print("PASS: 拼多多与天猫共享成本匹配回归测试全部通过")
