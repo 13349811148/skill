@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import unicodedata
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,6 +26,11 @@ GENERIC_PATH_PARTS = {
     "天猫",
     "拼多多",
 }
+BACKUP_PATH_KEYWORDS = ("备份", "副本", "backup")
+BACKUP_PATH_TOKEN_PATTERN = re.compile(
+    r"(?:^|[^a-z0-9])(bak|copy|copies)(?:$|[^a-z0-9])",
+    re.IGNORECASE,
+)
 
 
 class PromotionProtectionError(RuntimeError):
@@ -74,6 +80,54 @@ def require_single_day_value(value: Any, source_path: Path, field_name: str) -> 
         raise PromotionProtectionError(
             f"推广日期不是逐日数据，已停止生成日报：文件={source_path}，字段={field_name}，值={value}"
         )
+
+
+def _backup_marker(path: Path, database_root: Path) -> str:
+    try:
+        relative = path.relative_to(database_root)
+    except ValueError:
+        relative = path
+    for part in relative.parts:
+        normalized = unicodedata.normalize("NFKC", part).casefold()
+        if any(keyword in normalized for keyword in BACKUP_PATH_KEYWORDS):
+            return part
+        if BACKUP_PATH_TOKEN_PATTERN.search(normalized):
+            return part
+        if Path(normalized).suffix in {".bak", ".backup"}:
+            return part
+    return ""
+
+
+def require_no_backup_promotion_inputs(
+    paths: Iterable[Path],
+    database_root: Path,
+    promotion_label: str,
+) -> list[Path]:
+    """Stop before importing promotion costs when a backup path is in scope."""
+    candidates = sorted(set(Path(path) for path in paths))
+    backup_paths = [
+        (path, _backup_marker(path, database_root))
+        for path in candidates
+        if _backup_marker(path, database_root)
+    ]
+    if backup_paths:
+        preview = "\n".join(
+            f"- {path}（备份标记={marker}）"
+            for path, marker in backup_paths[:20]
+        )
+        remainder = (
+            ""
+            if len(backup_paths) <= 20
+            else f"\n- 另有{len(backup_paths) - 20}个备份候选。"
+        )
+        raise PromotionProtectionError(
+            f"{promotion_label}检测到备份文件或备份目录，"
+            "多份备份或快照存在重复计算推广费的风险，已停止生成日报。\n"
+            "请先将以下备份移出运营数据库的推广输入目录，再重新生成；"
+            "不要仅依赖文件哈希、店铺维度或后续快照去重继续计算。\n"
+            f"{preview}{remainder}"
+        )
+    return candidates
 
 
 def infer_path_dimensions(

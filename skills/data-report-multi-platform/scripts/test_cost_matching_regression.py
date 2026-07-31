@@ -27,6 +27,10 @@ from data_quality_protection import (
     resolve_final_cost,
     unit_subsidy_amount,
 )
+from promotion_protection import (
+    PromotionProtectionError,
+    require_no_backup_promotion_inputs,
+)
 
 
 def sheet(headers: list[str], rows: list[list[object]], name: str = "成本") -> SimpleNamespace:
@@ -166,6 +170,59 @@ def test_template_places_sku_id_last() -> None:
         columns = module.read_template_columns()
         assert columns[-5:] == expected_tail, f"{name}日报末尾列顺序错误: {columns[-5:]}"
         assert columns.count("SKU ID") == 1, f"{name}日报的 SKU ID 列数量不是 1"
+
+
+def test_backup_promotion_inputs_stop_both_platforms() -> None:
+    root = Path("数据库")
+    normal = root / "推广数据" / "测试店" / "推广数据.xlsx"
+    backup = root / "推广数据" / "_备份_推广累计去重_01" / "测试店" / "推广数据.xlsx"
+
+    assert require_no_backup_promotion_inputs([normal], root, "推广费用") == [normal]
+    try:
+        require_no_backup_promotion_inputs([normal, backup], root, "推广费用")
+    except PromotionProtectionError as exc:
+        message = str(exc)
+        assert "重复计算推广费" in message
+        assert "请先将以下备份移出" in message
+        assert str(backup) in message
+    else:
+        raise AssertionError("推广目录中的备份文件没有停止生成")
+
+    with (
+        patch.object(pdd, "discover_files", return_value=[backup]),
+        patch.object(
+            pdd,
+            "read_workbook_sheets",
+            side_effect=AssertionError("备份门禁之后不应读取工作簿"),
+        ),
+    ):
+        try:
+            pdd.load_promo_costs(root, {"2026-07-29"})
+        except pdd.ReportError as exc:
+            assert "重复计算推广费" in str(exc)
+        else:
+            raise AssertionError("拼多多推广备份没有停止生成")
+
+    with (
+        patch.object(tmall, "promotion_files", return_value=[backup]),
+        patch.object(
+            tmall,
+            "read_workbook_sheets",
+            side_effect=AssertionError("备份门禁之后不应读取工作簿"),
+        ),
+    ):
+        try:
+            tmall.load_promo_costs(
+                root,
+                {"2026-07-29"},
+                "推广数据",
+                "万相台费用",
+                False,
+            )
+        except tmall.ReportError as exc:
+            assert "重复计算推广费" in str(exc)
+        else:
+            raise AssertionError("天猫推广备份没有停止生成")
 
 
 def test_full_report_cost_regression_for_both_platforms() -> None:
@@ -397,6 +454,7 @@ def main() -> None:
     test_per_row_fallback_and_duplicate_protection()
     test_marketing_fallback_only_when_cost_table_misses()
     test_template_places_sku_id_last()
+    test_backup_promotion_inputs_stop_both_platforms()
     test_full_report_cost_regression_for_both_platforms()
     test_four_subsidized_orders_do_not_trigger_below_cost_confirmation()
     print("PASS: 拼多多与天猫共享成本匹配回归测试全部通过")

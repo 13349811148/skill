@@ -50,6 +50,7 @@ from promotion_protection import (
     deduplicate_exact_files,
     infer_path_dimensions,
     reconcile_promotion_costs,
+    require_no_backup_promotion_inputs,
     require_single_day_value,
     select_latest_snapshots,
 )
@@ -995,8 +996,16 @@ def load_promo_costs(
 ) -> tuple[dict[tuple[str, str], float], list[str]]:
     warnings: list[str] = []
     snapshot_rows: list[PromotionSnapshotRow] = []
+    try:
+        promotion_candidates = require_no_backup_promotion_inputs(
+            discover_files(root, "推广数据"),
+            root,
+            "拼多多推广费",
+        )
+    except PromotionProtectionError as exc:
+        raise ReportError(str(exc)) from exc
     promotion_paths, duplicate_warnings = deduplicate_exact_files(
-        discover_files(root, "推广数据"), "拼多多推广费"
+        promotion_candidates, "拼多多推广费"
     )
     warnings.extend(duplicate_warnings)
     for path in promotion_paths:

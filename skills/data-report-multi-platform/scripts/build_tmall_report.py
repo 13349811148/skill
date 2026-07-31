@@ -53,6 +53,7 @@ from promotion_protection import (
     deduplicate_exact_files,
     infer_path_dimensions,
     reconcile_promotion_costs,
+    require_no_backup_promotion_inputs,
     require_single_day_value,
     select_latest_snapshots,
 )
@@ -1039,8 +1040,16 @@ def load_promo_costs(
         "老客加速费用": PROMOTION_TMALL_OLD,
         "新客加速费用（旧版品牌新享）": PROMOTION_TMALL_BRAND,
     }[fee_name]
+    try:
+        promotion_candidates = require_no_backup_promotion_inputs(
+            promotion_files(root, promotion_dir, is_brand_enjoy_channel),
+            root,
+            fee_name,
+        )
+    except PromotionProtectionError as exc:
+        raise ReportError(str(exc)) from exc
     promotion_paths, duplicate_warnings = deduplicate_exact_files(
-        promotion_files(root, promotion_dir, is_brand_enjoy_channel), fee_name
+        promotion_candidates, fee_name
     )
     warnings.extend(duplicate_warnings)
     for path in promotion_paths:
