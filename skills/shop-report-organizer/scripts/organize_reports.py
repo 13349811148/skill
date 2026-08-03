@@ -59,6 +59,13 @@ PROMOTION_DATA_PREFIX = "推广数据"
 PROMOTION_ARCHIVE_DATE_HEADER = "归档日期"
 PROMOTION_ARCHIVE_PRODUCT_ID_HEADER = "归档商品ID"
 PROMOTION_ARCHIVE_TYPE_HEADER = "归档推广类型"
+PDD_DAILY_BREAKDOWN_REQUIRED_HEADERS = {
+    "日期",
+    "曝光量",
+    "点击量",
+    "总花费(元)",
+    "净实际投产比",
+}
 PROMOTION_SPEND_HEADERS_BY_TYPE = {
     "拼多多-商品推广": ("总花费(元)", "成交花费(元)"),
     "万相台": ("花费",),
@@ -174,6 +181,13 @@ class PromotionValidation:
     missing_date_rows: int
     missing_product_id_rows: int
     examples: list[str]
+
+
+@dataclass(frozen=True)
+class PddPromotionFilenameMetadata:
+    shop_text: str
+    item_token: str
+    filename_product_id: str
 
 
 @dataclass
@@ -1129,6 +1143,69 @@ def extract_shop_from_filename(path: Path, shops: list[str]) -> tuple[str, str]:
     return text, "filename_parentheses"
 
 
+def pdd_daily_breakdown_filename_metadata(
+    path: Path,
+) -> PddPromotionFilenameMetadata | None:
+    """Parse metadata only from the exact Pinduoduo per-day export filename."""
+    match = re.fullmatch(
+        r"商品推广_分天数据_(20\d{6})至(20\d{6})"
+        r"\(([^()]+)\)\(([^()]+_(\d{6,}))\)",
+        path.stem,
+    )
+    if match is None:
+        return None
+    return PddPromotionFilenameMetadata(
+        shop_text=match.group(3).strip(),
+        item_token=match.group(4).strip(),
+        filename_product_id=normalize_product_id(match.group(5)),
+    )
+
+
+def pdd_operation_log_filename_metadata(
+    path: Path,
+) -> PddPromotionFilenameMetadata | None:
+    """Parse the matching Pinduoduo operation-log filename for ID evidence."""
+    match = re.fullmatch(
+        r"商品推广操作日志_\d{6,8}\(([^()]+)\)\(([^()]+_(\d{6,}))\)",
+        path.stem,
+    )
+    if match is None:
+        return None
+    return PddPromotionFilenameMetadata(
+        shop_text=match.group(1).strip(),
+        item_token=match.group(2).strip(),
+        filename_product_id=normalize_product_id(match.group(3)),
+    )
+
+
+def is_pdd_daily_breakdown_signature(signature: Signature) -> bool:
+    required = {normalize_header(header) for header in signature.required_headers}
+    expected = {normalize_header(header) for header in PDD_DAILY_BREAKDOWN_REQUIRED_HEADERS}
+    return (
+        signature.report_type == PROMOTION_REPORT_TYPE
+        and signature.platform == "拼多多"
+        and signature.promotion_type == "拼多多-商品推广"
+        and expected.issubset(required)
+        and not signature.product_id_headers
+    )
+
+
+def promotion_analysis_fallback_product_id(analysis: Analysis) -> str:
+    if (
+        analysis.report_type != PROMOTION_REPORT_TYPE
+        or pdd_daily_breakdown_filename_metadata(analysis.source) is None
+    ):
+        return ""
+    product_ids = list(
+        dict.fromkeys(
+            normalize_product_id(product_id)
+            for product_id in analysis.product_ids
+            if normalize_product_id(product_id)
+        )
+    )
+    return product_ids[0] if len(product_ids) == 1 else ""
+
+
 def decide_shop(
     path: Path,
     report_type: str,
@@ -1204,6 +1281,30 @@ def promotion_effective_column_indices(
     )
 
 
+def promotion_product_id_for_row(
+    headers: list[str],
+    row: list[str],
+    signature: Signature,
+    fallback_product_id: str = "",
+) -> str:
+    """Resolve a row ID, with one narrow filename-backed export exception."""
+    _date_index, product_id_index = promotion_effective_column_indices(
+        headers, signature
+    )
+    product_id = (
+        normalize_product_id(row[product_id_index])
+        if product_id_index is not None and product_id_index < len(row)
+        else ""
+    )
+    if (
+        not product_id
+        and fallback_product_id
+        and is_pdd_daily_breakdown_signature(signature)
+    ):
+        return normalize_product_id(fallback_product_id)
+    return product_id
+
+
 def promotion_type_for_row(
     headers: list[str], row: list[str], fallback_signature: Signature
 ) -> str:
@@ -1266,17 +1367,22 @@ def promotion_preview_missing_fields(
     header_row_index: int,
     headers: list[str],
     signature: Signature,
+    fallback_product_id: str = "",
 ) -> list[str]:
     date_index, product_id_index = promotion_column_indices(headers, signature)
     missing: list[str] = []
     if date_index is None:
         missing.append("具体日期")
-    if product_id_index is None:
+    has_filename_product_id = bool(
+        normalize_product_id(fallback_product_id)
+        and is_pdd_daily_breakdown_signature(signature)
+    )
+    if product_id_index is None and not has_filename_product_id:
         missing.append("商品ID")
     data_rows = 0
     missing_date = False
     missing_product_id = False
-    if date_index is not None and product_id_index is not None:
+    if date_index is not None and (product_id_index is not None or has_filename_product_id):
         for row in rows[header_row_index + 1 :]:
             if not any(normalize_text(value) for value in row):
                 continue
@@ -1285,9 +1391,14 @@ def promotion_preview_missing_fields(
             data_rows += 1
             if date_index >= len(row) or parse_date(row[date_index]) is None:
                 missing_date = True
-            if product_id_index >= len(row) or not normalize_product_id(row[product_id_index]):
+            product_id = (
+                normalize_product_id(row[product_id_index])
+                if product_id_index is not None and product_id_index < len(row)
+                else normalize_product_id(fallback_product_id)
+            )
+            if not product_id:
                 missing_product_id = True
-    if date_index is not None and product_id_index is not None and data_rows == 0:
+    if date_index is not None and (product_id_index is not None or has_filename_product_id) and data_rows == 0:
         missing.append("推广明细")
     if missing_date:
         missing.append("具体日期")
@@ -1296,7 +1407,9 @@ def promotion_preview_missing_fields(
     return list(dict.fromkeys(missing))
 
 
-def scan_promotion_file_full(path: Path, max_cols: int) -> PromotionValidation:
+def scan_promotion_file_full(
+    path: Path, max_cols: int, fallback_product_id: str = ""
+) -> PromotionValidation:
     data_rows = 0
     valid_rows = 0
     missing_date_rows = 0
@@ -1316,10 +1429,11 @@ def scan_promotion_file_full(path: Path, max_cols: int) -> PromotionValidation:
             if date_index is not None and date_index < len(row)
             else None
         )
-        product_id = (
-            normalize_product_id(row[product_id_index])
-            if product_id_index is not None and product_id_index < len(row)
-            else ""
+        product_id = promotion_product_id_for_row(
+            promotion_row.headers,
+            row,
+            promotion_row.signature,
+            fallback_product_id,
         )
         row_missing: list[str] = []
         if parsed_date is None:
@@ -1460,6 +1574,7 @@ def is_daily_breakdown_promotion(
     headers: list[str],
     period_headers: list[str],
     product_id_headers: list[str],
+    fallback_product_id: str = "",
 ) -> bool:
     # Whether a promotion export can be archived is determined by its data,
     # not by a filename convention. Tmall exports often combine daily rows
@@ -1469,7 +1584,10 @@ def is_daily_breakdown_promotion(
 
     date_column_index = find_header_index(headers, period_headers)
     product_id_column_index = find_header_index(headers, product_id_headers)
-    if date_column_index is None or product_id_column_index is None:
+    normalized_fallback_product_id = normalize_product_id(fallback_product_id)
+    if date_column_index is None or (
+        product_id_column_index is None and not normalized_fallback_product_id
+    ):
         return False
 
     dates: list[dt.date] = []
@@ -1486,7 +1604,12 @@ def is_daily_breakdown_promotion(
         parsed = parse_date(row[date_column_index])
         if not parsed:
             return False
-        if product_id_column_index >= len(row) or not normalize_product_id(row[product_id_column_index]):
+        product_id = (
+            normalize_product_id(row[product_id_column_index])
+            if product_id_column_index is not None and product_id_column_index < len(row)
+            else normalized_fallback_product_id
+        )
+        if not product_id:
             return False
         dates.append(parsed)
 
@@ -1502,6 +1625,7 @@ def is_multi_day_promotion_summary(
     headers: list[str],
     period_headers: list[str],
     product_id_headers: list[str],
+    fallback_product_id: str = "",
 ) -> bool:
     if report_type != "推广数据":
         return False
@@ -1515,6 +1639,7 @@ def is_multi_day_promotion_summary(
         headers,
         period_headers,
         product_id_headers,
+        fallback_product_id,
     )
 
 
@@ -1978,7 +2103,10 @@ def validate_promotion_merge_inputs(analyses: list[Analysis], max_cols: int) -> 
         resolved = analysis.source.resolve()
         if resolved in checked:
             continue
-        scan_promotion_file_full(analysis.source, max_cols)
+        fallback_product_id = promotion_analysis_fallback_product_id(analysis)
+        scan_promotion_file_full(
+            analysis.source, max_cols, fallback_product_id=fallback_product_id
+        )
         checked.add(resolved)
     if checked:
         print(f"promotion input integrity preflight passed: files={len(checked)}")
@@ -2687,6 +2815,7 @@ def promotion_records(
     paths: list[Path],
     max_cols: int,
     preferred_paths: set[Path] | None = None,
+    fallback_product_ids: dict[Path, str] | None = None,
 ) -> tuple[list[str], list[dict[str, str]], int]:
     headers = [
         PROMOTION_ARCHIVE_DATE_HEADER,
@@ -2699,12 +2828,20 @@ def promotion_records(
         os.path.normcase(str(path.resolve(strict=False)))
         for path in (preferred_paths or set())
     }
+    fallback_by_path = {
+        os.path.normcase(str(path.resolve(strict=False))): normalize_product_id(product_id)
+        for path, product_id in (fallback_product_ids or {}).items()
+        if normalize_product_id(product_id)
+    }
     duplicate_rows = 0
 
     for path in paths:
         path_key = os.path.normcase(str(path.resolve(strict=False)))
         path_is_preferred = path_key in preferred_keys
-        scan_promotion_file_full(path, max_cols)
+        fallback_product_id = fallback_by_path.get(path_key, "")
+        scan_promotion_file_full(
+            path, max_cols, fallback_product_id=fallback_product_id
+        )
         for promotion_row in iter_promotion_rows_full(path, max_cols):
             row = promotion_row.values
             if is_ignorable_promotion_row(promotion_row.headers, row):
@@ -2717,10 +2854,11 @@ def promotion_records(
                 if date_index is not None and date_index < len(row)
                 else None
             )
-            product_id = (
-                normalize_product_id(row[product_id_index])
-                if product_id_index is not None and product_id_index < len(row)
-                else ""
+            product_id = promotion_product_id_for_row(
+                promotion_row.headers,
+                row,
+                promotion_row.signature,
+                fallback_product_id,
             )
             if parsed_date is None or not product_id:
                 raise RuntimeError(
@@ -2782,6 +2920,9 @@ def merge_promotion_data(analysis: Analysis, max_cols: int) -> tuple[Path, int, 
         merge_paths,
         max_cols,
         preferred_paths={analysis.source},
+        fallback_product_ids={
+            analysis.source: promotion_analysis_fallback_product_id(analysis)
+        },
     )
     rows = [[normalize_text(record.get(header, "")) for header in headers] for record in records]
 
@@ -3172,7 +3313,19 @@ def analyze_file(
             new_product_ids=[],
         )
 
+    daily_breakdown_metadata = (
+        pdd_daily_breakdown_filename_metadata(source)
+        if is_pdd_daily_breakdown_signature(signature)
+        else None
+    )
+    filename_product_id = (
+        daily_breakdown_metadata.filename_product_id
+        if daily_breakdown_metadata is not None
+        else ""
+    )
     product_ids = collect_product_ids(rows, header_row_index, headers, signature)
+    if not product_ids and filename_product_id:
+        product_ids = [filename_product_id]
     sales_product_ids = collect_product_ids(
         rows,
         header_row_index,
@@ -3204,6 +3357,11 @@ def analyze_file(
     shop_name, shop_source, product_counts = decide_shop(
         source, signature.report_type, rows, product_ids, product_map, shops
     )
+    if daily_breakdown_metadata is not None and not shop_name:
+        filename_shop = canonicalize_shop(daily_breakdown_metadata.shop_text, shops)
+        if filename_shop:
+            shop_name = filename_shop
+            shop_source = "daily_breakdown_filename"
     platform, platform_source = detect_platform(source, rows, signature)
     shop_name = normalize_shop_platform(shop_name, platform)
     if shop_name and platform_source:
@@ -3214,7 +3372,11 @@ def analyze_file(
     promotion_missing_fields: list[str] = []
     if signature.report_type == PROMOTION_REPORT_TYPE:
         promotion_missing_fields = promotion_preview_missing_fields(
-            rows, header_row_index, headers, signature
+            rows,
+            header_row_index,
+            headers,
+            signature,
+            fallback_product_id=filename_product_id,
         )
     if not shop_name:
         missing.append("shop_name")
@@ -3230,6 +3392,7 @@ def analyze_file(
         headers,
         signature.period_headers,
         signature.product_id_headers,
+        filename_product_id,
     ):
         missing.append("single_day_period")
 
@@ -3457,6 +3620,96 @@ def extract_zip_inputs(input_dir: Path) -> None:
 def input_file_prefix(path: Path) -> str:
     match = re.match(r"([0-9a-f]{32})", path.name, flags=re.IGNORECASE)
     return match.group(1).lower() if match else ""
+
+
+def apply_pdd_daily_breakdown_metadata_evidence(
+    analyses: list[Analysis],
+    product_map: dict[str, str],
+    shops: list[str],
+) -> None:
+    """Resolve the filename-only ID safely, preferring matching log content."""
+    log_ids_by_key: dict[tuple[str, str], set[str]] = {}
+    for analysis in analyses:
+        if analysis.report_type != PROMOTION_ADJUSTMENT_REPORT_TYPE:
+            continue
+        metadata = pdd_operation_log_filename_metadata(analysis.source)
+        if metadata is None:
+            continue
+        shop_name = analysis.shop_name or canonicalize_shop(metadata.shop_text, shops)
+        product_ids = {
+            normalize_product_id(product_id)
+            for product_id in analysis.product_ids
+            if normalize_product_id(product_id)
+        }
+        if not shop_name or not product_ids:
+            continue
+        log_ids_by_key.setdefault((shop_name, metadata.item_token), set()).update(
+            product_ids
+        )
+
+    for analysis in analyses:
+        if analysis.report_type != PROMOTION_REPORT_TYPE:
+            continue
+        metadata = pdd_daily_breakdown_filename_metadata(analysis.source)
+        if metadata is None:
+            continue
+        filename_shop = canonicalize_shop(metadata.shop_text, shops)
+        if not filename_shop:
+            analysis.status = "pending"
+            analysis.reason = "promotion_daily_breakdown_unknown_filename_shop"
+            analysis.target_folder = "_待确认"
+            analysis.target_path = analysis.source
+            analysis.missing_fields = "店铺"
+            continue
+        if analysis.shop_name and strip_platform_suffix(analysis.shop_name) != strip_platform_suffix(
+            filename_shop
+        ):
+            analysis.status = "pending"
+            analysis.reason = "promotion_daily_breakdown_shop_conflict"
+            analysis.target_folder = "_待确认"
+            analysis.target_path = analysis.source
+            analysis.missing_fields = "店铺证据冲突"
+            continue
+
+        log_ids = log_ids_by_key.get((filename_shop, metadata.item_token), set())
+        if len(log_ids) > 1:
+            analysis.status = "pending"
+            analysis.reason = "promotion_daily_breakdown_product_id_conflict"
+            analysis.target_folder = "_待确认"
+            analysis.target_path = analysis.source
+            analysis.missing_fields = "商品ID证据冲突"
+            continue
+
+        resolved_product_id = (
+            next(iter(log_ids)) if log_ids else metadata.filename_product_id
+        )
+        mapped_shop = product_map.get(resolved_product_id, "")
+        if mapped_shop and strip_platform_suffix(mapped_shop) != strip_platform_suffix(
+            filename_shop
+        ):
+            analysis.status = "pending"
+            analysis.reason = "promotion_daily_breakdown_product_shop_conflict"
+            analysis.target_folder = "_待确认"
+            analysis.target_path = analysis.source
+            analysis.missing_fields = "商品ID与店铺映射冲突"
+            continue
+
+        analysis.shop_name = filename_shop
+        evidence_source = "operation_log_content" if log_ids else "strict_filename"
+        analysis.shop_source = "+".join(
+            part
+            for part in (analysis.shop_source, f"daily_breakdown:{evidence_source}")
+            if part
+        )
+        analysis.product_ids = [resolved_product_id]
+        analysis.new_product_ids = (
+            [] if resolved_product_id in product_map else [resolved_product_id]
+        )
+        analysis.product_counts = (
+            f"filename_product_id={metadata.filename_product_id};"
+            f"resolved_product_id={resolved_product_id};"
+            f"id_source={evidence_source}"
+        )
 
 
 def apply_batch_shop_inference(
@@ -5104,6 +5357,7 @@ def main(argv: list[str]) -> int:
         for path in files
     ]
     file_download_dates = {path: download_date(path) for path in files}
+    apply_pdd_daily_breakdown_metadata_evidence(analyses, product_map, shops)
     apply_batch_shop_inference(database_root, analyses, signatures, file_download_dates)
     reserve_unique_targets(analyses)
     try:

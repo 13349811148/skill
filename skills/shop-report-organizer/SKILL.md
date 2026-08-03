@@ -97,6 +97,8 @@ For `售后数据`, keep one cumulative table per shop in the current download-m
 Special validation and merge rule for `推广数据`:
 
 - Require every non-summary promotion detail row to contain both a valid specific date and a valid product ID. Never use a filename date as a fallback for promotion archiving. If either field is missing from the header or any detail row, keep the source in its original location, mark it `pending`, and tell the user to re-download the promotion detail with both fields.
+- Narrow exception for Pinduoduo files whose actual headers match `日期、曝光量、点击量、总花费(元)、净实际投产比` and whose filename exactly matches `商品推广_分天数据_YYYYMMDD至YYYYMMDD(店铺)(商品标题_商品ID).xls[x]`: classify them as `推广数据`, read every date and metric from the workbook, and use the filename only for the otherwise-absent shop and product ID. Do not apply this exception to any other report or looser filename.
+- For that exception, prefer one unambiguous product ID found inside the matching same-batch `商品推广操作日志` over the filename suffix, then validate the resolved ID against the known product-to-shop map. Keep the file pending on multiple log IDs, unknown shop, or shop/ID conflict; never use fuzzy ID matching.
 - Keep exactly one cumulative promotion workbook per shop at `推广数据/<店铺>/<店铺>—推广数据.xlsx`; do not create one workbook per product ID.
 - Preserve each source column and add normalized `归档日期`、`归档商品ID` and `归档推广类型` columns, so the combined shop workbook always contains the date, product ID and promotion type used for filing. Write Pinduoduo rows as `拼多多-商品推广`; write Tmall rows as `万相台`、`新客加速` or `老客加速`. Classify legacy 品牌新享 as `新客加速` while preserving its original columns.
 - On `--apply`, validate every new-source row before moving any file, then merge it with the shop's cumulative promotion workbook.
@@ -218,6 +220,7 @@ Read `references/report_signatures.csv` for report signatures. Current content-b
 - `商品数据`: headers include `商品ID（必填）` and `商品名称`. Current product exports may be either the old product-code table with `商品编码`, or the newer stock export table with `SKUID（必填，注意不是SKU编码）`, `规格名称`, `库存增减`, and `规格编码`.
 - Tmall 商品发布模板 is also `商品数据`: recognize the headers `商品Id`, `类目id`, `商品标题`, `一口价`, `skuId`, `价格（元）`, and `数量`, including when the usable table is in a hidden or protected worksheet; infer the shop from a filename parenthesis such as `（天猫-店铺名）`.
 - Pinduoduo `推广数据`: headers include `商品名称`, `商品ID`, `推广名称`, `总花费(元)`, `净实际投产比`.
+- Pinduoduo `商品推广_分天数据` is also `推广数据` when its actual headers include `日期`, `曝光量`, `点击量`, `总花费(元)`, `净实际投产比` and its filename matches the strict form above; table rows remain the source of truth for dates and metrics.
 - Tmall 万相台 `推广数据`: headers include `日期`, `主体ID`, `主体类型`, `主体名称`, `花费`, `投入产出比`.
 - Tmall 品牌新享 `推广数据`: headers include `商品名称`, `商品ID`, `业务日期`, `预估抽佣金额`, `支付金额`.
 - Tmall 老客加速订单 `推广数据`: headers include `商品名称`, `父订单ID`, `商品ID`, `支付金额`, `预估老客加速费用`, `日期`.
@@ -228,15 +231,16 @@ Store-name detection order:
 1. Explicit shop text in spreadsheet cells, canonicalized against known shop folders and `references/shop_product_map.csv`.
 2. Product ID majority vote from `references/shop_product_map.csv`.
 3. Product ID majority vote from already archived files under `商品数据/<店铺>/...`; this lets future runs work even when `商品数据` is not exported again.
-4. For `商品数据` only, use the shop name inside filename parentheses to seed or update the product map. A `天猫-` prefix inside the parentheses is a platform label, not part of the shop name.
-5. If still unknown, mark the file `pending`.
+4. For the strict Pinduoduo `商品推广_分天数据` subtype only, use its filename shop and resolved product ID after the operation-log/product-map checks above.
+5. For `商品数据` only, use the shop name inside filename parentheses to seed or update the product map. A `天猫-` prefix inside the parentheses is a platform label, not part of the shop name.
+6. If still unknown, mark the file `pending`.
 
 Period detection:
 
 - For every order row, prefer a valid `订单支付时间`、`支付时间` or `订单付款时间`; when that row's preferred value is blank or invalid, fall back to `订单成交时间`; for Tmall, fall back once more to `订单创建时间`. If both payment and transaction times are valid, use the payment/付款 time. A valid fallback means the row is valid and must not stop processing.
 - Pinduoduo `售后数据`: min and max of `申请时间`; Tmall refund exports use `退款申请时间`, falling back to `退款完结时间`.
 - `推广数据`: use only the actual spreadsheet date column. Do not use a filename date range as a fallback.
-- `推广数据`: archive single-day or multi-day detail only when every non-summary row has a valid date and product ID. Keep a file pending when its date or product ID field is missing, blank, or invalid in any detail row, and tell the user to re-download a promotion detail export that includes both fields. The filename (including whether it contains `分天数据`) is not a condition.
+- `推广数据`: archive single-day or multi-day detail only when every non-summary row has a valid date and product ID. The strict `商品推广_分天数据` subtype may supply one validated filename/log product ID to every row because that export omits the ID column; every other promotion type still requires the ID in the table. Keep the file pending when its date or resolved product ID is missing, invalid, or conflicting. A filename containing `分天数据` without the required actual headers and strict metadata format is not enough.
 - `商品数据`: use the download date as a one-day period when no content period exists.
 
 Download date comes from the source file's filesystem creation time: use `st_birthtime` on macOS and the Windows creation time on Windows; fall back to modified time only when the platform has no creation-time field. Dates written in filenames never replace the filesystem creation time.
