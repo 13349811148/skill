@@ -109,8 +109,15 @@ function Remove-DirectoryBestEffort {
     try {
         Remove-Item -Recurse -Force -LiteralPath $Path -ErrorAction Stop
     } catch {
-        if (Test-Path -LiteralPath $Path) {
-            Write-Warning "Temporary update folder could not be fully removed: $Path"
+        Start-Sleep -Milliseconds 100
+        try {
+            if (Test-Path -LiteralPath $Path) {
+                Remove-Item -Recurse -Force -LiteralPath $Path -ErrorAction Stop
+            }
+        } catch {
+            if (Test-Path -LiteralPath $Path) {
+                Write-Warning "Temporary update folder could not be fully removed: $Path"
+            }
         }
     }
 }
