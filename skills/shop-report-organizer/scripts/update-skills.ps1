@@ -101,7 +101,10 @@ function Write-JsonFileAtomic {
 }
 
 function Remove-DirectoryBestEffort {
-    param([string]$Path)
+    param(
+        [string]$Path,
+        [switch]$Quiet
+    )
 
     if (-not (Test-Path -LiteralPath $Path)) {
         return
@@ -115,7 +118,7 @@ function Remove-DirectoryBestEffort {
                 [IO.Directory]::Delete([IO.Path]::GetFullPath($Path), $true)
             }
         } catch {
-            if (Test-Path -LiteralPath $Path) {
+            if ((Test-Path -LiteralPath $Path) -and -not $Quiet) {
                 Write-Warning "Temporary update folder could not be fully removed: $Path"
             }
         }
@@ -186,7 +189,7 @@ try {
 
     New-Item -ItemType Directory -Force -Path $syncRoot, $skillsRoot | Out-Null
     Get-ChildItem -LiteralPath $skillsRoot -Directory -Force -Filter ".skill-sync-*" -ErrorAction SilentlyContinue |
-        ForEach-Object { Remove-DirectoryBestEffort -Path $_.FullName }
+        ForEach-Object { Remove-DirectoryBestEffort -Path $_.FullName -Quiet }
     $legacyRepositoryCache = Join-Path $syncRoot "repository.git"
     if (Test-Path -LiteralPath $legacyRepositoryCache -PathType Container) {
         Remove-Item -Recurse -Force -LiteralPath $legacyRepositoryCache
