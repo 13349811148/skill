@@ -100,6 +100,21 @@ function Write-JsonFileAtomic {
     Move-Item -Force -LiteralPath $temporary -Destination $Path
 }
 
+function Remove-DirectoryBestEffort {
+    param([string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return
+    }
+    try {
+        Remove-Item -Recurse -Force -LiteralPath $Path -ErrorAction Stop
+    } catch {
+        if (Test-Path -LiteralPath $Path) {
+            Write-Warning "Temporary update folder could not be fully removed: $Path"
+        }
+    }
+}
+
 function Assert-SkillFolder {
     param(
         [string]$Name,
@@ -282,7 +297,7 @@ try {
             skills = @($skillNames)
         }
         Write-JsonFileAtomic -Path $statePath -Value $newState
-        Remove-Item -Recurse -Force -LiteralPath $transactionRoot
+        Remove-DirectoryBestEffort -Path $transactionRoot
 
         $namesText = ($skillNames -join ", ")
         if ($HookMode) {
@@ -294,7 +309,7 @@ try {
         }
     } finally {
         if (Test-Path -LiteralPath $temporaryRoot) {
-            Remove-Item -Recurse -Force -LiteralPath $temporaryRoot
+            Remove-DirectoryBestEffort -Path $temporaryRoot
         }
     }
 } catch {
