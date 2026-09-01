@@ -185,6 +185,8 @@ try {
     }
 
     New-Item -ItemType Directory -Force -Path $syncRoot, $skillsRoot | Out-Null
+    Get-ChildItem -LiteralPath $skillsRoot -Directory -Force -Filter ".skill-sync-*" -ErrorAction SilentlyContinue |
+        ForEach-Object { Remove-DirectoryBestEffort -Path $_.FullName }
     $legacyRepositoryCache = Join-Path $syncRoot "repository.git"
     if (Test-Path -LiteralPath $legacyRepositoryCache -PathType Container) {
         Remove-Item -Recurse -Force -LiteralPath $legacyRepositoryCache
@@ -304,7 +306,9 @@ try {
             skills = @($skillNames)
         }
         Write-JsonFileAtomic -Path $statePath -Value $newState
-        Remove-DirectoryBestEffort -Path $transactionRoot
+        # This running script now lives in the old backup, so Windows may keep
+        # the transaction folder locked until the process exits. The next
+        # update check removes stale transaction folders before doing any work.
 
         $namesText = ($skillNames -join ", ")
         if ($HookMode) {
