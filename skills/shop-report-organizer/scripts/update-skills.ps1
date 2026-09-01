@@ -112,7 +112,7 @@ function Remove-DirectoryBestEffort {
         Start-Sleep -Milliseconds 100
         try {
             if (Test-Path -LiteralPath $Path) {
-                Remove-Item -Recurse -Force -LiteralPath $Path -ErrorAction Stop
+                [IO.Directory]::Delete([IO.Path]::GetFullPath($Path), $true)
             }
         } catch {
             if (Test-Path -LiteralPath $Path) {
