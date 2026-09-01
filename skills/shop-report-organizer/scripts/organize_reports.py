@@ -3777,6 +3777,36 @@ def apply_batch_shop_inference(
             )
 
 
+def reconcile_same_batch_product_data_ids(analyses: list[Analysis]) -> None:
+    """Remove new-ID reminders already resolved by ready product data in this batch."""
+    product_data_shops: dict[str, set[str]] = {}
+    for analysis in analyses:
+        if (
+            analysis.status != "ready"
+            or analysis.report_type != "商品数据"
+            or not analysis.shop_name
+        ):
+            continue
+        for product_id in analysis.product_ids:
+            product_id = normalize_product_id(product_id)
+            if product_id:
+                product_data_shops.setdefault(product_id, set()).add(analysis.shop_name)
+
+    for analysis in analyses:
+        if (
+            analysis.report_type not in PRODUCT_ID_CHECK_REPORT_TYPES
+            or not analysis.new_product_ids
+            or not analysis.shop_name
+        ):
+            continue
+        analysis.new_product_ids = [
+            product_id
+            for product_id in analysis.new_product_ids
+            if product_data_shops.get(normalize_product_id(product_id))
+            != {analysis.shop_name}
+        ]
+
+
 def manifest_row(analysis: Analysis, action: str) -> dict[str, str]:
     return {
         "action": action,
@@ -5365,6 +5395,8 @@ def main(argv: list[str]) -> int:
     except OSError as exc:
         print(f"duplicate-file precheck failed: {exc}", file=sys.stderr)
         return 2
+    if not args.no_update_map:
+        reconcile_same_batch_product_data_ids(analyses)
 
     preliminary_action = "apply" if apply else "dry-run"
     preliminary_reminder_rows = missing_report_reminder_rows(expected_reports, analyses, preliminary_action, input_dir)
