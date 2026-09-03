@@ -372,11 +372,12 @@ def test_four_subsidized_orders_do_not_trigger_below_cost_confirmation() -> None
             cost_by_merchant_code=costs,
             product_exports=pdd.ProductExportIndex(),
         )
-    assert pdd_aggregates[("2026-07-06", style_id)][
+    pdd_key = ("2026-07-06", "黄小惠庄芯专卖店", product_id, style_id)
+    assert pdd_aggregates[pdd_key][
         "实际成交数量（去退款去补单后）"
     ] == 4
     assert abs(
-        pdd_aggregates[("2026-07-06", style_id)][
+        pdd_aggregates[pdd_key][
             "实际成交金额（去退款去补单后）"
         ]
         - 84.4

@@ -21,6 +21,7 @@ from data_quality_protection import (
     duplicate_identifier_warnings,
     load_cost_table_records,
     marketing_price_warnings,
+    normalize_match_code,
     optional_number,
     parse_number_strict,
     resolve_final_cost,
@@ -85,6 +86,42 @@ ARRIVAL_PRICE_MATCH_TOLERANCE = 0.005
 ARRIVAL_PRICE_LOW_DEVIATION_LIMIT = 0.05
 ARRIVAL_PRICE_WARNING_PREFIX = "到手价提醒："
 PROMOTION_SHOP_CANDIDATES = ("店铺名称", "店铺", "汇总_店铺名称", "店铺名")
+MISSING_MARKETING_VALUE = "营销活动表未匹配/未维护"
+MULTI_SPEC_VALUE = "多规格未唯一匹配"
+EMPTY_BURN_ARRIVAL_PRICE = "不适用（无有效销量）"
+MARKETING_OUTPUT_FIELDS = (
+    "品牌",
+    "所属运营",
+    "平台",
+    "店铺名称",
+    "大类",
+    "商品ID",
+    "商品SKU",
+    "产品成本",
+    "活动价",
+    "报名价",
+    EXPECTED_UNIT_RECEIPT_COLUMN,
+    PROMOTION_MECHANISM_COLUMN,
+)
+MARKETING_REQUIRED_FIELDS = (
+    "品牌",
+    "所属运营",
+    "平台",
+    "店铺名称",
+    "大类",
+    "商品ID",
+    "商品SKU",
+    "产品成本",
+    "活动价",
+    "报名价",
+    PROMOTION_MECHANISM_COLUMN,
+)
+MARKETING_NUMERIC_FIELDS = {
+    "产品成本",
+    "活动价",
+    "报名价",
+    EXPECTED_UNIT_RECEIPT_COLUMN,
+}
 
 SKILL_ROOT = Path(__file__).resolve().parents[1]
 COLUMNS_CSV = SKILL_ROOT / "references" / "template_columns.csv"
@@ -101,6 +138,25 @@ class WorkbookData:
 
 class ReportError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class MarketingResolution:
+    values: dict[str, Any]
+    sources: dict[str, str]
+    conflicts: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class PddCostResolution:
+    cost: float | None
+    source: str
+    cost_record: dict[str, Any]
+    marketing_source: str = ""
+    marketing_cost: float | None = None
+    table_cost: float | None = None
+    cost_difference: float | None = None
+    specification_conflict_warning: str = ""
 
 
 def text(value: Any) -> str:
@@ -460,7 +516,11 @@ def resolve_arrival_price(
     """Return the PDD report arrival price and a user-facing exception warning."""
     actual_arrival_price = actual_amount / quantity if quantity else ""
     if actual_arrival_price == "":
-        return "", None
+        return (
+            EMPTY_BURN_ARRIVAL_PRICE,
+            f"{ARRIVAL_PRICE_WARNING_PREFIX}无有效销量，无法计算实际到手价；"
+            f"日期={date}，样式ID={style_id or '未提供'}，商品ID={product_id or '未提供'}",
+        )
     if text(expected_unit_receipt) == "":
         detail = f"日期={date}，样式ID={style_id or '未提供'}，商品ID={product_id or '未提供'}"
         return (
@@ -470,16 +530,16 @@ def resolve_arrival_price(
             f"实际={actual_arrival_price:.2f}",
         )
 
-    expected_price = number(expected_unit_receipt)
+    expected_price = optional_number(expected_unit_receipt)
     detail = f"日期={date}，样式ID={style_id or '未提供'}，商品ID={product_id or '未提供'}"
-    if expected_price <= 0:
+    if expected_price is None or expected_price <= 0:
         return (
             actual_arrival_price,
             f"{ARRIVAL_PRICE_WARNING_PREFIX}单件预估实收金额无效，已按实际到手价填写，请检查营销活动表，{detail}，"
-            f"预估={expected_price:.2f}，实际={actual_arrival_price:.2f}",
+            f"预估={text(expected_unit_receipt) or '空'}，实际={actual_arrival_price:.2f}",
         )
     if abs(actual_arrival_price - expected_price) < ARRIVAL_PRICE_MATCH_TOLERANCE:
-        return expected_price, None
+        return actual_arrival_price, None
     if actual_arrival_price < expected_price:
         deviation = (expected_price - actual_arrival_price) / expected_price
         if deviation <= ARRIVAL_PRICE_LOW_DEVIATION_LIMIT:
@@ -490,8 +550,8 @@ def resolve_arrival_price(
                 f"预估={expected_price:.2f}，实际={actual_arrival_price:.2f}，偏差={deviation:.2%}",
             )
         return (
-            "",
-            f"{ARRIVAL_PRICE_WARNING_PREFIX}实际到手价低于单件预估实收金额超过5%，到手价未填写，请检查多件折扣或营销活动表，"
+            actual_arrival_price,
+            f"{ARRIVAL_PRICE_WARNING_PREFIX}实际到手价低于单件预估实收金额超过5%，已按实际到手价填写，请检查多件折扣或营销活动表，"
             f"{detail}，预估={expected_price:.2f}，实际={actual_arrival_price:.2f}，偏差={deviation:.2%}",
         )
     deviation = (actual_arrival_price - expected_price) / expected_price
@@ -554,6 +614,257 @@ def load_marketing_rows(marketing_path: Path) -> list[dict[str, Any]]:
     raise ReportError(
         f"营销活动表缺少商品ID、样式ID或商品SKU表头，已停止生成日报,{marketing_path}"
     )
+
+
+def _marketing_value(row: dict[str, Any], field: str) -> Any:
+    if field == PROMOTION_MECHANISM_COLUMN:
+        return marketing_promotion_mechanism(row)
+    return row.get(field, "")
+
+
+def _marketing_value_key(field: str, value: Any) -> tuple[str, Any] | None:
+    raw = text(value)
+    if not raw:
+        return None
+    if field in MARKETING_NUMERIC_FIELDS:
+        numeric = optional_number(value)
+        if numeric is not None:
+            return "number", round(numeric, 9)
+    return "text", normalize_match_code(raw)
+
+
+def _consistent_marketing_value(
+    candidates: list[dict[str, Any]], field: str
+) -> tuple[Any, bool]:
+    populated = [
+        (_marketing_value_key(field, _marketing_value(row, field)), _marketing_value(row, field))
+        for row in candidates
+        if text(_marketing_value(row, field))
+    ]
+    if not populated:
+        return "", False
+    keys = {key for key, _value in populated if key is not None}
+    if len(keys) != 1:
+        return "", True
+    return populated[0][1], False
+
+
+def resolve_marketing_fields(
+    marketing_rows: list[dict[str, Any]],
+    *,
+    style_id: str,
+    product_id: str,
+    shop: str,
+    sku: str,
+) -> MarketingResolution:
+    """Resolve each PDD marketing field without choosing an ambiguous row."""
+    sku_key = normalize_match_code(sku)
+    shop_key = normalize_match_code(shop)
+    style_candidates = [
+        row for row in marketing_rows if style_id and text(row.get("样式ID")) == style_id
+    ]
+    conflicts: list[str] = []
+    safe_style_candidates: list[dict[str, Any]] = []
+    if style_candidates:
+        if sku_key:
+            safe_style_candidates = [
+                row
+                for row in style_candidates
+                if normalize_match_code(row.get("商品SKU")) == sku_key
+            ]
+            if not safe_style_candidates:
+                marketing_skus = sorted(
+                    {
+                        text(row.get("商品SKU"))
+                        for row in style_candidates
+                        if text(row.get("商品SKU"))
+                    }
+                )
+                conflicts.append(
+                    "订单SKU与营销表样式SKU冲突，营销活动表样式ID规格不安全，已跳过样式ID匹配；"
+                    f"样式ID={style_id}，订单商品SKU={sku or '未提供'}，"
+                    f"营销表商品SKU={'|'.join(marketing_skus) or '未维护'}"
+                )
+        else:
+            style_sku_keys = {
+                normalize_match_code(row.get("商品SKU"))
+                for row in style_candidates
+                if normalize_match_code(row.get("商品SKU"))
+            }
+            if len(style_sku_keys) <= 1:
+                safe_style_candidates = style_candidates
+            else:
+                conflicts.append(
+                    "营销活动表样式ID对应多个规格，已跳过样式ID匹配；"
+                    f"样式ID={style_id}"
+                )
+
+    product_sku_candidates = [
+        row
+        for row in marketing_rows
+        if sku_key
+        and text(row.get("商品ID")) == product_id
+        and normalize_match_code(row.get("商品SKU")) == sku_key
+    ]
+    shop_sku_candidates = [
+        row
+        for row in marketing_rows
+        if sku_key
+        and shop_key
+        and normalize_match_code(row.get("店铺名称")) == shop_key
+        and normalize_match_code(row.get("商品SKU")) == sku_key
+    ]
+    cross_shop_sku_candidates = [
+        row
+        for row in marketing_rows
+        if sku_key and normalize_match_code(row.get("商品SKU")) == sku_key
+    ]
+    tiers = (
+        (f"规格安全样式ID={style_id}", safe_style_candidates),
+        (f"商品ID+商品SKU={product_id}+{sku}", product_sku_candidates),
+        (f"店铺名称+规范化商品SKU={shop}+{sku_key}", shop_sku_candidates),
+        (f"商品SKU跨店逐字段一致值={sku_key}", cross_shop_sku_candidates),
+    )
+
+    values: dict[str, Any] = {}
+    sources: dict[str, str] = {}
+    for field in MARKETING_OUTPUT_FIELDS:
+        for source, candidates in tiers:
+            if not candidates:
+                continue
+            value, conflicted = _consistent_marketing_value(candidates, field)
+            if conflicted:
+                distinct_values = sorted(
+                    {
+                        text(_marketing_value(candidate, field))
+                        for candidate in candidates
+                        if text(_marketing_value(candidate, field))
+                    }
+                )
+                conflicts.append(
+                    "营销字段候选冲突，未任取第一条；"
+                    f"匹配={source}，字段={field}，候选值={'|'.join(distinct_values[:8])}"
+                )
+                continue
+            if text(value):
+                values[field] = value
+                sources[field] = source
+                break
+        values.setdefault(field, "")
+    return MarketingResolution(values, sources, tuple(dict.fromkeys(conflicts)))
+
+
+def resolve_pdd_cost(
+    row: dict[str, Any],
+    marketing_resolution: MarketingResolution,
+    cost_by_merchant_code: dict[str, dict[str, Any]],
+    marketing_path: Path,
+) -> PddCostResolution:
+    final_sku = text(row.get("商品SKU"))
+    table_record = (
+        cost_by_merchant_code.get(normalize_match_code(final_sku), {}) if final_sku else {}
+    )
+    table_cost = optional_number(table_record.get("产品成本")) if table_record else None
+    if table_cost is not None and table_cost <= 0:
+        table_cost = None
+    marketing_raw_cost = marketing_resolution.values.get("产品成本", "")
+    marketing_cost = optional_number(marketing_raw_cost)
+    if marketing_cost is not None and marketing_cost <= 0:
+        marketing_cost = None
+    marketing_source = marketing_resolution.sources.get("产品成本", "")
+    marketing_source_label = (
+        f"营销活动表:{marketing_path.name}/{marketing_source}"
+        if marketing_source
+        else ""
+    )
+    marketing_fallback_is_newer = marketing_source.startswith(
+        ("店铺名称+规范化商品SKU=", "商品SKU跨店逐字段一致值=")
+    )
+    cost_difference = (
+        marketing_cost - table_cost
+        if marketing_cost is not None and table_cost is not None
+        else None
+    )
+    if marketing_fallback_is_newer and marketing_cost is not None:
+        return PddCostResolution(
+            marketing_cost,
+            marketing_source_label,
+            dict(table_record),
+            marketing_source_label,
+            marketing_cost,
+            table_cost,
+            cost_difference,
+        )
+    if table_cost is not None:
+        return PddCostResolution(
+            table_cost,
+            text(table_record.get("来源")) or "成本表:未提供来源",
+            dict(table_record),
+            marketing_source_label,
+            marketing_cost,
+            table_cost,
+            cost_difference,
+        )
+    if marketing_cost is not None:
+        return PddCostResolution(
+            marketing_cost,
+            marketing_source_label or f"营销活动表:{marketing_path.name}/未提供匹配来源",
+            dict(table_record),
+            marketing_source_label,
+            marketing_cost,
+            None,
+            None,
+        )
+    return PddCostResolution(
+        None,
+        "未匹配",
+        dict(table_record),
+        marketing_source_label,
+        None,
+        table_cost,
+        None,
+    )
+
+
+def finalize_marketing_display_fields(
+    row: dict[str, Any], *, empty_burn: bool = False
+) -> list[str]:
+    warnings: list[str] = []
+    identity = (
+        f"日期={text(row.get('日期')) or '未提供'}，"
+        f"店铺={text(row.get('店铺名称')) or '未提供'}，"
+        f"商品ID={text(row.get('商品ID')) or '未提供'}，"
+        f"SKU ID={text(row.get('SKU ID')) or '未提供'}，"
+        f"商品SKU={text(row.get('商品SKU')) or '未提供'}"
+    )
+    invalid_numeric_fields: list[str] = []
+    for field in ("产品成本", "活动价", "报名价"):
+        raw = text(row.get(field))
+        if raw and raw not in {MISSING_MARKETING_VALUE, MULTI_SPEC_VALUE} and optional_number(raw) is None:
+            invalid_numeric_fields.append(f"{field}={raw}")
+            if field == "产品成本":
+                row[field] = MISSING_MARKETING_VALUE
+    if invalid_numeric_fields:
+        warnings.append(
+            "营销活动表数值无效，未转换为0；"
+            f"{identity}，字段={'|'.join(invalid_numeric_fields)}"
+        )
+
+    missing_fields: list[str] = []
+    for field in MARKETING_REQUIRED_FIELDS:
+        if not text(row.get(field)):
+            row[field] = MISSING_MARKETING_VALUE
+            missing_fields.append(field)
+    if empty_burn:
+        row["到手价"] = EMPTY_BURN_ARRIVAL_PRICE
+    elif not text(row.get("到手价")):
+        row["到手价"] = EMPTY_BURN_ARRIVAL_PRICE
+        missing_fields.append("到手价")
+    if missing_fields:
+        warnings.append(
+            f"营销活动表未匹配/未维护；{identity}，字段={'|'.join(missing_fields)}"
+        )
+    return warnings
 
 
 def load_marketing_styles(marketing_rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
@@ -659,7 +970,17 @@ def load_product_exports(
 def is_valid_order(row: dict[str, Any]) -> bool:
     status = text(row.get("订单状态"))
     after_sale = text(row.get("售后状态"))
-    blocked_status = ["未成交", "关闭", "退款成功", "全额退款", "已退款"]
+    blocked_status = [
+        "未成交",
+        "关闭",
+        "已取消",
+        "待付款",
+        "待支付",
+        "未付款",
+        "退款成功",
+        "全额退款",
+        "已退款",
+    ]
     blocked_after_sale = ["退款成功", "全额退款", "已退款"]
     return not any(word in status for word in blocked_status) and not any(
         word in after_sale for word in blocked_after_sale
@@ -677,7 +998,17 @@ def matching_marketing_row(
     sku: str,
     template_products: dict[tuple[str, str], dict[str, Any]],
     template_styles: dict[str, dict[str, Any]],
+    shop: str = "",
+    marketing_rows: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    if marketing_rows is not None:
+        return resolve_marketing_fields(
+            marketing_rows,
+            style_id=style_id,
+            product_id=product_id,
+            shop=shop,
+            sku=sku,
+        ).values
     style_record = template_styles.get(style_id, {}) if style_id else {}
     if style_record:
         return style_record
@@ -716,7 +1047,23 @@ def resolve_order_unit_cost(
     template_products: dict[tuple[str, str], dict[str, Any]],
     template_styles: dict[str, dict[str, Any]],
     cost_by_merchant_code: dict[str, dict[str, Any]],
+    shop: str = "",
+    marketing_rows: list[dict[str, Any]] | None = None,
 ) -> float | None:
+    if marketing_rows is not None:
+        marketing_resolution = resolve_marketing_fields(
+            marketing_rows,
+            style_id=style_id,
+            product_id=product_id,
+            shop=shop,
+            sku=merchant_spec_code or sku,
+        )
+        return resolve_pdd_cost(
+            {"商品SKU": merchant_spec_code or sku},
+            marketing_resolution,
+            cost_by_merchant_code,
+            Path("营销活动表"),
+        ).cost
     resolution = resolve_final_cost(
         style_id=style_id,
         product_id=product_id,
@@ -776,14 +1123,15 @@ def load_order_aggregates(
     template_styles: dict[str, dict[str, Any]] | None = None,
     cost_by_merchant_code: dict[str, dict[str, Any]] | None = None,
     product_exports: ProductExportIndex | None = None,
-) -> tuple[dict[tuple[str, str], dict[str, Any]], list[str]]:
+    marketing_rows: list[dict[str, Any]] | None = None,
+) -> tuple[dict[tuple[str, str, str, str], dict[str, Any]], list[str]]:
     if small_receipt_action not in SMALL_RECEIPT_ACTIONS:
         raise ReportError(f"Unsupported small receipt action: {small_receipt_action}")
     template_products = template_products or {}
     template_styles = template_styles or {}
     cost_by_merchant_code = cost_by_merchant_code or {}
     product_exports = product_exports or ProductExportIndex()
-    aggregates: dict[tuple[str, str], dict[str, Any]] = {}
+    aggregates: dict[tuple[str, str, str, str], dict[str, Any]] = {}
     warnings: list[str] = []
     review_details: list[str] = []
     small_receipt_count = 0
@@ -854,7 +1202,18 @@ def load_order_aggregates(
                 if not merchant_spec_code:
                     export_record = product_exports.resolve(product_id, style_id)
                     merchant_spec_code = text(export_record.get("商品SKU"))
-                if not merchant_spec_code and style_id in template_styles:
+                if not merchant_spec_code and marketing_rows is not None:
+                    preliminary_marketing = resolve_marketing_fields(
+                        marketing_rows,
+                        style_id=style_id,
+                        product_id=product_id,
+                        shop=shop,
+                        sku="",
+                    )
+                    merchant_spec_code = text(
+                        preliminary_marketing.values.get("商品SKU")
+                    )
+                elif not merchant_spec_code and style_id in template_styles:
                     merchant_spec_code = text(template_styles[style_id].get("商品SKU"))
                 if not style_id:
                     continue
@@ -908,6 +1267,8 @@ def load_order_aggregates(
                     template_products,
                     template_styles,
                     cost_by_merchant_code,
+                    shop,
+                    marketing_rows,
                 )
                 if quantity > 0.0 and unit_cost is None:
                     missing_cost_rows.add((date, shop, product_id, style_id, merchant_spec_code))
@@ -918,6 +1279,8 @@ def load_order_aggregates(
                         merchant_spec_code,
                         template_products,
                         template_styles,
+                        shop,
+                        marketing_rows,
                     )
                     cost_reason = below_cost_review_reason(
                         number(actual_receipt),
@@ -940,7 +1303,7 @@ def load_order_aggregates(
                     review_details.append(detail)
                     if small_receipt_action == "exclude":
                         continue
-                key = (date, style_id)
+                key = (date, shop, product_id, style_id)
                 current = aggregates.setdefault(
                     key,
                     {
@@ -993,7 +1356,7 @@ def promo_date_from_filename(path: Path) -> str:
 
 def load_promo_costs(
     root: Path, target_dates: set[str]
-) -> tuple[dict[tuple[str, str], float], list[str]]:
+) -> tuple[dict[tuple[str, str, str], float], list[str]]:
     warnings: list[str] = []
     snapshot_rows: list[PromotionSnapshotRow] = []
     try:
@@ -1107,10 +1470,17 @@ def load_promo_costs(
                     )
                 if date not in target_dates:
                     continue
+                source_shop = (text(row.get(shop_col)) if shop_col else "") or path_shop
+                if not source_shop:
+                    raise ReportError(
+                        "拼多多推广行有非零花费但店铺名称缺失，无法按店铺隔离，已停止："
+                        f"文件={path}，工作表={sheet.sheet_name}，行={row_number}，"
+                        f"日期={date}，商品ID={product_id}，花费={amount:.2f}。"
+                    )
                 snapshot_rows.append(
                     PromotionSnapshotRow(
                         platform="拼多多",
-                        shop=text(row.get(shop_col)) if shop_col else path_shop,
+                        shop=source_shop,
                         promotion_type="拼多多推广费",
                         date=date,
                         product_id=product_id,
@@ -1119,7 +1489,7 @@ def load_promo_costs(
                     )
                 )
     try:
-        costs, snapshot_warnings = select_latest_snapshots(snapshot_rows)
+        costs, snapshot_warnings = select_latest_snapshots(snapshot_rows, include_shop=True)
     except PromotionProtectionError as exc:
         raise ReportError(str(exc)) from exc
     warnings.extend(snapshot_warnings)
@@ -1131,14 +1501,41 @@ def enrich_row(
     template_products: dict[tuple[str, str], dict[str, Any]],
     template_styles: dict[str, dict[str, Any]],
     product_exports: ProductExportIndex,
+    marketing_rows: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     product_id = text(row.get("商品ID"))
     order_sku = text(row.get("商品SKU"))
+    order_shop = text(row.get("店铺名称"))
     style_id = text(row.get("样式ID") or row.get("SKU ID"))
     export = product_exports.resolve(product_id, style_id)
     if not style_id:
         style_id = text(export.get("SKU ID"))
-    if not style_id:
+    provisional_sku = order_sku or text(export.get("商品SKU"))
+    if marketing_rows is not None and not style_id and not provisional_sku:
+        product_candidates = [
+            candidate
+            for candidate in marketing_rows
+            if text(candidate.get("商品ID")) == product_id
+        ]
+        same_shop_candidates = [
+            candidate
+            for candidate in product_candidates
+            if order_shop
+            and normalize_match_code(candidate.get("店铺名称"))
+            == normalize_match_code(order_shop)
+        ]
+        candidates = same_shop_candidates or product_candidates
+        specifications = {
+            (
+                text(candidate.get("样式ID")),
+                text(candidate.get("商品SKU")),
+            )
+            for candidate in candidates
+            if text(candidate.get("样式ID")) or text(candidate.get("商品SKU"))
+        }
+        if len(specifications) == 1:
+            style_id, provisional_sku = next(iter(specifications))
+    if not style_id and marketing_rows is None:
         marketing_style_ids = {
             candidate_style_id
             for candidate_style_id, value in template_styles.items()
@@ -1146,52 +1543,79 @@ def enrich_row(
         }
         if len(marketing_style_ids) == 1:
             style_id = next(iter(marketing_style_ids))
-    style_base = template_styles.get(style_id)
-    product_base = template_products.get((product_id, order_sku)) or next(
-        (value for (pid, _sku), value in template_products.items() if pid == product_id),
-        {},
-    )
-    if style_base:
-        base = style_base
+
+    if marketing_rows is not None:
+        marketing_resolution = resolve_marketing_fields(
+            marketing_rows,
+            style_id=style_id,
+            product_id=product_id,
+            shop=order_shop,
+            sku=provisional_sku,
+        )
+        resolved_sku = text(marketing_resolution.values.get("商品SKU"))
+        final_sku = provisional_sku or resolved_sku
+        if final_sku and normalize_match_code(final_sku) != normalize_match_code(provisional_sku):
+            marketing_resolution = resolve_marketing_fields(
+                marketing_rows,
+                style_id=style_id,
+                product_id=product_id,
+                shop=order_shop,
+                sku=final_sku,
+            )
+        base = dict(marketing_resolution.values)
     else:
-        base = product_base
-    style_sku = text(style_base.get("商品SKU")) if style_base else ""
-    marketing_skus = {
-        text(value.get("商品SKU"))
-        for (candidate_product_id, _sku), value in template_products.items()
-        if candidate_product_id == product_id and text(value.get("商品SKU"))
-    }
-    unique_marketing_sku = next(iter(marketing_skus)) if len(marketing_skus) == 1 else ""
+        style_base = template_styles.get(style_id)
+        product_base = template_products.get((product_id, order_sku)) or next(
+            (value for (pid, _sku), value in template_products.items() if pid == product_id),
+            {},
+        )
+        base = style_base or product_base
+        marketing_resolution = MarketingResolution(dict(base), {}, ())
+        style_sku = text(style_base.get("商品SKU")) if style_base else ""
+        marketing_skus = {
+            text(value.get("商品SKU"))
+            for (candidate_product_id, _sku), value in template_products.items()
+            if candidate_product_id == product_id and text(value.get("商品SKU"))
+        }
+        unique_marketing_sku = next(iter(marketing_skus)) if len(marketing_skus) == 1 else ""
+        final_sku = provisional_sku or style_sku or unique_marketing_sku
+
     result = dict(base)
     result.update({k: v for k, v in export.items() if v and not result.get(k)})
-    result.update(row)
+    for field, value in row.items():
+        if field in {"商品ID", "店铺名称", "商品SKU", "商家编码-规格维度"}:
+            if text(value):
+                result[field] = value
+        else:
+            result[field] = value
     result["样式ID"] = style_id
     result["SKU ID"] = style_id
-    final_sku = (
-        order_sku
-        or text(export.get("商品SKU"))
-        or style_sku
-        or unique_marketing_sku
-    )
+    result["商品ID"] = product_id
+    result["店铺名称"] = order_shop
     result["商品SKU"] = final_sku
     result["商家编码-规格维度"] = final_sku
     if not result.get("平台"):
         result["平台"] = "拼多多"
+    result["_营销字段来源"] = marketing_resolution.sources
+    result["_营销匹配冲突"] = marketing_resolution.conflicts
     return result
 
 
 def build_empty_burn_promotion_row(
     date: str,
+    shop: str,
     product_id: str,
     promotion_fee: float,
     template_products: dict[tuple[str, str], dict[str, Any]],
     template_styles: dict[str, dict[str, Any]],
     product_exports: ProductExportIndex,
+    marketing_rows: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Build a product-level row for promotion spend with no effective sales."""
     row = enrich_row(
         {
             "日期": date,
+            "店铺名称": shop,
             "商品ID": product_id,
             "实际成交数量（去退款去补单后）": 0.0,
             "实际成交金额（去退款去补单后）": 0.0,
@@ -1199,26 +1623,52 @@ def build_empty_burn_promotion_row(
         template_products,
         template_styles,
         product_exports,
+        marketing_rows,
     )
     # Promotion exports are product-level.  Do not falsely attribute spend to
     # one SKU when the marketing table contains multiple SKUs for the product.
-    marketing_skus = {
-        text(value.get("商品SKU"))
-        for (candidate_product_id, _sku), value in template_products.items()
-        if candidate_product_id == product_id and text(value.get("商品SKU"))
-    }
-    product_style_ids = {
-        style_id
-        for style_id, value in template_styles.items()
-        if text(value.get("商品ID")) == product_id
-    }
+    if marketing_rows is not None:
+        product_candidates = [
+            candidate
+            for candidate in marketing_rows
+            if text(candidate.get("商品ID")) == product_id
+        ]
+        same_shop_candidates = [
+            candidate
+            for candidate in product_candidates
+            if shop
+            and normalize_match_code(candidate.get("店铺名称"))
+            == normalize_match_code(shop)
+        ]
+        specification_candidates = same_shop_candidates or product_candidates
+        marketing_skus = {
+            text(value.get("商品SKU"))
+            for value in specification_candidates
+            if text(value.get("商品SKU"))
+        }
+        product_style_ids = {
+            text(value.get("样式ID"))
+            for value in specification_candidates
+            if text(value.get("样式ID"))
+        }
+    else:
+        marketing_skus = {
+            text(value.get("商品SKU"))
+            for (candidate_product_id, _sku), value in template_products.items()
+            if candidate_product_id == product_id and text(value.get("商品SKU"))
+        }
+        product_style_ids = {
+            style_id
+            for style_id, value in template_styles.items()
+            if text(value.get("商品ID")) == product_id
+        }
     if len(marketing_skus) > 1 or len(product_style_ids) > 1 or product_exports.sku_count(product_id) > 1:
-        row["SKU ID"] = ""
-        row["商品SKU"] = ""
-        row["商家编码-规格维度"] = ""
+        row["SKU ID"] = MULTI_SPEC_VALUE
+        row["商品SKU"] = MULTI_SPEC_VALUE
+        row["商家编码-规格维度"] = MULTI_SPEC_VALUE
     row.update(
         {
-            "到手价": "",
+            "到手价": EMPTY_BURN_ARRIVAL_PRICE,
             "每单补贴金额": "",
             "总补贴金额": "",
             "净销售额（实际成交+总补贴金额）": 0.0,
@@ -1229,7 +1679,11 @@ def build_empty_burn_promotion_row(
             "平摊管理费用": 0.0,
             "净利润": -promotion_fee,
             "定价是否合理": "建议缩减推广",
-            "备注": "空烧推广费：无有效销售",
+            "备注": (
+                "空烧推广费：无有效销售；多规格未唯一匹配"
+                if row.get("商品SKU") == MULTI_SPEC_VALUE
+                else "空烧推广费：无有效销售"
+            ),
         }
     )
     return row
@@ -1262,13 +1716,17 @@ def build_report(
         template_styles,
         cost_by_merchant_code,
         product_exports,
+        marketing_rows,
     )
     promo_costs, promo_warnings = load_promo_costs(database_root, target_dates)
-    product_sales: dict[tuple[str, str], float] = defaultdict(float)
+    product_sales: dict[tuple[str, str, str], float] = defaultdict(float)
     for aggregate in order_rows.values():
         date = text(aggregate.get("日期"))
+        shop = text(aggregate.get("店铺名称"))
         product_id = text(aggregate.get("商品ID"))
-        product_sales[(date, product_id)] += number(aggregate.get("实际成交金额（去退款去补单后）"))
+        product_sales[(date, shop, product_id)] += number(
+            aggregate.get("实际成交金额（去退款去补单后）")
+        )
 
     empty_burn_promo_costs = {
         key: promo_total
@@ -1283,13 +1741,21 @@ def build_report(
     arrival_price_warnings: list[str] = []
     cost_data_warnings: list[str] = []
     cost_specification_conflicts: set[str] = set()
+    marketing_match_conflicts: set[str] = set()
     cost_source_logs: list[dict[str, str]] = []
     for key, aggregate in order_rows.items():
-        date, _style_id = key
+        date = text(aggregate.get("日期"))
         style_id = text(aggregate.get("样式ID"))
         if style_id and style_id not in template_styles:
             unmatched_styles[style_id] = text(aggregate.get("商品ID"))
-        row = enrich_row(aggregate, template_products, template_styles, product_exports)
+        row = enrich_row(
+            aggregate,
+            template_products,
+            template_styles,
+            product_exports,
+            marketing_rows,
+        )
+        marketing_match_conflicts.update(row.get("_营销匹配冲突", ()))
         qty = number(row.get("实际成交数量（去退款去补单后）"))
         amount = number(row.get("实际成交金额（去退款去补单后）"))
         has_subsidy = is_subsidy_activity(row)
@@ -1305,14 +1771,16 @@ def build_report(
         marketing_cost = row.get("产品成本", "")
         style_id = text(row.get("样式ID"))
         product_id = text(row.get("商品ID"))
-        cost_resolution = resolve_final_cost(
-            style_id=style_id,
-            product_id=product_id,
-            final_order_sku=merchant_spec_code,
-            cost_by_merchant_code=cost_by_merchant_code,
-            template_products=template_products,
-            template_styles=template_styles,
-            marketing_source_prefix=f"营销活动表:{marketing_path.name}",
+        marketing_resolution = MarketingResolution(
+            {field: row.get(field, "") for field in MARKETING_OUTPUT_FIELDS},
+            dict(row.get("_营销字段来源", {})),
+            tuple(row.get("_营销匹配冲突", ())),
+        )
+        cost_resolution = resolve_pdd_cost(
+            row,
+            marketing_resolution,
+            cost_by_merchant_code,
+            marketing_path,
         )
         cost_record = cost_resolution.cost_record
         if cost_resolution.cost is not None:
@@ -1331,6 +1799,21 @@ def build_report(
                 )
             if merchant_spec_code:
                 unmatched_cost_merchant_codes.add(merchant_spec_code)
+        if (
+            cost_resolution.marketing_cost is not None
+            and cost_resolution.table_cost is not None
+            and cost_resolution.source == cost_resolution.marketing_source
+        ):
+            cost_data_warnings.append(
+                "营销成本覆盖成本表旧成本；"
+                f"日期={date}，店铺={text(row.get('店铺名称')) or '未提供'}，"
+                f"商品ID={product_id or '未提供'}，样式ID={style_id or '未提供'}，"
+                f"商品SKU={merchant_spec_code or '未提供'}，"
+                f"营销来源={cost_resolution.marketing_source}，"
+                f"营销成本={cost_resolution.marketing_cost:.2f}，"
+                f"成本表成本={cost_resolution.table_cost:.2f}，"
+                f"差异={cost_resolution.cost_difference or 0.0:.2f}"
+            )
         for field in COST_METADATA_FIELDS:
             row[field] = cost_record.get(field, "")
         has_cost = text(row.get("产品成本")) != ""
@@ -1346,10 +1829,27 @@ def build_report(
                 order_spec_code=merchant_spec_code,
                 cost=row.get("产品成本"),
                 source=selected_cost_source,
+                marketing_source=cost_resolution.marketing_source,
+                marketing_cost=(
+                    cost_resolution.marketing_cost
+                    if cost_resolution.marketing_cost is not None
+                    else ""
+                ),
+                table_cost=(
+                    cost_resolution.table_cost
+                    if cost_resolution.table_cost is not None
+                    else ""
+                ),
+                cost_difference=(
+                    cost_resolution.cost_difference
+                    if cost_resolution.cost_difference is not None
+                    else ""
+                ),
             )
         )
-        promo_total = promo_costs.get((date, product_id), 0.0)
-        product_amount = product_sales.get((date, product_id), 0.0)
+        shop = text(row.get("店铺名称"))
+        promo_total = promo_costs.get((date, shop, product_id), 0.0)
+        product_amount = product_sales.get((date, shop, product_id), 0.0)
         row["到手价"], arrival_price_warning = resolve_arrival_price(
             row.get(EXPECTED_UNIT_RECEIPT_COLUMN, ""), amount, qty, date, style_id, product_id
         )
@@ -1383,18 +1883,42 @@ def build_report(
                 row["定价是否合理"] = "建议缩减推广"
             else:
                 row["定价是否合理"] = "合理"
+        cost_data_warnings.extend(finalize_marketing_display_fields(row))
         output_rows.append({column: row.get(column, "") for column in columns})
 
     empty_burn_rows: list[dict[str, Any]] = []
     empty_burn_warnings: list[str] = []
-    for (date, product_id), promotion_fee in sorted(empty_burn_promo_costs.items()):
+    for (date, shop, product_id), promotion_fee in sorted(empty_burn_promo_costs.items()):
         empty_burn_row = build_empty_burn_promotion_row(
             date,
+            shop,
             product_id,
             promotion_fee,
             template_products,
             template_styles,
             product_exports,
+            marketing_rows,
+        )
+        marketing_match_conflicts.update(empty_burn_row.get("_营销匹配冲突", ()))
+        empty_burn_marketing_resolution = MarketingResolution(
+            {field: empty_burn_row.get(field, "") for field in MARKETING_OUTPUT_FIELDS},
+            dict(empty_burn_row.get("_营销字段来源", {})),
+            tuple(empty_burn_row.get("_营销匹配冲突", ())),
+        )
+        empty_burn_cost_resolution = resolve_pdd_cost(
+            empty_burn_row,
+            empty_burn_marketing_resolution,
+            cost_by_merchant_code,
+            marketing_path,
+        )
+        if empty_burn_cost_resolution.cost is not None:
+            empty_burn_row["产品成本"] = empty_burn_cost_resolution.cost
+        else:
+            empty_burn_row["产品成本"] = ""
+        for field in COST_METADATA_FIELDS:
+            empty_burn_row[field] = empty_burn_cost_resolution.cost_record.get(field, "")
+        cost_data_warnings.extend(
+            finalize_marketing_display_fields(empty_burn_row, empty_burn=True)
         )
         empty_burn_rows.append({column: empty_burn_row.get(column, "") for column in columns})
         empty_burn_cost = empty_burn_row.get("产品成本", "")
@@ -1408,27 +1932,37 @@ def build_report(
                 style_id=text(empty_burn_row.get("SKU ID")),
                 order_spec_code=text(empty_burn_row.get("商品SKU")),
                 cost=empty_burn_cost,
-                source=(
-                    f"营销活动表:{marketing_path.name}/"
-                    + marketing_cost_source(
-                        "",
-                        product_id,
-                        text(empty_burn_row.get("商品SKU")),
-                        template_products,
-                        template_styles,
-                    )
-                    if text(empty_burn_cost)
-                    else "未匹配"
+                source=empty_burn_cost_resolution.source,
+                marketing_source=empty_burn_cost_resolution.marketing_source,
+                marketing_cost=(
+                    empty_burn_cost_resolution.marketing_cost
+                    if empty_burn_cost_resolution.marketing_cost is not None
+                    else ""
+                ),
+                table_cost=(
+                    empty_burn_cost_resolution.table_cost
+                    if empty_burn_cost_resolution.table_cost is not None
+                    else ""
+                ),
+                cost_difference=(
+                    empty_burn_cost_resolution.cost_difference
+                    if empty_burn_cost_resolution.cost_difference is not None
+                    else ""
                 ),
             )
         )
         empty_burn_warnings.append(
-            f"空烧推广费已写入报表,无有效销售,{date},{product_id},{promotion_fee:.2f}"
+            f"空烧推广费已写入报表,无有效销售,{date},{shop},{product_id},{promotion_fee:.2f}"
         )
 
     output_rows = order_output_rows(output_rows, empty_burn_rows)
     try:
-        reconcile_promotion_costs(promo_costs, output_rows, "拼多多")
+        reconcile_promotion_costs(
+            promo_costs,
+            output_rows,
+            "拼多多",
+            key_fields=("日期", "店铺名称", "商品ID"),
+        )
     except PromotionProtectionError as exc:
         raise ReportError(str(exc)) from exc
     warnings = (
@@ -1440,6 +1974,7 @@ def build_report(
         + arrival_price_warnings
         + cost_data_warnings
         + sorted(cost_specification_conflicts)
+        + sorted(marketing_match_conflicts)
         + empty_burn_warnings
     )
     for product_id in sorted(negative_gross_missing_price_product_ids):

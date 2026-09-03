@@ -200,14 +200,16 @@ def deduplicate_exact_files(
 
 def select_latest_snapshots(
     rows: Iterable[PromotionSnapshotRow],
-) -> tuple[dict[tuple[str, str], float], list[str]]:
+    *,
+    include_shop: bool = False,
+) -> tuple[dict[tuple[str, ...], float], list[str]]:
     per_source: dict[
         tuple[str, str, str, str, str], dict[Path, float]
     ] = defaultdict(lambda: defaultdict(float))
     for row in rows:
         per_source[row.business_key][row.source_path] += row.amount
 
-    costs: dict[tuple[str, str], float] = defaultdict(float)
+    costs: dict[tuple[str, ...], float] = defaultdict(float)
     warnings: list[str] = []
     for business_key, source_amounts in per_source.items():
         platform, shop, promotion_type, date, product_id = business_key
@@ -231,7 +233,8 @@ def select_latest_snapshots(
                 f"日期={date},商品ID={product_id},保留={selected_path},忽略="
                 + "|".join(str(path) for path in sorted(ignored))
             )
-        costs[(date, product_id)] += amount
+        output_key = (date, shop, product_id) if include_shop else (date, product_id)
+        costs[output_key] += amount
     return dict(costs), warnings
 
 
@@ -264,32 +267,39 @@ def _number(value: Any) -> float:
 
 
 def reconcile_promotion_costs(
-    expected_costs: dict[tuple[str, str], float],
+    expected_costs: dict[tuple[str, ...], float],
     output_rows: Iterable[dict[str, Any]],
     platform: str,
     tolerance: float = RECONCILIATION_TOLERANCE,
+    key_fields: tuple[str, ...] = ("日期", "商品ID"),
 ) -> tuple[float, float]:
-    actual_costs: dict[tuple[str, str], float] = defaultdict(float)
+    actual_costs: dict[tuple[str, ...], float] = defaultdict(float)
     for row in output_rows:
         amount = _number(row.get("推广费用"))
         if abs(amount) <= 1e-12:
             continue
-        date = _text(row.get("日期"))
-        product_id = _text(row.get("商品ID"))
-        if not date or not product_id:
-            raise PromotionProtectionError(
-                f"{platform}推广费对账失败：输出行有推广费但缺少日期或商品ID，推广费={amount:.2f}。"
+        key = tuple(_text(row.get(field)) for field in key_fields)
+        if any(not value for value in key):
+            missing_fields = "、".join(
+                field for field, value in zip(key_fields, key) if not value
             )
-        actual_costs[(date, product_id)] += amount
+            raise PromotionProtectionError(
+                f"{platform}推广费对账失败：输出行有推广费但缺少{missing_fields}，"
+                f"推广费={amount:.2f}。"
+            )
+        actual_costs[key] += amount
 
     mismatches: list[str] = []
-    for date, product_id in sorted(set(expected_costs) | set(actual_costs)):
-        expected = expected_costs.get((date, product_id), 0.0)
-        actual = actual_costs.get((date, product_id), 0.0)
+    for key in sorted(set(expected_costs) | set(actual_costs)):
+        expected = expected_costs.get(key, 0.0)
+        actual = actual_costs.get(key, 0.0)
         difference = actual - expected
         if abs(difference) > tolerance + 1e-9:
+            identity = "，".join(
+                f"{field}={value}" for field, value in zip(key_fields, key)
+            )
             mismatches.append(
-                f"日期={date}，商品ID={product_id}，导入={expected:.2f}，输出={actual:.2f}，差额={difference:.2f}"
+                f"{identity}，导入={expected:.2f}，输出={actual:.2f}，差额={difference:.2f}"
             )
 
     expected_total = sum(expected_costs.values())

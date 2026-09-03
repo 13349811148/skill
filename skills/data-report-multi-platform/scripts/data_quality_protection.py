@@ -20,6 +20,10 @@ COST_SOURCE_LOG_COLUMNS = (
     "订单规格编码",
     "产品成本",
     "成本来源",
+    "营销成本来源",
+    "营销成本",
+    "成本表成本",
+    "成本差异（营销-成本表）",
 )
 COST_TABLE_CODE_CANDIDATES = (
     "商家编码-规格维度",
@@ -393,6 +397,10 @@ def cost_source_log(
     order_spec_code: str,
     cost: Any,
     source: str,
+    marketing_source: str = "",
+    marketing_cost: Any = "",
+    table_cost: Any = "",
+    cost_difference: Any = "",
 ) -> dict[str, str]:
     return {
         "平台": platform,
@@ -404,4 +412,8 @@ def cost_source_log(
         "订单规格编码": order_spec_code or "未提供",
         "产品成本": text(cost) or "未匹配",
         "成本来源": source,
+        "营销成本来源": marketing_source,
+        "营销成本": text(marketing_cost),
+        "成本表成本": text(table_cost),
+        "成本差异（营销-成本表）": text(cost_difference),
     }
