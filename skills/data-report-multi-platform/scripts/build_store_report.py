@@ -8,12 +8,22 @@ import os
 import subprocess
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from decimal import Decimal, ROUND_HALF_UP
 
 SKILL = Path(__file__).resolve().parent.parent
 HEADERS = ['日期','平台','店铺','填报人','访客数','曝光次数','点击次数','支付金额','支付订单数','支付买家数','退款金额','退款订单数','新客数','老客数','老客数占比','客单价','支付转化率','净成交额','推广花费','推广成交额','推广ROI','推广费比','店铺评分','投诉差评数','今日主要动作','异常说明']
-DERIVED = {'客单价','支付转化率','净成交额','推广ROI','推广费比'}
-ALWAYS_BLANK = {'新客数','老客数','老客数占比','今日主要动作','异常说明'}
-ALIASES = {'店铺':['店铺','店铺名称','汇总_店铺名称'], '曝光次数':['推广曝光次数','推广曝光量'], '点击次数':['推广点击次数','推广点击量'], '推广成交额':['推广净成交额']}
+DERIVED = {'客单价','支付转化率','净成交额','推广ROI','推广费比','新客数','老客数'}
+ALWAYS_BLANK = {'今日主要动作','异常说明'}
+ALIASES = {'店铺':['店铺','店铺名称','汇总_店铺名称'], '曝光次数':['推广曝光次数','推广曝光量'], '点击次数':['推广点击次数','推广点击量'], '推广成交额':['推广净成交额'], '老客数占比':['老客数占比','老买家占比']}
+
+def estimate_customers(buyers, share):
+    """User-approved estimate. Keep the source share rather than re-deriving it."""
+    if buyers is None or share is None:return None,None
+    count=Decimal(str(buyers));ratio=Decimal(str(share))
+    if not count.is_finite() or count<0 or count!=count.to_integral_value():raise ValueError('支付买家数必须为非负整数')
+    if not ratio.is_finite() or not Decimal(0)<=ratio<=Decimal(1):raise ValueError('老客数占比必须在0到1之间')
+    old=int((count*ratio).quantize(Decimal('1'),rounding=ROUND_HALF_UP))
+    return int(count)-old,old
 
 def number(value):
     if value is None or str(value).strip() in ('','-','--','n.a.','待补'): return None
@@ -64,8 +74,9 @@ def build_payload(root, dates, sources=(), config=None):
         rank=source.stat().st_mtime_ns
         for field,aliases in fields.items():
             raw=next((record.get(a) for a in aliases if record.get(a) is not None and str(record.get(a)).strip()),None)
-            value=number(raw)
+            value=number(str(Decimal(str(raw).strip().rstrip('%'))/100)) if field=='老客数占比' and raw is not None and str(raw).strip().endswith('%') else number(raw)
             if value is None:continue
+            if field=='老客数占比' and value>1:raise ValueError(f'{source}: 老客数占比必须在0到1之间')
             if field in {'访客数','曝光次数','点击次数','支付订单数','支付买家数','退款订单数','投诉差评数'} and int(value)!=value:
                 raise ValueError(f'{source}: {field}不是整数')
             slot=(*key,field)
@@ -93,7 +104,7 @@ def build_payload(root, dates, sources=(), config=None):
             if not canonical:
                 logs.append({'source':str(path),'message':'后台店名未确认映射，未与订单/推广合并'});continue
             for record in records(path):
-                insert(record,path,{'访客数':['店铺访客数（人）','店铺访客数','访客数'],'支付金额':['成交金额（元）'],'支付订单数':['订单数'],'支付买家数':['成交买家数'],'退款金额':['退款金额（元）'],'退款订单数':['退款单数'],'店铺评分':['综合体验星级'],'投诉差评数':['新增差评（条）']},'拼多多',canonical)
+                insert(record,path,{'访客数':['店铺访客数（人）','店铺访客数','访客数'],'支付金额':['成交金额（元）'],'支付订单数':['订单数'],'支付买家数':['成交买家数'],'老客数占比':['老买家占比'],'退款金额':['退款金额（元）'],'退款订单数':['退款单数'],'店铺评分':['综合体验星级'],'投诉差评数':['新增差评（条）']},'拼多多',canonical)
                 try:dt=day(record.get('日期'))
                 except (ValueError,TypeError):continue
                 if dt not in dates:continue
@@ -106,7 +117,7 @@ def build_payload(root, dates, sources=(), config=None):
                     if path.stat().st_mtime_ns>=old:
                         rows[key]['_后台支付转化率']=rate;rows[key]['_后台转化率来源时间']=path.stat().st_mtime_ns
                         evidence['|'.join((*key,'支付转化率'))]=str(path)+'（后台原始转化率，访客缺失时使用；不反推访客）'
-            logs.append({'source':str(path),'message':'后台日成交金额/订单数/买家数对应未扣退款支付口径；退款采用后台当日退款指标；评分=综合体验星级，投诉差评列仅填新增差评（1至3星，不含默认评价）；新老买家为整理器推算，仍留空。'})
+            logs.append({'source':str(path),'message':'后台日成交金额/订单数/买家数对应未扣退款支付口径；退款采用后台当日退款指标；评分=综合体验星级，投诉差评列仅填新增差评（1至3星，不含默认评价）；老客占比取后台原值，新老买家人数按用户确认规则重新推算。'})
     # Account daily exports contain total promotion metrics, without a product ID.
     for folder in ['4.推广数据库','推广数据']:
         if not (root/folder).exists():continue
@@ -129,6 +140,12 @@ def build_payload(root, dates, sources=(), config=None):
             row=rows.setdefault(key,{h:None for h in HEADERS});row.update(zip(HEADERS[:3],key));row['填报人']=config.get('reporters',{}).get(shop['店铺'])
     for row in rows.values():
         for field in ALWAYS_BLANK:row[field]=None
+        row['新客数'],row['老客数']=estimate_customers(row.get('支付买家数'),row.get('老客数占比'))
+        if row['老客数'] is not None:
+            key=(row['日期'],row['平台'],row['店铺'])
+            for field in ['新客数','老客数']:
+                evidence['|'.join((*key,field))]='推算值（用户确认）：老客数=ROUND(支付买家数×后台老买家占比,0)，新客数=支付买家数−老客数；原始比例来源='+evidence.get('|'.join((*key,'老客数占比')),'未知')
+            logs.append({'date':row['日期'],'shop':row['店铺'],'message':f'新老客人数为推算值（用户已确认）；支付买家数={row["支付买家数"]}，后台老客占比={row["老客数占比"]}，新客数={row["新客数"]}，老客数={row["老客数"]}；占比保留原值，不用取整后人数反算。'})
         visitors=row.get('访客数');buyers=row.get('支付买家数');raw_rate=row.get('_后台支付转化率')
         if visitors is not None and buyers is not None and visitors>0 and raw_rate is not None:
             calculated=buyers/visitors

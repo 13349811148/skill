@@ -14,6 +14,8 @@ if(n){
  for(let i=4;i<=n+3;i++){
   const rawRate=payload.rows[i-4]._后台支付转化率;
   const form={
+   M:`=IF(COUNT(J${i},O${i})=2,IF(AND(J${i}>=0,O${i}>=0,O${i}<=1),J${i}-ROUND(J${i}*O${i},0),""),"")`,
+   N:`=IF(COUNT(J${i},O${i})=2,IF(AND(J${i}>=0,O${i}>=0,O${i}<=1),ROUND(J${i}*O${i},0),""),"")`,
    P:`=IF(COUNT(H${i},I${i})=2,IF(I${i}>0,H${i}/I${i},""),"")`,
    Q:`=IF(COUNT(J${i},E${i})=2,IF(E${i}>0,J${i}/E${i},""),${typeof rawRate==='number'?rawRate:'""'})`,
    R:`=IF(COUNT(H${i},K${i})=2,H${i}-K${i},"")`,
@@ -23,7 +25,8 @@ if(n){
   for(const [c,f] of Object.entries(form))sheet.getRange(`${c}${i}`).formulas=[[f]];
  }
  sheet.getRange(`A4:A${n+3}`).setNumberFormat('yyyy-mm-dd');
- for(const c of ['Q','V'])sheet.getRange(`${c}4:${c}${n+3}`).setNumberFormat('0.00%');
+ for(const c of ['O','Q','V'])sheet.getRange(`${c}4:${c}${n+3}`).setNumberFormat('0.00%');
+ sheet.getRange(`M4:N${n+3}`).setNumberFormat('#,##0');
  for(const c of ['H','K','P','R','S','T','U'])sheet.getRange(`${c}4:${c}${n+3}`).setNumberFormat('#,##0.00');
 }
 sheet.getRange('A2').values=[['口径：支付日原始支付金额；退款按实际退款日；曝光/点击仅推广；ROI=全店净成交额÷推广花费；费比=推广花费÷全店净成交额。缺失及负净成交比率留空，详见独立日志。']];

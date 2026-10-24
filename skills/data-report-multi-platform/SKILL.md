@@ -131,3 +131,7 @@ When the author gate cannot verify all three conditions or returns `PUBLISH_BLOC
 ## 本周数据及V3读取（本地2026-10-24补充）
 
 商品与店铺日报均使用V3数据库；店铺扩展以references/store_report_rules.md末尾的补齐数据接入规则为准。用户已授权成本/营销缺失时先输出已知字段，可在入口增加`--allow-missing-reference`。默认仍严格校验；不隐藏未知字段，不伪造利润。商品推广实际和托管分摊必须分开核算。本周默认周一至昨日完整日。
+
+## 新老客列补齐（2026-10-24用户确认）
+
+店铺日报现填写新客数、老客数及后台老客占比。新老人数按已确认的ROUND规则推算，原始占比不反算覆盖；具体规则见references/store_report_rules.md末尾。

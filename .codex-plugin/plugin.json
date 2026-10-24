@@ -1,13 +1,19 @@
 {
   "name": "daily-report",
-  "version": "2026.10.24",
+  "version": "2026.10.24+customers.1",
   "description": "生成拼多多和天猫商品日报，并按平台日报模板额外输出店铺日报。支持V3后台流量与交易数据、商品推广实际花费和全店托管分摊核对。",
-  "skills": ["./skills/data-report-multi-platform"],
+  "skills": [
+    "./skills/data-report-multi-platform"
+  ],
   "repository": "https://github.com/13349811148/skill",
-  "author": {"name": "Chen Fei"},
+  "author": {
+    "name": "Chen Fei"
+  },
   "interface": {
     "displayName": "日报（商品＋店铺）",
     "shortDescription": "生成商品和店铺两份日报，核对推广费用及后台交易指标。",
-    "defaultPrompt": ["使用日报生成本周的商品日报和店铺日报。"]
+    "defaultPrompt": [
+      "使用日报生成本周的商品日报和店铺日报。"
+    ]
   }
 }

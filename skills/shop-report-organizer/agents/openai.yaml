@@ -1,4 +1,4 @@
 interface:
-  display_name: "数据整理 2026.10.24.105334"
+  display_name: "数据整理 2026.10.24.153234"
   short_description: "V2版：整理拼多多和天猫运营数据库报表"
   default_prompt: "使用 $shop-report-organizer 完成预览到正式整理的全流程；无阻塞时自动正式写入，有阻塞时明确实际写入为零，并分别汇报营销活动表新增、更新、未变化、人工待补和备份路径。"
