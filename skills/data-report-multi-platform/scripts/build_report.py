@@ -8,6 +8,7 @@ from pathlib import Path
 
 import build_tmall_report
 import build_pdd_report
+from portable_reports import read_workbook_sheets
 from handoff_protection import find_header_row, is_excluded_order_path
 
 
@@ -33,6 +34,8 @@ def option_value(arguments: list[str], option: str, default: str) -> str:
 def detect_platforms(database_root: Path) -> set[str]:
     orders_dir = database_root / "订单数据"
     if not orders_dir.exists():
+        orders_dir = database_root / "2.订单数据库"
+    if not orders_dir.exists():
         return set()
 
     detected: set[str] = set()
@@ -45,7 +48,7 @@ def detect_platforms(database_root: Path) -> set[str]:
         ):
             continue
         try:
-            sheets = build_tmall_report.read_workbook_sheets(
+            sheets = read_workbook_sheets(
                 path, max_rows=20
             )
         except Exception:
@@ -67,7 +70,28 @@ def run_platform(platform: str, passthrough: list[str]) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Generate a Tmall or Pinduoduo operating report.")
     parser.add_argument("--platform", choices=[*sorted(PLATFORM_SCRIPTS), "both"])
+    parser.add_argument("--store-input", action="append", default=[], help="明确店铺日指标 CSV/XLSX，可重复")
+    parser.add_argument("--store-output", help="新增店铺维度日报路径")
+    parser.add_argument("--store-only", action="store_true", help="仅生成店铺维度，正常请求默认两种均输出")
     args, passthrough = parser.parse_known_args()
+    store_arguments = []
+    for option in ("--database-root", "--start-date", "--end-date", "--date"):
+        for index, value in enumerate(passthrough):
+            if value == option and index + 1 < len(passthrough):
+                store_arguments.extend([option, passthrough[index + 1]])
+            elif value.startswith(option + "="):
+                store_arguments.extend([option, value.split("=", 1)[1]])
+    if args.store_output:
+        store_arguments.extend(["--output", args.store_output])
+    elif option_value(passthrough, "--output", ""):
+        product_output = Path(option_value(passthrough, "--output", ""))
+        store_arguments.extend(["--output", str(product_output.with_name(product_output.stem + "_店铺维度.xlsx"))])
+    for source in args.store_input:
+        store_arguments.extend(["--input", source])
+    store_result = subprocess.run([sys.executable, str(SCRIPT_DIR / "build_store_report.py"), *store_arguments], check=False).returncode
+    if args.store_only:
+        return store_result
+
     if args.platform == "both":
         selected = ["tmall", "pdd"]
     elif args.platform:
@@ -80,7 +104,7 @@ def main() -> int:
             return 2
 
     results = [run_platform(platform, passthrough) for platform in selected]
-    return max(results, default=0)
+    return max([store_result, *results], default=0)
 
 
 if __name__ == "__main__":

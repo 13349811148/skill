@@ -31,6 +31,8 @@ DISPLAY_LABELS = {
     "shop-report-organizer": "数据整理",
 }
 PUBLISH_PATHS = (
+    ".agents/plugins",
+    ".codex-plugin",
     "release.json",
     "skills",
     "sync",

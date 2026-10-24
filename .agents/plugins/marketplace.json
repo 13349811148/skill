@@ -1,0 +1,12 @@
+{
+  "name": "chenfei-skills",
+  "interface": {"displayName": "陈飞经营数据工具"},
+  "plugins": [
+    {
+      "name": "daily-report",
+      "source": {"source": "local", "path": "./"},
+      "policy": {"installation": "AVAILABLE", "authentication": "ON_INSTALL"},
+      "category": "Productivity"
+    }
+  ]
+}

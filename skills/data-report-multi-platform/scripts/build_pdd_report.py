@@ -2128,6 +2128,7 @@ def main() -> int:
         default="confirm",
         help="小额实收或单件实收加有效补贴后仍低于成本超过10%%时的处理：confirm（先停止并等待确认）、include（计入）、exclude（不计入）。",
     )
+    parser.add_argument("--allow-missing-reference", action="store_true", help="用户授权缺成本/活动表时，输出已知字段并留空未知利润")
     args = parser.parse_args()
 
     database_root = Path(args.database_root)
@@ -2136,9 +2137,9 @@ def main() -> int:
     output_path = Path(args.output)
     if not database_root.exists():
         raise ReportError(f"Database root does not exist: {database_root}")
-    if not marketing_path.exists():
+    if not marketing_path.exists() and not args.allow_missing_reference:
         raise ReportError(f"营销活动表不存在: {marketing_path}")
-    if not cost_table_path.exists():
+    if not cost_table_path.exists() and not args.allow_missing_reference:
         raise ReportError(f"成本表不存在: {cost_table_path}")
 
     target_dates = requested_dates_from_args(args)
@@ -2173,6 +2174,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    from pdd_local_runtime import install
+    install(sys.modules[__name__])
     try:
         raise SystemExit(main())
     except ReportError as exc:

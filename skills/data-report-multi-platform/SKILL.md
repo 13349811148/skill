@@ -9,11 +9,17 @@ Use this Skill to generate separate reports for recognized platforms. Before cal
 
 ## Update Gate
 
-Before any business workflow, run the bundled `scripts/update-skills.ps1` exactly once for the current user request. Let the script infer the AI client home from this Skill's installed path. If the update succeeds or reports that the installed release is current, reread this `SKILL.md` from disk before continuing so the newest rules take effect. Do not run the update gate again after rereading during the same request. If the update check fails, keep the installed version, tell the user briefly, and continue with the current rules.
+This package includes the store-day extension. Read this installed SKILL.md before each request. Do not run the legacy two-skill updater automatically from a plugin cache: it does not update plugin installation metadata. Update a plugin through its marketplace, or a standalone skill through its installer. Keep local changes until an explicit update is requested.
 
-```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "<this-skill-directory>\scripts\update-skills.ps1"
-```
+## 店铺维度日报（本地扩展，2026-10-24）
+
+默认同时输出原商品维度日报及独立的店铺维度日报。先读 [店铺规则](references/store_report_rules.md)。店铺使用 `assets/store_daily_template.xlsx` 的“①平台日报”，26列表头、顺序及版式保持模板。店铺规则优先于模板内旧公式与文字；它不改变商品日报的订单/成本口径。店铺无需营销/成本表；商品日报受阻时仍可交付店铺已知字段并明确报告商品未生成。
+
+入口仍为 `scripts/build_report.py`，增加 `--store-input <店铺日指标.csv或xlsx>`（可重复）、`--store-output <店铺日报.xlsx>`。正常默认两种都输出；用户明确只要店铺时使用 `--store-only`。指定产品 `--output` 时店铺输出至同目录、后缀“_店铺维度.xlsx”。
+
+运行前整理店铺日原始数据到数据库的“店铺日报输入”目录，或通过 `--store-input` 传入。不要从商品日报的净成交结果反推店铺原始支付。按规则读取后台店铺概况、实际退款完成日、账户每日汇总；找不到可靠字段则留空并记录日志，不能填0或用同意退款时间代替实际退款日。标准输入映射和来源限制见店铺规则。自动读取有来源店铺元数据的“账户每日汇总”文件；不能叠加商品明细与账户汇总。
+
+此扩展已同时保存到本地插件源与当前加载缓存，避免本地刷新丢失；未修改上游 GitHub。
 
 ## Mandatory Execution Order
 
@@ -121,3 +127,7 @@ When the author gate cannot verify all three conditions or returns `PUBLISH_BLOC
 - `scripts/promotion_protection.py`: Shared promotion-backup gate, daily-date integrity, promotion-snapshot deduplication, and input-output reconciliation safeguards.
 - `scripts/update-skills.ps1`: Check the shared public GitHub repository and transactionally update both Skills before business work.
 - `references/template_columns.csv`: Shared output-column order.
+
+## 本周数据及V3读取（本地2026-10-24补充）
+
+商品与店铺日报均使用V3数据库；店铺扩展以references/store_report_rules.md末尾的补齐数据接入规则为准。用户已授权成本/营销缺失时先输出已知字段，可在入口增加`--allow-missing-reference`。默认仍严格校验；不隐藏未知字段，不伪造利润。商品推广实际和托管分摊必须分开核算。本周默认周一至昨日完整日。
