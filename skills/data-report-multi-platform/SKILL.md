@@ -23,6 +23,12 @@ This package includes the store-day extension. Read this installed SKILL.md befo
 
 ## Mandatory Execution Order
 
+### 商品日报生成后自动上传 WPS（2026-10-26）
+
+每次商品日报成功生成并完成数据与版式校验后，默认将本次商品 XLSX 上传到当前用户 WPS 在线文档的“我的云文档”，返回可打开的在线文档链接。执行前读取 [WPS 上传与登录续传](references/wps_upload.md)。这属于用户已要求的常规日报交付步骤，无需每次再次确认上传。仅店铺日报、生成失败、待确认异常订单及内部 JSON/日志/预览不触发上传；店铺日报不在此自动上传范围内。用户当次明确要求仅本地时遵从用户。
+
+登录、扫码、验证码交由用户操作；保留待上传文件与页面，用户完成后继续同一任务，不重算已完成的报表。上传异常与本地生成结果分别报告；不能把创建待上传记录或看到文件选择框当作已上传。入口会生成同名 `.wps-upload.json` 交接记录；代理必须执行浏览器上传及在线验证，Python 脚本自身不登录或上传。
+
 Follow this order exactly. Do not skip a step, run a platform builder directly, or report completion before the final check.
 
 1. Run the **Update Gate** and reread this file when the installed release is current or updated.
@@ -30,6 +36,7 @@ Follow this order exactly. Do not skip a step, run a platform builder directly, 
 3. Read and validate the marketing-activity and cost workbooks before calculation. Stop and report the specific issue if a required marketing workbook cannot be read or lacks valid matching records.
 4. Let the dispatcher run the internal platform builder. Do not invoke `build_tmall_report.py` or `build_pdd_report.py` as a separate user workflow.
 5. Verify that every requested platform report was created, required output fields have been checked, and all warnings have been written to the generation log and sent in the current Codex or Work Buddy conversation.
+6. 完成每个成功商品日报的 WPS 上传与在线验证，按 [WPS 上传与登录续传](references/wps_upload.md) 更新交接记录并交付链接；若登录或上传工具受阻，交付本地文件并准确报告待续传状态。
 
 ## Platform Routing
 

@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import subprocess
 import sys
 from pathlib import Path
+import time
+from wps_upload import prepare as prepare_wps_upload
 
 import build_tmall_report
 import build_pdd_report
@@ -63,8 +66,20 @@ def detect_platforms(database_root: Path) -> set[str]:
 
 def run_platform(platform: str, passthrough: list[str]) -> int:
     command = [sys.executable, str(PLATFORM_SCRIPTS[platform]), *passthrough]
+    started_ns = time.time_ns()
     print(f"开始生成{platform}报表")
-    return subprocess.run(command, check=False).returncode
+    result = subprocess.run(command, check=False).returncode
+    if result == 0:
+        module = build_tmall_report if platform == 'tmall' else build_pdd_report
+        report = Path(option_value(passthrough, '--output', str(module.DEFAULT_OUTPUT)))
+        try:
+            task = prepare_wps_upload(report, platform, started_ns)
+            print('WPS_UPLOAD_HANDOFF: ' + json.dumps(task, ensure_ascii=False), flush=True)
+            print('下一步必须读取 references/wps_upload.md，通过浏览器上传商品日报并验证在线链接；本地导出不等于上传成功。', flush=True)
+        except Exception as exc:
+            print(f'WPS 上传交接失败；本地商品日报保留: {exc}', file=sys.stderr)
+            return 1
+    return result
 
 
 def main() -> int:
