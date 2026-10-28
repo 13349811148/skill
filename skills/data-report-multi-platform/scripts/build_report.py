@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 import time
 from wps_upload import prepare as prepare_wps_upload
+from report_archive import requested_dates
 
 import build_tmall_report
 import build_pdd_report
@@ -65,6 +66,9 @@ def detect_platforms(database_root: Path) -> set[str]:
 
 
 def run_platform(platform: str, passthrough: list[str]) -> int:
+    if os.environ.get('DAILY_REPORT_ARCHIVE')=='1' and not option_value(passthrough,'--output',''):
+        name='商品日报_拼多多.xlsx' if platform=='pdd' else '商品日报_天猫.xlsx'
+        passthrough=[*passthrough,'--output',str(Path(os.environ['DAILY_REPORT_ARCHIVE_DIR'])/name)]
     command = [sys.executable, str(PLATFORM_SCRIPTS[platform]), *passthrough]
     started_ns = time.time_ns()
     print(f"开始生成{platform}报表")
@@ -88,8 +92,14 @@ def main() -> int:
     parser.add_argument("--store-input", action="append", default=[], help="明确店铺日指标 CSV/XLSX，可重复")
     parser.add_argument("--store-output", help="新增店铺维度日报路径")
     parser.add_argument("--store-only", action="store_true", help="仅生成店铺维度，正常请求默认两种均输出")
+    parser.add_argument('--archive-dir',type=Path,help='固定报表目录，默认运营数据库/数据报表输出')
     args, passthrough = parser.parse_known_args()
+    archive_root=args.archive_dir or Path(option_value(passthrough,'--database-root',str(DEFAULT_DATABASE_ROOT)))/'数据报表输出'
+    os.environ['DAILY_REPORT_ARCHIVE']='1'
+    os.environ['DAILY_REPORT_ARCHIVE_DIR']=str(archive_root)
+    os.environ['DAILY_REPORT_DATES']=json.dumps(sorted(requested_dates(passthrough)))
     store_arguments = []
+    store_arguments.extend(['--archive-dir',str(archive_root)])
     for option in ("--database-root", "--start-date", "--end-date", "--date"):
         for index, value in enumerate(passthrough):
             if value == option and index + 1 < len(passthrough):
@@ -98,9 +108,6 @@ def main() -> int:
                 store_arguments.extend([option, value.split("=", 1)[1]])
     if args.store_output:
         store_arguments.extend(["--output", args.store_output])
-    elif option_value(passthrough, "--output", ""):
-        product_output = Path(option_value(passthrough, "--output", ""))
-        store_arguments.extend(["--output", str(product_output.with_name(product_output.stem + "_店铺维度.xlsx"))])
     for source in args.store_input:
         store_arguments.extend(["--input", source])
     store_result = subprocess.run([sys.executable, str(SCRIPT_DIR / "build_store_report.py"), *store_arguments], check=False).returncode
@@ -118,6 +125,8 @@ def main() -> int:
             print("未识别到天猫或拼多多订单表，请检查订单数据目录和表头。", file=sys.stderr)
             return 2
 
+    if len(selected)>1 and option_value(passthrough,'--output',''):
+        parser.error('多平台须分别保存，不能共用一个--output；请用--archive-dir指定同一目录')
     results = [run_platform(platform, passthrough) for platform in selected]
     return max([store_result, *results], default=0)
 

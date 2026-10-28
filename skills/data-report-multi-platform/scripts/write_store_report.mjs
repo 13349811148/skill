@@ -3,10 +3,10 @@ import path from 'node:path';
 import {FileBlob,SpreadsheetFile} from './artifact_runtime.mjs';
 const [input,output]=process.argv.slice(2);
 const payload=JSON.parse(await fs.readFile(input,'utf8'));
-const wb=await SpreadsheetFile.importXlsx(await FileBlob.load(path.join(import.meta.dirname,'../assets/store_daily_template.xlsx')));
+const wb=await SpreadsheetFile.importXlsx(await FileBlob.load(payload.existingWorkbook||path.join(import.meta.dirname,'../assets/store_daily_template.xlsx')));
 const sheet=wb.worksheets.getItem('①平台日报');
 // The bundled asset contains only the requested sheet. Never export sample rows.
-const n=payload.rows.length,end=Math.max(33,n+3);
+const n=payload.rows.length,end=Math.max(33,n+3,(payload.oldRows||0)+3);
 sheet.getRange(`A4:Z${end}`).clear({applyTo:'contents'});
 if(n){
  for(let i=5;i<=n+3;i++)sheet.getRange(`A${i}:Z${i}`).copyFrom(sheet.getRange('A4:Z4'),'all');
@@ -29,7 +29,7 @@ if(n){
  sheet.getRange(`M4:N${n+3}`).setNumberFormat('#,##0');
  for(const c of ['H','K','P','R','S','T','U'])sheet.getRange(`${c}4:${c}${n+3}`).setNumberFormat('#,##0.00');
 }
-sheet.getRange('A2').values=[['口径：支付日原始支付金额；退款按实际退款日；曝光/点击仅推广；ROI=全店净成交额÷推广花费；费比=推广花费÷全店净成交额。缺失及负净成交比率留空，详见独立日志。']];
+sheet.getRange('A2').values=[[payload.report_note||'口径：支付日原始支付金额；退款按实际退款日；曝光/点击仅推广；ROI=全店净成交额÷推广花费；费比=推广花费÷全店净成交额。缺失及负净成交比率留空，详见独立日志。']];
 sheet.getRange('A2:Z2').format.wrapText=true;
 sheet.getRange('A2:Z2').format.rowHeight=42;
 // The configured shop's full name must remain readable in the template column.

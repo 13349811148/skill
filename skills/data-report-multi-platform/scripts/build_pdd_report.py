@@ -2082,6 +2082,10 @@ def write_log(path: Path, rows_count: int, warnings: list[str]) -> None:
 
 
 def write_cost_log(path: Path, cost_source_logs: list[dict[str, str]]) -> Path:
+    if os.environ.get('DAILY_REPORT_ARCHIVE')=='1':
+        import json
+        from report_archive import cost_log
+        return cost_log(path,COST_SOURCE_LOG_COLUMNS,cost_source_logs,set(json.loads(os.environ['DAILY_REPORT_DATES'])))
     log_path = path.with_name(path.stem + "_成本获取日志.csv")
     with log_path.open("w", encoding="utf-8-sig", newline="") as fh:
         writer = csv.DictWriter(fh, fieldnames=COST_SOURCE_LOG_COLUMNS)

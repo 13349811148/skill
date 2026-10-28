@@ -69,6 +69,11 @@ def install(module):
     module.discover_files=discover
     def write(path,columns,rows):
         path=Path(path);path.parent.mkdir(parents=True,exist_ok=True)
+        if os.environ.get('DAILY_REPORT_ARCHIVE')=='1':
+            from report_archive import product
+            dates=json.loads(os.environ['DAILY_REPORT_DATES'])
+            product(path,columns,rows,dates)
+            return
         data=path.with_suffix('.product.json');data.write_text(json.dumps({'columns':columns,'rows':rows},ensure_ascii=False,default=str),encoding='utf-8')
         deps=Path.home()/'.cache/codex-runtimes/codex-primary-runtime/dependencies'
         node=deps/('node/bin/node.exe' if os.name=='nt' else 'node/bin/node')

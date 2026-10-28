@@ -5,6 +5,10 @@ description: "Generate Chinese operating reports for Tmall and Pinduoduo from th
 
 # 日报V2版本（天猫+拼多多）
 
+## 固定报表保存（2026-10-28用户确认）
+
+默认不再按每次请求的日期新建交付文件。商品日报使用固定工作簿，每月新建一个 `YYYY-MM` 子表；店铺日报每月固定一个 XLSX 文件，月内各日累积在“①平台日报”。同一业务日期重跑要替换旧记录，不能重复追加或保留已消失的商品行。其他日期和月份保留。先读 [固定保存与历史迁移](references/report_archive.md)。本节覆盖下文旧的单次输出文件命名说明，计算口径、异常订单确认和推广核对保持原规则。
+
 Use this Skill to generate separate reports for recognized platforms. Before calculating, inspect every workbook sheet, including hidden sheets, and look for a valid order header in its first 20 rows. Recognize 天猫 from its order-date fields together with signals such as `宝贝ID`、`交易状态`、`子订单编号` or `主订单编号`; recognize 拼多多 from `样式ID`, an order date, and a distinct field such as `商家实收金额(元)`、`汇总_店铺名称`、`多多支付立减金额(元)` or `团ID`. Run the matching platform mode automatically. If both platforms are recognized, generate one report for each platform; never combine their orders into one workbook calculation. If no platform is recognized, report the unmatched files and ask for a valid export.
 
 ## Update Gate
@@ -15,7 +19,7 @@ This package includes the store-day extension. Read this installed SKILL.md befo
 
 默认同时输出原商品维度日报及独立的店铺维度日报。先读 [店铺规则](references/store_report_rules.md)。店铺使用 `assets/store_daily_template.xlsx` 的“①平台日报”，26列表头、顺序及版式保持模板。店铺规则优先于模板内旧公式与文字；它不改变商品日报的订单/成本口径。店铺无需营销/成本表；商品日报受阻时仍可交付店铺已知字段并明确报告商品未生成。
 
-入口仍为 `scripts/build_report.py`，增加 `--store-input <店铺日指标.csv或xlsx>`（可重复）、`--store-output <店铺日报.xlsx>`。正常默认两种都输出；用户明确只要店铺时使用 `--store-only`。指定产品 `--output` 时店铺输出至同目录、后缀“_店铺维度.xlsx”。
+入口仍为 `scripts/build_report.py`；正常默认更新两种固定报表。用户明确只要店铺时使用 `--store-only`。`--archive-dir` 统一指定固定报表目录；`--store-input <店铺日指标.csv或xlsx>` 可重复。`--output` 和 `--store-output` 仅在用户明确指定路径时使用，不能自动带上本次日期另建交付文件。
 
 运行前整理店铺日原始数据到数据库的“店铺日报输入”目录，或通过 `--store-input` 传入。不要从商品日报的净成交结果反推店铺原始支付。按规则读取后台店铺概况、实际退款完成日、账户每日汇总；找不到可靠字段则留空并记录日志，不能填0或用同意退款时间代替实际退款日。标准输入映射和来源限制见店铺规则。自动读取有来源店铺元数据的“账户每日汇总”文件；不能叠加商品明细与账户汇总。
 

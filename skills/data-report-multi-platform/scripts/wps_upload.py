@@ -38,6 +38,7 @@ def prepare(report, platform, generated_after_ns=0):
             'sha256': checksum, 'status': 'pending', 'destination': 'WPS 我的云文档',
             'url': None, 'message': '本地已生成，等待代理执行 WPS 浏览器上传并验证',
             'updated_at': datetime.now(timezone.utc).isoformat()}
+    data['previous_url']=previous.get('url') or previous.get('previous_url')
     save(path, data)
     return data
 

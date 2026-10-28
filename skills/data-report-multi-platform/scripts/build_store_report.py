@@ -104,12 +104,12 @@ def build_payload(root, dates, sources=(), config=None):
             if not canonical:
                 logs.append({'source':str(path),'message':'后台店名未确认映射，未与订单/推广合并'});continue
             for record in records(path):
-                insert(record,path,{'访客数':['店铺访客数（人）','店铺访客数','访客数'],'支付金额':['成交金额（元）'],'支付订单数':['订单数'],'支付买家数':['成交买家数'],'老客数占比':['老买家占比'],'退款金额':['退款金额（元）'],'退款订单数':['退款单数'],'店铺评分':['综合体验星级'],'投诉差评数':['新增差评（条）']},'拼多多',canonical)
+                insert(record,path,{'访客数':['店铺访客数（人）','店铺访客数','访客数'],'支付金额':['成交金额（元）'],'支付订单数':['订单数','成交订单数（单）'],'支付买家数':['成交买家数','成交买家数（人）'],'老客数占比':['老买家占比','成交老买家占比'],'退款金额':['退款金额（元）'],'退款订单数':['退款单数','退款单数（单）'],'店铺评分':['综合体验星级'],'投诉差评数':['新增差评（条）']},'拼多多',canonical)
                 try:dt=day(record.get('日期'))
                 except (ValueError,TypeError):continue
                 if dt not in dates:continue
                 key=(dt,'拼多多',canonical)
-                raw_rate=record.get('转化率')
+                raw_rate=record.get('转化率') if record.get('转化率') is not None else record.get('成交转化率')
                 if raw_rate is not None:
                     rate=number(raw_rate)
                     if rate is not None and rate>1:raise ValueError(f'后台转化率需为0到1的数值 {path}/{dt}')
@@ -167,6 +167,7 @@ def main():
     p.add_argument('--config',type=Path)
     p.add_argument('--date',action='append');p.add_argument('--start-date');p.add_argument('--end-date')
     p.add_argument('--output',type=Path);p.add_argument('--payload-only',action='store_true')
+    p.add_argument('--archive-dir',type=Path)
     a=p.parse_args();dates=set()
     for item in a.date or []:dates.update(day(v) for v in item.split(','))
     if bool(a.start_date)!=bool(a.end_date):p.error('开始/结束日期须同时提供')
@@ -177,6 +178,11 @@ def main():
     if not dates:p.error('必须指定统计日期')
     root=Path(a.database_root);output=a.output or root/'数据报表输出/店铺维度日报.xlsx'
     payload=build_payload(root,dates,a.input,json.loads(a.config.read_text(encoding='utf-8')) if a.config else None)
+    if os.environ.get('DAILY_REPORT_ARCHIVE')=='1' and not a.payload_only:
+        from report_archive import store
+        paths=store(payload,a.archive_dir or root/'数据报表输出',a.output)
+        print('店铺月报: '+', '.join(map(str,paths)))
+        return 0
     output.parent.mkdir(parents=True,exist_ok=True)
     payload_path=output.with_suffix('.store.json');payload_path.write_text(json.dumps(payload,ensure_ascii=False,indent=2),encoding='utf-8')
     log=output.with_name(output.stem+'_生成日志.json');log.write_text(json.dumps({'warnings':payload['logs'],'field_sources':payload['evidence']},ensure_ascii=False,indent=2),encoding='utf-8')

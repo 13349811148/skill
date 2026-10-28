@@ -1,7 +1,7 @@
 {
   "name": "daily-report",
-  "version": "2026.10.26+wps.1",
-  "description": "生成拼多多和天猫商品日报，并按平台日报模板额外输出店铺日报。支持V3后台流量与交易数据、商品推广实际花费和全店托管分摊核对。 商品日报生成并校验后上传WPS在线文档，支持用户登录后续传及独立上传状态。",
+  "version": "2026.10.28+archive.1",
+  "description": "商品日报固定总工作簿按月份分子表；店铺日报每月一个文件；按业务日期替换防重复，保留历史修订口径。仅商品日报同步WPS。",
   "skills": [
     "./skills/data-report-multi-platform"
   ],
