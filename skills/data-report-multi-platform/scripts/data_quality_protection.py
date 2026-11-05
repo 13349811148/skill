@@ -211,7 +211,6 @@ def load_cost_table_records(
         code_headers = _supported_code_headers(headers)
         cost_header = "匹配成本(元)" if product_summary else _first_supported_header(headers, COST_TABLE_COST_CANDIDATES)
         header_positions = {header: index for index, header in enumerate(headers) if header}
-        cost_position = header_positions[cost_header]
         metadata_positions = {
             field: header_positions[actual]
             for field in COST_METADATA_FIELDS
@@ -219,9 +218,11 @@ def load_cost_table_records(
         }
         sheet_name = text(getattr(data, "sheet_name", "未命名工作表")) or "未命名工作表"
         skipped_statuses: Counter[str] = Counter()
+        reference_count = 0
 
         for row_index, values in enumerate(rows[header_index + 1 :], start=header_index + 2):
             row_code_headers = code_headers
+            row_cost_headers = [cost_header]
             if product_summary:
                 def field(name: str) -> str:
                     position = header_positions[name]
@@ -229,9 +230,11 @@ def load_cost_table_records(
                 if not any(text(v) for v in values):
                     continue
                 status = field("匹配状态")
-                if status != "已匹配":
+                if status not in {"已匹配", "参考测算"}:
                     skipped_statuses[status or "状态为空"] += 1
                     continue
+                row_cost_headers = (["匹配成本(元)"] if status == "已匹配" else []) + ["参考测算成本(元)"]
+                row_cost_headers = [header for header in row_cost_headers if header in header_positions]
                 kind = field("编码类型")
                 if kind not in {"组合装", "货品"}:
                     warnings.append(f"成本汇总编码类型无效，已忽略；工作表={sheet_name}，行号={row_index}，类型={kind}")
@@ -252,27 +255,42 @@ def load_cost_table_records(
             if not match_code:
                 continue
 
-            raw_cost = values[cost_position] if cost_position < len(values) else ""
-            if text(raw_cost) == "":
-                warnings.append(f"成本表成本为空，已忽略；工作表={sheet_name}，行号={row_index}，编码={raw_code}")
-                continue
-            try:
-                cost_value = parse_number_strict(
-                    raw_cost,
-                    field_name="成本",
-                    context=f"文件={cost_table_path}，工作表={sheet_name}，行号={row_index}，编码={raw_code}",
-                )
-            except DataQualityError as exc:
-                warnings.append(f"成本表成本无效，已忽略；{exc}")
-                continue
-            if cost_value <= 0.0:
-                warnings.append(
-                    f"成本表成本必须大于0，已忽略；工作表={sheet_name}，行号={row_index}，"
-                    f"编码={raw_code}，成本={cost_value:.2f}"
-                )
+            cost_value = None
+            selected_cost_header = ""
+            has_cost_value = False
+            for candidate_header in row_cost_headers:
+                position = header_positions[candidate_header]
+                raw_cost = values[position] if position < len(values) else ""
+                if text(raw_cost) == "":
+                    continue
+                has_cost_value = True
+                try:
+                    candidate_cost = parse_number_strict(
+                        raw_cost,
+                        field_name="成本",
+                        context=f"文件={cost_table_path}，工作表={sheet_name}，行号={row_index}，编码={raw_code}，成本表头={candidate_header}",
+                    )
+                except DataQualityError as exc:
+                    warnings.append(f"成本表成本无效，已忽略该值；{exc}")
+                    continue
+                if candidate_cost <= 0.0:
+                    warnings.append(
+                        f"成本表成本必须大于0，已忽略该值；工作表={sheet_name}，行号={row_index}，"
+                        f"编码={raw_code}，成本表头={candidate_header}，成本={candidate_cost:.2f}"
+                    )
+                    continue
+                cost_value = candidate_cost
+                selected_cost_header = candidate_header
+                break
+            if cost_value is None:
+                if not has_cost_value:
+                    warnings.append(f"成本表成本为空，已忽略；工作表={sheet_name}，行号={row_index}，编码={raw_code}")
                 continue
 
             source = f"成本表:{cost_table_path.name}/{sheet_name}/{selected_header}={raw_code}"
+            cost_kind = "参考测算" if selected_cost_header == "参考测算成本(元)" else "已匹配"
+            if product_summary:
+                source += f"/{selected_cost_header}（{cost_kind}）"
             record = {
                 "产品成本": cost_value,
                 **{
@@ -284,6 +302,8 @@ def load_cost_table_records(
                 "工作表": sheet_name,
                 "行号": row_index,
                 "编码表头": selected_header,
+                "成本表头": selected_cost_header,
+                "成本性质": cost_kind,
             }
             previous = costs.get(match_code)
             if previous:
@@ -304,11 +324,18 @@ def load_cost_table_records(
                     f"原始编码={raw_code}，成本={cost_value:.2f}"
                 )
             costs[match_code] = record
+            if product_summary and cost_kind == "参考测算":
+                reference_count += 1
 
+        if reference_count:
+            warnings.append(
+                f"产品成本汇总采用参考测算成本{reference_count}条，成本来源已标注参考测算；"
+                f"文件={cost_table_path.name}，工作表={sheet_name}"
+            )
         if skipped_statuses:
             detail = "、".join(f"{status}{count}条" for status, count in sorted(skipped_statuses.items()))
             warnings.append(
-                f"产品成本汇总仅采用已匹配的正数匹配成本(元)，未使用参考测算成本；"
+                f"产品成本汇总采用已匹配成本或可用参考测算成本，无可用成本的项目留空；"
                 f"文件={cost_table_path.name}，工作表={sheet_name}；跳过{detail}"
             )
 

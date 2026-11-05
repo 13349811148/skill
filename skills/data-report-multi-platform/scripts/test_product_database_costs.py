@@ -1,4 +1,4 @@
-"""Validate V3 summary costs without using reference estimates or bundle parts."""
+"""Validate approved reference costs, exact SKU identity and unmatched blanks."""
 from pathlib import Path
 from types import SimpleNamespace
 from tempfile import TemporaryDirectory
@@ -16,21 +16,28 @@ def summary(rows):
 
 
 class ProductCostTests(unittest.TestCase):
-    def test_bundle_and_stock_identity_exclude_estimates(self):
+    def test_bundle_and_stock_identity_with_reference_fallback(self):
         costs, warnings = load_cost_table_records(Path('产品成本.xlsx'), [summary([
-            ['组合装','PACK02','ITEM01×2',18,None,'已匹配'],
+            ['组合装','PACK02','ITEM01×2',18,19,'已匹配'],
             ['货品','','ITEM01',9,None,'已匹配'],
             ['组合装','REF01','ITEM01×3',99,27,'参考测算'],
             ['货品','','PARTIAL01',1,2,'未完整匹配'],
-            ['货品','','EMPTY01',None,3,'已匹配'],
+            ['货品','','FALLBACK01',None,3,'已匹配'],
+            ['货品','','EMPTY01',None,None,'已匹配'],
         ])])
-        self.assertEqual(set(costs), {'pack02','item01'})
+        self.assertEqual(set(costs), {'pack02','item01','ref01','fallback01'})
         self.assertEqual(costs['pack02']['产品成本'],18)
         self.assertEqual(costs['item01']['产品成本'],9)
         self.assertEqual(costs['pack02']['编码表头'],'组合装编码')
         self.assertEqual(costs['item01']['编码表头'],'货品编码（组合内）')
         self.assertEqual(costs['pack02']['行号'],3)
-        self.assertTrue(warnings)
+        self.assertEqual(costs['ref01']['产品成本'],27)
+        self.assertEqual(costs['fallback01']['产品成本'],3)
+        self.assertEqual(costs['ref01']['成本性质'],'参考测算')
+        self.assertEqual(costs['pack02']['成本性质'],'已匹配')
+        self.assertEqual(costs['ref01']['成本表头'],'参考测算成本(元)')
+        self.assertIn('参考测算成本(元)（参考测算）',costs['ref01']['来源'])
+        self.assertTrue(any('采用参考测算成本2条' in warning for warning in warnings))
 
     def test_normalized_duplicate_conflict_still_stops(self):
         with self.assertRaises(DataQualityError):
@@ -39,11 +46,29 @@ class ProductCostTests(unittest.TestCase):
                 ['组合装','pack02','ITEM01×2',19,None,'已匹配'],
             ])])
 
-    def test_reference_only_is_not_a_valid_cost_table(self):
+    def test_reference_only_is_a_valid_cost_table(self):
+        costs,_=load_cost_table_records(Path('产品成本.xlsx'), [summary([
+            ['组合装','REF01','ITEM01×3',None,27,'参考测算'],
+        ])])
+        self.assertEqual(costs['ref01']['产品成本'],27)
+
+    def test_only_missing_or_invalid_costs_stop_generation(self):
         with self.assertRaises(DataQualityError):
             load_cost_table_records(Path('产品成本.xlsx'), [summary([
-                ['组合装','REF01','ITEM01×3',99,27,'参考测算'],
+                ['组合装','REF01','ITEM01×3',None,None,'参考测算'],
+                ['货品','','ZERO',0,0,'已匹配'],
+                ['货品','','INVALID','不是数字',-1,'已匹配'],
             ])])
+
+    def test_invalid_matched_cost_can_use_a_valid_reference(self):
+        costs,warnings=load_cost_table_records(Path('产品成本.xlsx'), [summary([
+            ['货品','','REF01',0,7,'已匹配'],
+            ['货品','','REF02','无效',8,'已匹配'],
+        ])])
+        self.assertEqual(costs['ref01']['产品成本'],7)
+        self.assertEqual(costs['ref02']['产品成本'],8)
+        self.assertTrue(any('必须大于0' in warning for warning in warnings))
+        self.assertTrue(any('成本无效' in warning for warning in warnings))
 
     def test_discovery_precedence_and_ambiguity_for_both_platforms(self):
         with TemporaryDirectory() as name:
