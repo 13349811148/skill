@@ -1,7 +1,7 @@
 """User-confirmed unit cost and margin rules for product daily reports."""
 from typing import Any
 
-from data_quality_protection import optional_number
+from data_quality_protection import optional_number, normalize_match_code, text
 
 SHIPPING_PER_UNIT = 2.1
 OTHER_COST_RATE = 0.167
@@ -11,11 +11,10 @@ REMOVED_COLUMNS = ("店铺费用", "平摊管理费用")
 
 
 def apply_product_cost_rules(row: dict[str, Any]) -> None:
-    """Keep cost and gross margin per unit; net profit remains a row total.
+    """Apply the requested net-profit definition: gross minus promotion spend.
 
-    Unknown product cost never becomes zero. Net profit still requires known
-    net sales, including any subsidy; missing marketing data cannot imply zero
-    subsidy. Empty-burn rows have no fulfillment costs or sales margin.
+    Do not multiply gross by quantity or depend on unknown subsidy/net sales.
+    Unknown product cost never becomes zero.
     """
     for field in REMOVED_COLUMNS:
         row.pop(field, None)
@@ -41,9 +40,17 @@ def apply_product_cost_rules(row: dict[str, Any]) -> None:
     row["综合成本"] = total
     row["毛利"] = gross
     row["毛利率"] = gross / arrival if arrival else ""
-    net_sales = optional_number(row.get("净销售额（实际成交+总补贴金额）"))
-    if net_sales is None:
-        return
-    base_profit = net_sales - total * quantity
-    row["净利润"] = base_profit - promotion
-    row["定价是否合理"] = "建议改价" if base_profit < 0 else "建议缩减推广" if row["净利润"] < 0 else "合理"
+    row["净利润"] = gross - promotion
+    row["定价是否合理"] = "建议改价" if gross < 0 else "建议缩减推广" if row["净利润"] < 0 else "合理"
+
+
+def product_output_row(row: dict[str, Any], columns: list[str], costs) -> dict[str, Any]:
+    """Rename the report field without changing internal export/matching aliases."""
+    code = text(row.get("SKU编码") or row.get("商品SKU"))
+    key = normalize_match_code(code)
+    names = getattr(costs, "sku_names", {})
+    name = names.get(key) or costs.get(key, {}).get("SKU名称", "")
+    output = {column: row.get(column, "") for column in columns}
+    output["SKU编码"] = code
+    output["SKU名称"] = name
+    return output

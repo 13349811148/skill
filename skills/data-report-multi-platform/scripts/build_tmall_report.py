@@ -47,7 +47,7 @@ from handoff_protection import (
     resolve_order_date,
 )
 from order_line_protection import classify_order_line
-from product_cost_rules import apply_product_cost_rules
+from product_cost_rules import apply_product_cost_rules, product_output_row
 from promotion_protection import (
     PromotionProtectionError,
     PromotionSnapshotRow,
@@ -1535,7 +1535,7 @@ def build_report(
         net_sales = amount + subsidy if amount or subsidy else 0.0
         row["净销售额（实际成交+总补贴金额）"] = net_sales if net_sales else ""
         apply_product_cost_rules(row)
-        output_rows.append({column: row.get(column, "") for column in columns})
+        output_rows.append(product_output_row(row, columns, cost_by_merchant_code))
 
     empty_burn_rows: list[dict[str, Any]] = []
     empty_burn_warnings: list[str] = []
@@ -1552,7 +1552,7 @@ def build_report(
             template_styles,
             product_exports,
         )
-        empty_burn_rows.append({column: empty_burn_row.get(column, "") for column in columns})
+        empty_burn_rows.append(product_output_row(empty_burn_row, columns, cost_by_merchant_code))
         empty_burn_cost = empty_burn_row.get("产品成本", "")
         cost_source_logs.append(
             cost_source_log(
@@ -1645,6 +1645,8 @@ def write_workbook(path: Path, columns: list[str], rows: list[dict[str, Any]]) -
             "商品ID",
             "SKU ID",
             "商品SKU",
+            "SKU编码",
+            "SKU名称",
             PROMOTION_MECHANISM_COLUMN,
             "定价是否合理",
             "备注",

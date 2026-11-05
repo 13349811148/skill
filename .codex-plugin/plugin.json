@@ -1,7 +1,7 @@
 {
   "name": "daily-report",
-  "version": "2026.11.05+costs.3",
-  "description": "商品日报含综合、产品、快递、均摊及平台成本和单件毛利；按月累计，仅商品日报同步WPS。",
+  "version": "2026.11.05+costs.4",
+  "description": "商品日报按SKU编码匹配成本和SKU名称，净利润按毛利减推广费，日期年-月-日；按月累计，仅商品日报同步WPS。",
   "skills": [
     "./skills/data-report-multi-platform"
   ],

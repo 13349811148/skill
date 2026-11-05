@@ -34,7 +34,7 @@ def install(module):
     def build(*args,**kwargs):
         columns,rows,warnings,logs=original_build(*args,**kwargs)
         if missing:
-            fields=['净销售额（实际成交+总补贴金额）','净利润','定价是否合理']
+            fields=['净销售额（实际成交+总补贴金额）']
             if '营销活动表' in missing:
                 fields+=['活动价','报名价',module.PROMOTION_MECHANISM_COLUMN,'每单补贴金额','总补贴金额']
             missing_label='、'.join(sorted(set(missing)))
@@ -44,7 +44,7 @@ def install(module):
                 for field in ['品牌','所属运营','大类']:
                     if row.get(field)=='营销活动表未匹配/未维护':row[field]=''
                 apply_product_cost_rules(row)
-                row['备注']='；'.join(filter(None,[row.get('备注',''),'缺少'+missing_label+'；已匹配成本保留，缺失字段及净利润待补；商品推广按实际，托管按成交额分摊']))
-            warnings.insert(0,'缺少'+missing_label+'；按用户授权输出已知商品字段，已匹配产品成本保留，综合成本和单件毛利按已知成本计算，缺失资料对应字段及净利润留空。')
+                row['备注']='；'.join(filter(None,[row.get('备注',''),'缺少'+missing_label+'；已匹配成本保留，营销字段待补；净利润按毛利减推广费用；商品推广按实际，托管按成交额分摊']))
+            warnings.insert(0,'缺少'+missing_label+'；按用户授权输出已知商品字段，已匹配产品成本保留，综合成本和单件毛利按已知成本计算，缺失营销字段留空，净利润按毛利减推广费用计算。')
         return columns,rows,warnings,logs
     module.load_marketing_rows=marketing;module.load_costs_by_merchant_code=costs;module.build_report=build

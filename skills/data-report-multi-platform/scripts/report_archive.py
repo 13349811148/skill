@@ -91,7 +91,8 @@ def read_product(output, columns):
 
 
 def product_key(row):
-    return tuple(str(row.get(k) or '') for k in ['日期', '店铺名称', '商品ID', 'SKU ID', '商品SKU'])
+    return (*tuple(str(row.get(k) or '') for k in ['日期', '店铺名称', '商品ID', 'SKU ID']),
+            str(row.get('SKU编码') or row.get('商品SKU') or ''))
 
 
 def product_sort(row):

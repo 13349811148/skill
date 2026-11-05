@@ -172,6 +172,49 @@ def find_product_cost_table(database_root: Path) -> Path | None:
     return candidates[0] if candidates else None
 
 
+class CostRecords(dict):
+    """Usable cost records plus independently matched specification names."""
+
+    def __init__(self, sku_names: dict[str, str]):
+        super().__init__()
+        self.sku_names = sku_names
+
+
+def load_cost_sku_names(sheets: Iterable[Any]) -> dict[str, str]:
+    """Match cost-table product names by exact SKU, even without a valid cost."""
+    names: dict[str, str] = {}
+    for data in sheets:
+        rows = getattr(data, "rows", [])
+        for index, candidate in enumerate(rows[:20]):
+            headers = [text(v) for v in candidate]
+            name_header = _first_supported_header(headers, ("产品名称", "商品名称"))
+            summary = {"编码类型", "组合装编码", "货品编码（组合内）"}.issubset(headers)
+            code_headers = _supported_code_headers(headers)
+            if not name_header or not (summary or code_headers):
+                continue
+            positions = {h: i for i, h in enumerate(headers) if h}
+            for values in rows[index + 1:]:
+                def value(header: str) -> str:
+                    p = positions[header]
+                    return text(values[p]) if p < len(values) else ""
+                current_headers = code_headers
+                if summary:
+                    kind = value("编码类型")
+                    if kind not in {"组合装", "货品"}:
+                        continue
+                    current_headers = ["组合装编码" if kind == "组合装" else "货品编码（组合内）"]
+                raw_code = next((value(h) for h in current_headers if value(h)), "")
+                code = normalize_match_code(raw_code)
+                name = " ".join(value(name_header).split())
+                if not code or not name:
+                    continue
+                if code in names and names[code] != name:
+                    raise DataQualityError(f"成本表同一SKU编码对应不同商品名称，已停止：{raw_code}；{names[code]}；{name}")
+                names[code] = name
+            break
+    return names
+
+
 def load_cost_table_records(
     cost_table_path: Path,
     sheets: Iterable[Any],
@@ -182,7 +225,8 @@ def load_cost_table_records(
     ``sheet_name``, ``truncated``) so the two report builders share exactly the
     same matching and duplicate-protection behavior.
     """
-    costs: dict[str, dict[str, Any]] = {}
+    sheets = list(sheets)
+    costs: dict[str, dict[str, Any]] = CostRecords(load_cost_sku_names(sheets))
     warnings: list[str] = []
     for data in sheets:
         if getattr(data, "truncated", False):
@@ -304,6 +348,7 @@ def load_cost_table_records(
                 "编码表头": selected_header,
                 "成本表头": selected_cost_header,
                 "成本性质": cost_kind,
+                "SKU名称": costs.sku_names.get(match_code, ""),
             }
             previous = costs.get(match_code)
             if previous:
