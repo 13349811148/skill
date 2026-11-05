@@ -152,6 +152,26 @@ def _supported_code_headers(headers: Sequence[str]) -> list[str]:
     return selected
 
 
+def find_product_cost_table(database_root: Path) -> Path | None:
+    """Prefer the explicitly maintained V3 cost table, not product exports."""
+    folder = database_root / "1.产品数据库"
+    preferred = folder / "产品成本.xlsx"
+    if preferred.is_file():
+        return preferred
+    candidates = sorted(
+        p for p in folder.iterdir()
+        if p.is_file() and p.suffix.lower() in {".xlsx", ".xls"}
+        and "成本" in p.stem and not p.name.startswith("~$")
+        and not any(word in p.stem.lower() for word in ("模板", "备份", "副本", "backup"))
+    ) if folder.is_dir() else []
+    if len(candidates) > 1:
+        raise DataQualityError(
+            "产品数据库存在多个成本表候选，请用 --cost-table 指定："
+            + "、".join(str(p) for p in candidates)
+        )
+    return candidates[0] if candidates else None
+
+
 def load_cost_table_records(
     cost_table_path: Path,
     sheets: Iterable[Any],
@@ -173,19 +193,23 @@ def load_cost_table_records(
         rows = getattr(data, "rows", [])
         header_index: int | None = None
         headers: list[str] = []
+        product_summary = False
         for index, candidate_row in enumerate(rows[:20]):
             candidate_headers = [text(value) for value in candidate_row]
-            if _supported_code_headers(candidate_headers) and _first_supported_header(
+            summary_headers = {"编码类型", "组合装编码", "货品编码（组合内）", "匹配成本(元)", "匹配状态"}
+            is_summary = summary_headers.issubset(candidate_headers)
+            if is_summary or (_supported_code_headers(candidate_headers) and _first_supported_header(
                 candidate_headers, COST_TABLE_COST_CANDIDATES
-            ):
+            )):
                 header_index = index
                 headers = candidate_headers
+                product_summary = is_summary
                 break
         if header_index is None:
             continue
 
         code_headers = _supported_code_headers(headers)
-        cost_header = _first_supported_header(headers, COST_TABLE_COST_CANDIDATES)
+        cost_header = "匹配成本(元)" if product_summary else _first_supported_header(headers, COST_TABLE_COST_CANDIDATES)
         header_positions = {header: index for index, header in enumerate(headers) if header}
         cost_position = header_positions[cost_header]
         metadata_positions = {
@@ -194,11 +218,29 @@ def load_cost_table_records(
             if (actual := _first_supported_header(headers, (field,)))
         }
         sheet_name = text(getattr(data, "sheet_name", "未命名工作表")) or "未命名工作表"
+        skipped_statuses: Counter[str] = Counter()
 
         for row_index, values in enumerate(rows[header_index + 1 :], start=header_index + 2):
+            row_code_headers = code_headers
+            if product_summary:
+                def field(name: str) -> str:
+                    position = header_positions[name]
+                    return text(values[position]) if position < len(values) else ""
+                if not any(text(v) for v in values):
+                    continue
+                status = field("匹配状态")
+                if status != "已匹配":
+                    skipped_statuses[status or "状态为空"] += 1
+                    continue
+                kind = field("编码类型")
+                if kind not in {"组合装", "货品"}:
+                    warnings.append(f"成本汇总编码类型无效，已忽略；工作表={sheet_name}，行号={row_index}，类型={kind}")
+                    continue
+                # Component expressions belong to the bundle, never to an order SKU.
+                row_code_headers = ["组合装编码" if kind == "组合装" else "货品编码（组合内）"]
             selected_header = ""
             raw_code = ""
-            for code_header in code_headers:
+            for code_header in row_code_headers:
                 raw_value = values[header_positions[code_header]] if header_positions[code_header] < len(values) else ""
                 if text(raw_value):
                     selected_header = code_header
@@ -262,6 +304,13 @@ def load_cost_table_records(
                     f"原始编码={raw_code}，成本={cost_value:.2f}"
                 )
             costs[match_code] = record
+
+        if skipped_statuses:
+            detail = "、".join(f"{status}{count}条" for status, count in sorted(skipped_statuses.items()))
+            warnings.append(
+                f"产品成本汇总仅采用已匹配的正数匹配成本(元)，未使用参考测算成本；"
+                f"文件={cost_table_path.name}，工作表={sheet_name}；跳过{detail}"
+            )
 
     if not costs:
         raise DataQualityError(f"成本表未读取到可用正数成本，已停止生成日报，{cost_table_path}")

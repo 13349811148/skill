@@ -216,7 +216,7 @@ def store(payload, directory, explicit_output=None):
             merged.update({store_key(r): r for r in incoming})
             result = dict(payload, rows=[merged[k] for k in sorted(merged)], oldRows=len(previous),
                           existingWorkbook=str(output) if output.exists() else None, archive_mode=True,
-                          report_note='本月累计日报；同一日期/平台/店铺重新生成时替换，不重复追加。历史估算和缺失口径按各日独立日志；今日动作/异常说明不自动填。')
+                          report_note=payload.get('report_note') or '本月累计日报；同一日期/平台/店铺重新生成时替换，不重复追加。历史估算和缺失口径按各日独立日志；今日动作/异常说明不自动填。')
             prefixes = tuple('|'.join(k)+'|' for k in keys)
             historical = {k:v for k,v in state.get('evidence', {}).items() if not k.startswith(prefixes)}
             result['evidence'] = {**historical, **payload.get('evidence', {})}

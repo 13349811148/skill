@@ -22,7 +22,12 @@ if(n){
    U:`=IF(COUNT(R${i},S${i})=2,IF(AND(R${i}>=0,S${i}>0),R${i}/S${i},""),"")`,
    V:`=IF(COUNT(R${i},S${i})=2,IF(AND(R${i}>0,S${i}>=0),S${i}/R${i},""),"")`
   };
-  for(const [c,f] of Object.entries(form))sheet.getRange(`${c}${i}`).formulas=[[f]];
+  const retained=payload.rows[i-4]._原值保留||{};
+  const labels={M:'新客数',N:'老客数',P:'客单价',Q:'支付转化率',R:'净成交额',U:'推广ROI',V:'推广费比'};
+  for(const [c,f] of Object.entries(form)){
+   if(Object.hasOwn(retained,labels[c]))sheet.getRange(`${c}${i}`).values=[[retained[labels[c]]]];
+   else sheet.getRange(`${c}${i}`).formulas=[[f]];
+  }
  }
  sheet.getRange(`A4:A${n+3}`).setNumberFormat('yyyy-mm-dd');
  for(const c of ['O','Q','V'])sheet.getRange(`${c}4:${c}${n+3}`).setNumberFormat('0.00%');

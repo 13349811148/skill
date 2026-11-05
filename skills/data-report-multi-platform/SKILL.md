@@ -72,6 +72,12 @@ Apply all four safeguards before writing either platform workbook. A failure in 
 
 ## Cost Matching and Data Quality Protection
 
+### 产品数据库成本（2026-11-05）
+
+默认优先读取 `<数据库根目录>/1.产品数据库/产品成本.xlsx`，`--cost-table` 显式指定优先级最高；产品库无成本表时兼容旧的“营销活动监控”目录。读取新成本汇总格式和部分参考资料缺失时，先读 [产品成本读取规则](references/product_costs.md)。此规则覆盖下文仅从营销活动监控自动发现成本表的旧说明。
+
+“编码成本汇总”只使用“已匹配”的正数“匹配成本(元)”。组合装按组合装编码、货品按货品编码匹配订单最终规格编码；组合子件列表不作为组合装的规格编码，不使用参考测算成本。缺营销活动表时保留已匹配产品成本，未知的补贴与利润仍留空，不再把成本连同营销字段清空。
+
 Apply these rules to both platforms while leaving the existing refund and supplemental-order handling unchanged:
 
 1. Treat `SKU ID` as the platform's specification identity and the final order `商品SKU` as the specification-level merchant code; never replace it with a marketing-table display name before cost matching. The shared cost reader must support these equivalent cost-code headers: `商家编码-规格维度`、`商品SKU`、`商品编码`、`商品SKU名称`、`SKU名称` and `SKU编码`. If a table has more than one candidate header, select the first nonblank value **for that row** in this order: `商家编码-规格维度` → `商品SKU` → the remaining aliases. Do not skip a row merely because an earlier candidate cell is blank. Normalize full-width characters, all whitespace, and letter case before comparing; retain the actual header and raw code in the source log.
@@ -86,7 +92,7 @@ For both platform outputs, display `实际成交数量（去退款去补单后�
 
 For both platform outputs, place the four cost-metadata columns immediately before the final `SKU ID` column, after all normal, blank, and auxiliary columns. Keep their exact order as `项目组`、`管理类型`、`品种`、`产线`, then write `SKU ID` as the absolute final column; never insert another output column after `SKU ID`.
 
-Both modes use `%USERPROFILE%\Desktop\运营数据库`. They auto-detect the marketing activity and cost workbooks from `营销活动监控`, preferring the most recently modified workbook whose name contains `营销活动_更新` when present; only calculate dates explicitly requested by the user.
+Both modes use `%USERPROFILE%\Desktop\运营数据库`. Marketing activity workbooks are auto-detected from `营销活动监控`, preferring the most recently modified workbook whose name contains `营销活动_更新`. Cost discovery follows the product-database rule above, with the legacy folder as fallback. Only calculate dates explicitly requested by the user.
 
 Read the marketing activity workbook before calculating. If it cannot be opened, has no `商品ID`、`样式ID`、`商品SKU` headers, or has no valid product records, stop immediately and report the specific failure. Never generate a report with blank marketing fields after a marketing-workbook read failure.
 

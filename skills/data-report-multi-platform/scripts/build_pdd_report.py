@@ -19,6 +19,7 @@ from data_quality_protection import (
     DataQualityError,
     cost_source_log,
     duplicate_identifier_warnings,
+    find_product_cost_table,
     load_cost_table_records,
     marketing_price_warnings,
     normalize_match_code,
@@ -468,6 +469,12 @@ def resolve_marketing_path(argument: str | None, database_root: Path) -> Path:
 def resolve_cost_table_path(argument: str | None, database_root: Path, marketing_path: Path) -> Path:
     if argument:
         return Path(argument)
+    try:
+        product_cost = find_product_cost_table(database_root)
+    except DataQualityError as exc:
+        raise ReportError(str(exc)) from exc
+    if product_cost is not None:
+        return product_cost
     folder = database_root / "营销活动监控"
     candidates = [path for path in reference_workbooks(folder) if path != marketing_path]
     non_template = [path for path in candidates if "模板" not in path.stem and "营销活动" not in path.stem]

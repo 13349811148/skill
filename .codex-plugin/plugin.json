@@ -1,7 +1,7 @@
 {
   "name": "daily-report",
-  "version": "2026.10.28+archive.1",
-  "description": "商品日报固定总工作簿按月份分子表；店铺日报每月一个文件；按业务日期替换防重复，保留历史修订口径。仅商品日报同步WPS。",
+  "version": "2026.11.05+costs.1",
+  "description": "从产品数据库读取已匹配的规格成本，保留未知成本和利润空白；商品日报按月分子表，店铺日报每月一个文件，仅商品日报同步WPS。",
   "skills": [
     "./skills/data-report-multi-platform"
   ],
