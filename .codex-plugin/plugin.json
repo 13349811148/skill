@@ -1,7 +1,7 @@
 {
   "name": "daily-report",
-  "version": "2026.11.05+costs.2",
-  "description": "从产品数据库读取正式匹配及参考测算成本，保留来源，仅无可用成本项目留空；商品日报按月分子表，店铺日报每月一个文件，仅商品日报同步WPS。",
+  "version": "2026.11.05+costs.3",
+  "description": "商品日报含综合、产品、快递、均摊及平台成本和单件毛利；按月累计，仅商品日报同步WPS。",
   "skills": [
     "./skills/data-report-multi-platform"
   ],

@@ -47,6 +47,7 @@ from handoff_protection import (
     resolve_order_date,
 )
 from order_line_protection import classify_order_line
+from product_cost_rules import apply_product_cost_rules
 from promotion_protection import (
     PromotionProtectionError,
     PromotionSnapshotRow,
@@ -1313,13 +1314,12 @@ def build_empty_burn_promotion_row(
             "毛利": 0.0,
             "毛利率": "",
             "推广费用": promotion_fee,
-            "店铺费用": 0.0,
-            "平摊管理费用": 0.0,
             "净利润": -promotion_fee,
             "定价是否合理": "建议缩减推广",
             "备注": f"空烧推广费：无有效销售；{fee_remark}",
         }
     )
+    apply_product_cost_rules(row)
     return row
 
 
@@ -1533,31 +1533,8 @@ def build_report(
         )
         row["备注"] = "；".join(part for part in (existing_remark, receipt_remark, fee_remark) if part)
         net_sales = amount + subsidy if amount or subsidy else 0.0
-        shop_fee = net_sales * 0.01 if net_sales else ""
-        management_fee = net_sales * 0.01 if net_sales else ""
-        promo_fee = number(row.get("推广费用"))
         row["净销售额（实际成交+总补贴金额）"] = net_sales if net_sales else ""
-        row["店铺费用"] = shop_fee
-        row["平摊管理费用"] = management_fee
-        row["毛利"] = net_sales - cost * qty if has_cost and qty else ""
-        if (
-            has_subsidy
-            and row["毛利"] != ""
-            and row["毛利"] < 0
-            and (not has_activity_price or not has_register_price)
-            and product_id
-        ):
-            negative_gross_missing_price_product_ids.add(product_id)
-        row["毛利率"] = row["毛利"] / net_sales if row.get("毛利") != "" and net_sales else ""
-        base_profit = net_sales - qty * cost - number(shop_fee) - number(management_fee) if net_sales and has_cost else ""
-        row["净利润"] = base_profit - promo_fee if base_profit != "" else ""
-        if row["净利润"] != "":
-            if base_profit < 0:
-                row["定价是否合理"] = "建议改价"
-            elif row["净利润"] < 0:
-                row["定价是否合理"] = "建议缩减推广"
-            else:
-                row["定价是否合理"] = "合理"
+        apply_product_cost_rules(row)
         output_rows.append({column: row.get(column, "") for column in columns})
 
     empty_burn_rows: list[dict[str, Any]] = []
@@ -1689,8 +1666,10 @@ def write_workbook(path: Path, columns: list[str], rows: list[dict[str, Any]]) -
             "净销售额（实际成交+总补贴金额）",
             "毛利",
             "推广费用",
-            "店铺费用",
-            "平摊管理费用",
+            "综合成本",
+            "快递成本",
+            "其他均摊成本",
+            "平台费用",
             "净利润",
         }
         for header in text_columns:
