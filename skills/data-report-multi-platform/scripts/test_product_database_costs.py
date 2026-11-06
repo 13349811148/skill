@@ -74,6 +74,8 @@ class ProductCostTests(unittest.TestCase):
         with TemporaryDirectory() as name:
             root=Path(name);product=root/'1.产品数据库';product.mkdir()
             legacy=root/'营销活动监控';legacy.mkdir();(legacy/'成本表.xlsx').touch()
+            (product/'运费成本.xlsx').touch()
+            (product/'快递成本.xlsx').touch()
             preferred=product/'产品成本.xlsx';preferred.touch()
             for module in (pdd,tmall):
                 self.assertEqual(module.resolve_cost_table_path(None,root,legacy/'营销活动.xlsx'),preferred)

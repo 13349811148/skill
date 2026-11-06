@@ -24,6 +24,9 @@ COST_SOURCE_LOG_COLUMNS = (
     "营销成本",
     "成本表成本",
     "成本差异（营销-成本表）",
+    "快递成本",
+    "运费来源",
+    "运费匹配状态",
 )
 COST_TABLE_CODE_CANDIDATES = (
     "商家编码-规格维度",
@@ -162,6 +165,7 @@ def find_product_cost_table(database_root: Path) -> Path | None:
         p for p in folder.iterdir()
         if p.is_file() and p.suffix.lower() in {".xlsx", ".xls"}
         and "成本" in p.stem and not p.name.startswith("~$")
+        and not any(word in p.stem for word in ("运费", "快递", "物流"))
         and not any(word in p.stem.lower() for word in ("模板", "备份", "副本", "backup"))
     ) if folder.is_dir() else []
     if len(candidates) > 1:
@@ -537,4 +541,7 @@ def cost_source_log(
         "营销成本": text(marketing_cost),
         "成本表成本": text(table_cost),
         "成本差异（营销-成本表）": text(cost_difference),
+        "快递成本": "0" if row_type == "空烧推广费" else "",
+        "运费来源": "无有效销售，不计快递成本" if row_type == "空烧推广费" else "",
+        "运费匹配状态": "不适用（空烧推广费）" if row_type == "空烧推广费" else "",
     }

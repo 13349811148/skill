@@ -1,7 +1,7 @@
 {
   "name": "daily-report",
-  "version": "2026.11.05+costs.4",
-  "description": "商品日报按SKU编码匹配成本和SKU名称，净利润按毛利减推广费，日期年-月-日；按月累计，仅商品日报同步WPS。",
+  "version": "2026.11.06+shipping.1",
+  "description": "商品日报按SKU编码和收货地区匹配运费：黑吉辽用圆通，其他地区取圆通邮政较低报价；按月累计，仅商品日报同步WPS。",
   "skills": [
     "./skills/data-report-multi-platform"
   ],

@@ -3,7 +3,6 @@ from typing import Any
 
 from data_quality_protection import optional_number, normalize_match_code, text
 
-SHIPPING_PER_UNIT = 2.1
 OTHER_COST_RATE = 0.167
 PLATFORM_COST_RATE = 0.007
 NEW_COST_COLUMNS = ("综合成本", "快递成本", "其他均摊成本", "平台费用")
@@ -14,7 +13,8 @@ def apply_product_cost_rules(row: dict[str, Any]) -> None:
     """Apply the requested net-profit definition: gross minus promotion spend.
 
     Do not multiply gross by quantity or depend on unknown subsidy/net sales.
-    Unknown product cost never becomes zero.
+    Unknown product or shipping cost never becomes zero. Shipping is supplied
+    by the freight matcher and survives a second partial-reference pass.
     """
     for field in REMOVED_COLUMNS:
         row.pop(field, None)
@@ -29,11 +29,12 @@ def apply_product_cost_rules(row: dict[str, Any]) -> None:
     arrival = optional_number(row.get("到手价"))
     cost = optional_number(row.get("产品成本"))
     valid_sales = quantity is not None and quantity > 0 and arrival is not None and arrival >= 0
-    row["快递成本"] = SHIPPING_PER_UNIT if valid_sales else ""
+    shipping = optional_number(row.get("快递成本"))
+    row["快递成本"] = shipping if valid_sales and shipping is not None and shipping > 0 else ""
     row["其他均摊成本"] = arrival * OTHER_COST_RATE if valid_sales else ""
     row["平台费用"] = arrival * PLATFORM_COST_RATE if valid_sales else ""
     row.update({"综合成本": "", "毛利": "", "毛利率": "", "净利润": "", "定价是否合理": ""})
-    if not valid_sales or cost is None or cost <= 0:
+    if not valid_sales or cost is None or cost <= 0 or row["快递成本"] == "":
         return
     total = cost + row["快递成本"] + row["其他均摊成本"] + row["平台费用"]
     gross = arrival - total

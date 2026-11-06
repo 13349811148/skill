@@ -48,6 +48,7 @@ from handoff_protection import (
 )
 from order_line_protection import classify_order_line
 from product_cost_rules import apply_product_cost_rules, product_output_row
+from shipping_costs import load_database_shipping, capture_shipping_order, apply_shipping_cost
 from promotion_protection import (
     PromotionProtectionError,
     PromotionSnapshotRow,
@@ -980,6 +981,8 @@ def load_order_aggregates(
                 current["实际成交数量（去退款去补单后）"] += quantity
                 current["商家实收金额(元)"] += number(merchant_receipt)
                 current["实际成交金额（去退款去补单后）"] += number(merchant_receipt)
+                capture_shipping_order(current, row, quantity, merchant_spec_code,
+                                       f"{path.name}/{sheet.sheet_name}/行{row_number}")
                 if text(merchant_receipt) != "" and number(merchant_receipt) == 0:
                     current["实收金额为0数量"] += quantity
     if review_details:
@@ -1344,6 +1347,10 @@ def build_report(
         text(row.get("商品ID")) for row in template_styles.values() if text(row.get("商品ID"))
     }
     cost_by_merchant_code, cost_warnings = load_costs_by_merchant_code(cost_table_path)
+    try:
+        shipping_table, shipping_warnings = load_database_shipping(database_root)
+    except DataQualityError as exc:
+        raise ReportError(str(exc)) from exc
     product_exports, product_warnings = load_product_exports(database_root)
     order_rows, order_warnings = load_order_aggregates(
         database_root,
@@ -1534,6 +1541,7 @@ def build_report(
         row["备注"] = "；".join(part for part in (existing_remark, receipt_remark, fee_remark) if part)
         net_sales = amount + subsidy if amount or subsidy else 0.0
         row["净销售额（实际成交+总补贴金额）"] = net_sales if net_sales else ""
+        apply_shipping_cost(row, aggregate, shipping_table, shipping_warnings, cost_source_logs[-1])
         apply_product_cost_rules(row)
         output_rows.append(product_output_row(row, columns, cost_by_merchant_code))
 
@@ -1596,6 +1604,7 @@ def build_report(
         + old_acceleration_warnings
         + legacy_brand_enjoy_warnings
         + cost_warnings
+        + shipping_warnings
         + product_warnings
         + cost_data_warnings
         + sorted(cost_specification_conflicts)
