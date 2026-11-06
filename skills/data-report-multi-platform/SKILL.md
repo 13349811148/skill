@@ -23,7 +23,7 @@ This package includes the store-day extension. Read this installed SKILL.md befo
 
 运行前整理店铺日原始数据到数据库的“店铺日报输入”目录，或通过 `--store-input` 传入。不要从商品日报的净成交结果反推店铺原始支付。按规则读取后台店铺概况、实际退款完成日、账户每日汇总；找不到可靠字段则留空并记录日志，不能填0或用同意退款时间代替实际退款日。标准输入映射和来源限制见店铺规则。自动读取有来源店铺元数据的“账户每日汇总”文件；不能叠加商品明细与账户汇总。
 
-此扩展已同时保存到本地插件源与当前加载缓存，避免本地刷新丢失；未修改上游 GitHub。
+插件修改同步本地源与当前加载缓存，发布遵循文末作者更新流程。
 
 ## Mandatory Execution Order
 
@@ -45,9 +45,9 @@ Follow this order exactly. Do not skip a step, run a platform builder directly, 
 ## Platform Routing
 
 - **天猫**: Run `scripts/build_report.py --platform tmall`. Output `天猫店铺数据报表.xlsx`. When the order export has no `商家实收` field, use `买家应付` as `商家实收金额(元)` for receipt matching, sales statistics, small-receipt checks, and promotion allocation. Keep the current 天猫 rules: common Tmall export headers, and combine 万相台 `花费`、新客加速 `预估新客加速费用`、老客加速 `预估老客加速费用` (plus any legacy 品牌新享费用, which is included under 新客加速) into `推广费用`. In `备注`, show exactly three component amounts: `万相台费用`、`新客加速费用`、`老客加速费用`; 新客加速与老客加速均属于原品牌新享口径. Retain the zero-receipt registration-price adjustment for subsidy activities. Keep every promotion amount keyed by `日期 + 商品ID`, then preserve the existing rule of splitting that product’s fee across its matched 样式ID order rows by actual receipt amount; never allocate a grand total directly or evenly. Match costs using the order's specification-level merchant code and carry the matched cost table's `产线`、`项目组`、`管理类型`、`品种` into the output.
-- **拼多多**: Run `scripts/build_report.py --platform pdd`. Output `数据报表拼多多.xlsx`. Keep the prior 拼多多 old-format rules, including style-ID aggregation, subsidy, cost, net-profit, and pricing reminders. Resolve every marketing field independently in this order: specification-safe `样式ID` → exact `商品ID + 商品SKU` → `店铺名称 + 规范化商品SKU` → cross-shop `商品SKU` candidates whose populated values are identical for that field. Normalize SKU full-width/half-width characters, all whitespace, and letter case. Never select the first cross-shop candidate when values conflict; a same-shop value wins before a cross-shop consistent value. A fallback record must not overwrite the order's original `商品ID`、`店铺名称` or final `商品SKU`. Always retain the safely matched `活动价`、`报名价` and `促销机制` in every normal sales or empty-burn output row, regardless of subsidy qualification. Populate `促销机制` from `活动名称`; only fall back to legacy promotion-mechanism fields when `活动名称` is blank. Normal-sales `到手价` is always actual receipt ÷ quantity. Compare it with `单件预估实收金额` only to generate warnings: even when actual is more than 5% below expected, write the actual value and warn. Never blank or replace the actual arrival price with the estimate.
+- **拼多多**: Run `scripts/build_report.py --platform pdd`. Output `数据报表拼多多.xlsx`. Keep the prior 拼多多 old-format rules, including style-ID aggregation, subsidy, cost, net-profit, and pricing reminders. Resolve every marketing field independently in this order: specification-safe `样式ID` → exact `商品ID + 商品SKU` → `店铺名称 + 规范化商品SKU` → cross-shop `商品SKU` candidates whose populated values are identical for that field. Normalize SKU full-width/half-width characters, all whitespace, and letter case. Never select the first cross-shop candidate when values conflict; a same-shop value wins before a cross-shop consistent value. A fallback record must not overwrite the order's original `商品ID`、`店铺名称` or final `商品SKU`. Retain the safely matched `促销机制` in normal sales and empty-burn output rows. Activity and registration prices remain internal inputs for the existing order checks; do not output either price column. Populate `促销机制` from `活动名称`; only fall back to legacy promotion-mechanism fields when `活动名称` is blank. Normal-sales `到手价` is always actual receipt ÷ quantity. Compare it with `单件预估实收金额` only to generate warnings: even when actual is more than 5% below expected, write the actual value and warn. Never blank or replace the actual arrival price with the estimate.
 
-For both platforms, never transfer a product's promotion spend to another selling product. For Pinduoduo, keep promotion spend keyed by `日期 + 店铺名称 + 商品ID` from import through allocation and reconciliation; allocate it only among effective sales rows for the same shop and product. When that key has no effective sales amount, add one independent `空烧推广费` row and preserve the promotion source shop. Keep every safely matched product, category, cost, and activity field; write both `实际成交数量（去退款去补单后）` and `实际成交金额（去退款去补单后）` as `0`, write net sales and gross profit as `0`, and write net profit as the negative promotion fee. If a product-level promotion row cannot resolve one specification, write `多规格未唯一匹配` in both `SKU ID` and `商品SKU`, never choose an arbitrary specification. Write `不适用（无有效销量）` in the empty-burn `到手价`. Mark `备注` as `空烧推广费：无有效销售`, append the multi-spec marker when applicable, retain the three Tmall promotion-component amounts in the Tmall remark, and record the generated empty-burn row in the generation log. Keep every normal sales row before every empty-burn row; place the complete empty-burn group at the absolute bottom of the output table, then sort that bottom group by `日期`、`店铺名称`、`商品ID`、`SKU ID`、`商品SKU`.
+For both platforms, never transfer a product's promotion spend to another selling product. For Pinduoduo, keep promotion spend keyed by `日期 + 店铺名称 + 商品ID` from import through allocation and reconciliation; allocate it only among effective sales rows for the same shop and product. When that key has no effective sales amount, add one independent `空烧推广费` row and preserve the promotion source shop. Keep every safely matched product, category, cost, and activity field; write both `实际成交数量（去退款去补单后）` and `实际成交金额（去退款去补单后）` as `0`, write gross profit as `0`, and write net profit as the negative promotion fee. If a product-level promotion row cannot resolve one specification, write `多规格未唯一匹配` in both `SKU ID` and `商品SKU`, never choose an arbitrary specification. Write `不适用（无有效销量）` in the empty-burn `到手价`. Mark `备注` as `空烧推广费：无有效销售`, append the multi-spec marker when applicable, retain the three Tmall promotion-component amounts in the Tmall remark, and record the generated empty-burn row in the generation log. Keep every normal sales row before every empty-burn row; place the complete empty-burn group at the absolute bottom of the output table, then sort that bottom group by `日期`、`店铺名称`、`商品ID`、`SKU ID`、`商品SKU`.
 
 ## 数据整理至日报交接保护
 
@@ -72,11 +72,11 @@ Apply all four safeguards before writing either platform workbook. A failure in 
 
 ## Cost Matching and Data Quality Protection
 
-### 商品综合成本与单件毛利（2026-11-05用户确认）
+### 单件综合成本与整行利润（2026-11-06用户最新确认）
 
-商品日报成本列顺序为“综合成本、产品成本、快递成本、其他均摊成本、平台费用”，删除旧“店铺费用”和“平摊管理费用”。快递成本按下述运费表规则匹配，不再固定2.1元；其他均摊成本=到手价×16.7%；平台费用=到手价×0.7%；综合成本=以上四项之和。毛利改为单件“到手价−综合成本”，毛利率=单件毛利÷到手价。详见 [商品成本与毛利规则](references/product_economics.md)。计算与写表均按字段名定位，不再固定到旧列字母。SKU ID仍是绝对最后一列。
+商品日报成本列顺序为“综合成本、产品成本、快递成本、其他均摊成本、平台费用”，删除旧“店铺费用”和“平摊管理费用”。快递成本按下述运费表规则匹配，不再固定2.1元；其他均摊成本=到手价×16.7%；平台费用=到手价×0.7%；综合成本及四个分项都为每件金额，综合成本=产品成本+快递成本+其他均摊成本+平台费用。毛利=实际成交金额（去退款去补单后）−综合成本×实际成交数量（去退款去补单后）；毛利率=毛利÷实际成交金额（去退款去补单后），成交金额为0则留空。详见 [商品成本与毛利规则](references/product_economics.md)。计算与写表均按字段名定位，不再固定到旧列字母。SKU ID仍是绝对最后一列。
 
-即使缺营销资料，已知的综合成本、单件毛利、毛利率及按下述新定义可计算的净利润仍填写；未知净销售额和补贴继续留空。历史列迁移只使用既有最终确认的报表行，保留date_notes、销量、实收、推广和排除结果；不得重导原始订单恢复已排除数据。
+商品日报删除活动价、报名价、每单补贴金额、总补贴金额、净销售额（实际成交+总补贴金额）这5列，输出32列，SKU ID仍在最后。即使缺营销资料，可计算的综合成本、整行毛利、毛利率和净利润仍填写；删除字段不能由部分资料模式重新加回。历史列迁移只使用既有最终确认的报表行，保留date_notes、销量、实收、推广和排除结果；不得重导原始订单恢复已排除数据。
 
 ### 快递成本按编码与地区匹配（2026-11-06用户确认）
 
@@ -86,13 +86,13 @@ Apply all four safeguards before writing either platform workbook. A failure in 
 
 ### 净利润、日期和SKU列（2026-11-05再次确认）
 
-净利润直接等于该行毛利−该行推广费用，不乘销量、不加补贴；覆盖先前整行总利润口径。毛利未知时净利润留空。输出列“商品SKU”改为“SKU编码”，其后紧接新增“SKU名称”，按成本表的编码精确匹配“产品名称”（兼容旧表“商品名称”）。名称独立于成本金额匹配：成本不可用但编码名称明确时仍可填名称，不猜标题或组合子件；冲突停止。订单与营销输入仍兼容旧商品SKU字段；输出与历史业务键使用SKU编码。商品日期保存为真实日期，显示格式统一`yyyy-mm-dd`。SKU ID仍在最后。详见 [商品成本与毛利规则](references/product_economics.md)。
+净利润=该行毛利−该行推广费用。综合成本保持单件金额，只在毛利处乘一次有效销量，毛利和净利润不再重复乘销量，也不加入补贴。毛利未知时净利润留空。输出列“商品SKU”改为“SKU编码”，其后紧接新增“SKU名称”，按成本表的编码精确匹配“产品名称”（兼容旧表“商品名称”）。名称独立于成本金额匹配：成本不可用但编码名称明确时仍可填名称，不猜标题或组合子件；冲突停止。订单与营销输入仍兼容旧商品SKU字段；输出与历史业务键使用SKU编码。商品日期保存为真实日期，显示格式统一`yyyy-mm-dd`。SKU ID仍在最后。详见 [商品成本与毛利规则](references/product_economics.md)。
 
 ### 产品数据库成本（2026-11-05）
 
 默认优先读取 `<数据库根目录>/1.产品数据库/产品成本.xlsx`，`--cost-table` 显式指定优先级最高；产品库无成本表时兼容旧的“营销活动监控”目录。读取新成本汇总格式和部分参考资料缺失时，先读 [产品成本读取规则](references/product_costs.md)。此规则覆盖下文仅从营销活动监控自动发现成本表的旧说明。
 
-“编码成本汇总”按用户确认接入正式匹配成本和参考测算成本。状态为“已匹配”时优先使用正数“匹配成本(元)”，没有可用值时使用正数“参考测算成本(元)”；状态为“参考测算”时使用正数“参考测算成本(元)”，并在成本来源中标注。只有未匹配或没有可用正数成本的项目留空。组合装按组合装编码、货品按货品编码匹配订单最终规格编码；组合子件列表不作为组合装的规格编码。缺营销活动表时保留可用成本与按新定义可算的毛利、净利润，未知补贴仍留空。
+“编码成本汇总”按用户确认接入正式匹配成本和参考测算成本。状态为“已匹配”时优先使用正数“匹配成本(元)”，没有可用值时使用正数“参考测算成本(元)”；状态为“参考测算”时使用正数“参考测算成本(元)”，并在成本来源中标注。只有未匹配或没有可用正数成本的项目留空。组合装按组合装编码、货品按货品编码匹配订单最终规格编码；组合子件列表不作为组合装的规格编码。缺营销活动表时保留可用成本与按新定义可算的毛利、净利润，不输出已删除的补贴字段。
 
 Apply these rules to both platforms while leaving the existing refund and supplemental-order handling unchanged:
 
@@ -104,7 +104,7 @@ Apply these rules to both platforms while leaving the existing refund and supple
 6. Deduplicate byte-for-byte identical order files, and when the same identified order line occurs across overlapping exports, keep the newest file by modification time using `店铺 + 订单号 + SKU ID + 商品ID + 商品SKU`. Do not merge unrelated rows merely because an order-number field is absent. Stop on an unreadable relevant order or promotion file, a required-field failure, or an invalid nonblank order/promotion number. Keep 商品ID、SKU ID and 商品SKU as text when writing Excel so long identifiers never lose digits.
 7. For 商品数据 exports above `100,000` rows, use the first `100,000` rows and warn; do not discard the entire file.
 
-For both platform outputs, display `实际成交数量（去退款去补单后）` as an integer, `每单补贴金额` and `总补贴金额` as numbers with two decimal places, and `毛利率` as a percentage.
+For both platform outputs, display `实际成交数量（去退款去补单后）` as an integer, retained money columns with two decimal places, and `毛利率` as a percentage. The five deleted price/subsidy/net-sales fields are not report columns.
 
 For both platform outputs, place the four cost-metadata columns immediately before the final `SKU ID` column, after all normal, blank, and auxiliary columns. Keep their exact order as `项目组`、`管理类型`、`品种`、`产线`, then write `SKU ID` as the absolute final column; never insert another output column after `SKU ID`.
 
@@ -112,7 +112,7 @@ Both modes use `%USERPROFILE%\Desktop\运营数据库`. Marketing activity workb
 
 Read the marketing activity workbook before calculating. If it cannot be opened, has no `商品ID`、`样式ID`、`商品SKU` headers, or has no valid product records, stop immediately and report the specific failure. Never generate a report with blank marketing fields after a marketing-workbook read failure.
 
-For Pinduoduo, check `品牌`、`所属运营`、`平台`、`店铺名称`、`大类`、`商品ID`、`商品SKU`、`产品成本`、`活动价`、`报名价`、`促销机制` and `到手价` before writing. Never leave one of these fields silently blank. When it cannot be filled safely, write `营销活动表未匹配/未维护` and add a generation warning; use the empty-burn and multi-spec markers defined above where applicable. Preserve invalid nonblank values such as `#N/A` for diagnosis or replace an unusable cost with the explicit missing marker, but never coerce a missing or invalid cost or price to numeric zero.
+For Pinduoduo, check `品牌`、`所属运营`、`平台`、`店铺名称`、`大类`、`商品ID`、`商品SKU`、`产品成本`、`促销机制` and `到手价` before writing. Never leave one of these fields silently blank. When it cannot be filled safely, write `营销活动表未匹配/未维护` and add a generation warning; use the empty-burn and multi-spec markers defined above where applicable. Preserve invalid nonblank values such as `#N/A` for diagnosis or replace an unusable cost with the explicit missing marker, but never coerce a missing or invalid cost or price to numeric zero.
 
 For platform detection and 商品数据 exports, inspect at most the first 100,000 rows. If a 商品数据 export exceeds this limit, report that only the first 100,000 rows were used; do not silently claim that the report covers the entire file. Read all eligible rows from order and promotion exports for the calculation.
 

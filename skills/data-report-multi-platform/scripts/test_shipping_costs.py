@@ -104,12 +104,13 @@ class ShippingPolicyTests(unittest.TestCase):
         aggregate = {}
         capture_shipping_order(aggregate, {"省": "辽宁省", "市": "沈阳市"}, 1, "A", "订单/行2")
         capture_shipping_order(aggregate, {"省": "安徽省", "市": "合肥市"}, 3, "A", "订单/行3")
-        row = {"SKU编码": "A", "实际成交数量（去退款去补单后）": 4, "到手价": 100, "产品成本": 10}
+        row = {"SKU编码": "A", "实际成交数量（去退款去补单后）": 4, "实际成交金额（去退款去补单后）":400, "到手价": 100, "产品成本": 10}
         warnings, log = [], {}
         apply_shipping_cost(row, aggregate, self.table(), warnings, log)
         apply_product_cost_rules(row)
         self.assertEqual(row["快递成本"], 3.75)
-        self.assertAlmostEqual(row["毛利"], 68.85)
+        self.assertAlmostEqual(row["综合成本"], 31.15)
+        self.assertAlmostEqual(row["毛利"], 275.4)
         self.assertIn("4/4件", log["运费匹配状态"])
         self.assertIn("邮政/安徽", log["运费来源"])
         self.assertEqual(warnings, [])

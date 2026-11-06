@@ -115,8 +115,6 @@ MARKETING_REQUIRED_FIELDS = (
     "商品ID",
     "商品SKU",
     "产品成本",
-    "活动价",
-    "报名价",
     PROMOTION_MECHANISM_COLUMN,
 )
 MARKETING_NUMERIC_FIELDS = {
@@ -297,7 +295,7 @@ def read_template_columns() -> list[str]:
     with COLUMNS_CSV.open("r", encoding="utf-8-sig", newline="") as fh:
         reader = csv.DictReader(fh)
         for row in reader:
-            columns.append(row["column"])
+            columns.append(row["column"].replace("\r\n", "\n").replace("\r", "\n"))
     if columns.count("SKU ID") != 1 or not columns or columns[-1] != "SKU ID":
         raise ReportError("列模板必须且只能包含一个 SKU ID，并将其放在绝对最后一列。")
     return columns

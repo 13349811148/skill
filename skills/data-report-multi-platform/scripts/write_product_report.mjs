@@ -5,7 +5,7 @@ const wb=d.existingWorkbook?await SpreadsheetFile.importXlsx(await FileBlob.load
 const letter=(n)=>{let value='';for(;n>0;n=Math.floor((n-1)/26))value=String.fromCharCode(65+(n-1)%26)+value;return value;};
 const column=(name)=>{const index=d.columns.indexOf(name);return index<0?null:letter(index+1);};
 const last=letter(d.columns.length);
-const money=['综合成本','产品成本','快递成本','其他均摊成本','平台费用','活动价','报名价','到手价','实际成交金额（去退款去补单后）','每单补贴金额','总补贴金额','净销售额（实际成交+总补贴金额）','毛利','推广费用','净利润'];
+const money=['综合成本','产品成本','快递成本','其他均摊成本','平台费用','到手价','实际成交金额（去退款去补单后）','毛利','推广费用','净利润'];
 const parts=d.sheets||[{name:'每日销售数据',rows:d.rows,oldRows:0}];
 for(const part of parts){
 let s;
@@ -31,6 +31,9 @@ for(const name of ['商品ID','SKU编码','SKU ID']){const col=column(name);if(c
 for(const name of money){const col=column(name);if(col)s.getRange(`${col}2:${col}${n+1}`).setNumberFormat('#,##0.00');}
 const qty=column('实际成交数量（去退款去补单后）'),margin=column('毛利率');
 if(qty)s.getRange(`${qty}2:${qty}${n+1}`).setNumberFormat('#,##0');if(margin)s.getRange(`${margin}2:${margin}${n+1}`).setNumberFormat('0.00%');}
+// Historical schema migrations can carry the retained columns' original formats.
+if(n&&part.sourceNumberFormats)s.getRange(`A2:${last}${n+1}`).format.numberFormat=part.sourceNumberFormats;
+if(n)for(const name of part.sourceWrappedColumns||[]){const c=column(name);if(c)s.getRange(`${c}2:${c}${n+1}`).format.wrapText=true;}
 s.freezePanes.freezeRows(1);wb.recalculate();
 for(const [area,name] of process.env.DAILY_REPORT_PREVIEW==='0'?[]:[['A1:I7','identity'],['J1:R7','costs'],['S1:AC7','amounts']]){
  const img=await wb.render({sheetName:part.name,range:area,scale:1.2,format:'png'});await fs.writeFile(output+`.${d.sheets?part.name+'.':''}${name}.png`,new Uint8Array(await img.arrayBuffer()));

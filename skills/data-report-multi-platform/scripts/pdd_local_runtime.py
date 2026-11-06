@@ -3,7 +3,7 @@ import sys
 from pathlib import Path
 from portable_reports import install as portable_install
 from pdd_promotion_daily import load as load_promotion
-from product_cost_rules import apply_product_cost_rules
+from product_cost_rules import apply_product_cost_rules, REMOVED_REPORT_COLUMNS
 
 def install(module):
     portable_install(module)
@@ -34,17 +34,19 @@ def install(module):
     def build(*args,**kwargs):
         columns,rows,warnings,logs=original_build(*args,**kwargs)
         if missing:
-            fields=['净销售额（实际成交+总补贴金额）']
+            fields=[]
             if '营销活动表' in missing:
-                fields+=['活动价','报名价',module.PROMOTION_MECHANISM_COLUMN,'每单补贴金额','总补贴金额']
+                fields+=[module.PROMOTION_MECHANISM_COLUMN]
             missing_label='、'.join(sorted(set(missing)))
             for row in rows:
-                for field in fields:row[field]=''
+                for field in fields:
+                    if field in columns:row[field]=''
+                for field in REMOVED_REPORT_COLUMNS:row.pop(field,None)
                 if row.get('产品成本')=='营销活动表未匹配/未维护':row['产品成本']=''
                 for field in ['品牌','所属运营','大类']:
                     if row.get(field)=='营销活动表未匹配/未维护':row[field]=''
                 apply_product_cost_rules(row)
                 row['备注']='；'.join(filter(None,[row.get('备注',''),'缺少'+missing_label+'；已匹配成本保留，营销字段待补；净利润按毛利减推广费用；商品推广按实际，托管按成交额分摊']))
-            warnings.insert(0,'缺少'+missing_label+'；按用户授权输出已知商品字段，已匹配产品成本保留，综合成本和单件毛利按已知成本计算，缺失营销字段留空，净利润按毛利减推广费用计算。')
+            warnings.insert(0,'缺少'+missing_label+'；按用户授权输出已知商品字段，已匹配产品成本保留；综合成本为每件四项成本合计，毛利为实际成交金额减综合成本×有效销量，净利润为毛利减推广费用。')
         return columns,rows,warnings,logs
     module.load_marketing_rows=marketing;module.load_costs_by_merchant_code=costs;module.build_report=build
