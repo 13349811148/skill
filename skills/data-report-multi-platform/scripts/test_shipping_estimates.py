@@ -3,7 +3,7 @@ from tempfile import TemporaryDirectory
 import unittest
 from openpyxl import Workbook
 from shipping_costs import ShippingTable, ShippingQuote, load_shipping_table
-from shipping_estimates import name_grams, fill_same_weight_quotes
+from shipping_estimates import name_grams, fill_same_weight_quotes, reference_products
 
 
 class ShippingEstimatesTests(unittest.TestCase):
@@ -42,6 +42,45 @@ class ShippingEstimatesTests(unittest.TestCase):
             self.assertIn('按重量估算',table.lookup('A','圆通','安徽').estimate)
             self.assertEqual(table.lookup('B','圆通','安徽').amount,2.4)
             self.assertIn('同克重估算',table.lookup('B','圆通','安徽').estimate)
+
+    def test_only_authorized_codes_can_use_nearest_weight_and_distance_beats_packaging(self):
+        info={code:{'货品名称':name,'重量(g)':weight,'体积(cm³)':volume} for code,name,weight,volume in [
+            ('cb10','餐包360g*1盒',None,None),('other','餐包360g*1盒',None,None),
+            ('near','麻花188g【2袋】',520,900),('far','蛋糕400g*1盒',600,1000)]}
+        group=reference_products('cb10',info,{})
+        self.assertEqual(group['donors'],['near'])
+        self.assertEqual(group['reference_g'],376)
+        self.assertEqual(group['difference_g'],16)
+        self.assertIsNone(reference_products('other',info,{}))
+
+    def test_exact_weight_wins_and_equal_distance_chooses_heavier_nominal_weight(self):
+        info={code:{'货品名称':f'产品{grams}g【1袋】','重量(g)':weight,'体积(cm³)':800} for code,grams,weight in [
+            ('wh03',206,None),('low',202,300),('high',210,310)]}
+        self.assertEqual(reference_products('wh03',info,{})['donors'],['high'])
+        info['exact']={'货品名称':'产品206g【1袋】','重量(g)':320,'体积(cm³)':None}
+        self.assertEqual(reference_products('wh03',info,{})['donors'],['exact'])
+
+    def test_nearest_reference_price_is_not_scaled_or_used_to_fill_product_cost(self):
+        info={'sqm05':{'货品名称':'沙琪玛500g*1箱','重量(g)':None,'体积(cm³)':None},
+              'ref':{'货品名称':'吐司460g【1袋】','重量(g)':651,'体积(cm³)':2000}}
+        table=ShippingTable({('sqm05','圆通','湖北'):ShippingQuote(None,''),
+                             ('ref','圆通','湖北'):ShippingQuote(2.4,'原表已含打包费')})
+        fill_same_weight_quotes(table,info,{})
+        quote=table.lookup('sqm05','圆通','湖北')
+        self.assertEqual(quote.amount,2.4)
+        self.assertIn('差40g',quote.estimate)
+        self.assertIn('最接近克重估算',quote.estimate)
+
+    def test_cached_nearest_estimate_refreshes_when_a_closer_measured_donor_exists(self):
+        info={'cb10':{'货品名称':'餐包360g*1盒','重量(g)':None,'体积(cm³)':None},
+              'old':{'货品名称':'吐司400g【1袋】','重量(g)':600,'体积(cm³)':2000},
+              'new':{'货品名称':'麻花188g【2袋】','重量(g)':520,'体积(cm³)':1900}}
+        table=ShippingTable({('cb10','圆通','湖北'):ShippingQuote(8,'旧缓存',estimate='最接近克重估算（参考400g）'),
+                             ('old','圆通','湖北'):ShippingQuote(8,'旧参考'),
+                             ('new','圆通','湖北'):ShippingQuote(2.4,'新参考')})
+        fill_same_weight_quotes(table,info,{})
+        self.assertEqual(table.lookup('cb10','圆通','湖北').amount,2.4)
+        self.assertIn('参考376g',table.lookup('cb10','圆通','湖北').estimate)
 
 
 if __name__=='__main__':unittest.main()

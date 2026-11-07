@@ -6,6 +6,9 @@ import unicodedata
 
 from data_quality_protection import normalize_match_code, optional_number, text
 
+# These are the only products the user authorized for nearest-weight fallback.
+NEAREST_WEIGHT_CODES = {"cb10", "lmb01", "sqm05", "wh03"}
+
 
 def name_grams(name):
     value = unicodedata.normalize("NFKC", text(name)).lower()
@@ -86,37 +89,58 @@ def nominal_weights(path: Path):
     return {code: resolve(code) for code in records}
 
 
+def reference_products(code, measurements, weights):
+    """Exact nominal grams first; the four authorized codes may use nearest grams."""
+    def grams(code, row):
+        if "辅材" in text(row.get("分类")):
+            return None
+        return weights.get(code) or name_grams(row.get("货品名称"))
+    row = measurements.get(code, {})
+    nominal = grams(code, row)
+    if nominal is None:
+        return None
+    candidates = [(other, data, grams(other, data)) for other, data in measurements.items()
+                  if other != code and (optional_number(data.get("重量(g)")) or 0) > 0
+                  and grams(other, data) is not None]
+    donors = [(other, data, g) for other, data, g in candidates if g == nominal]
+    if not donors and normalize_match_code(code) in NEAREST_WEIGHT_CODES and candidates:
+        distance = min(abs(g - nominal) for _, _, g in candidates)
+        reference_g = max(g for _, _, g in candidates if abs(g - nominal) == distance)
+        donors = [(other, data, g) for other, data, g in candidates if g == reference_g]
+    if not donors:
+        return None
+    complete = [(other, data, g) for other, data, g in donors if (optional_number(data.get("体积(cm³)")) or 0) > 0]
+    if complete:
+        donors = complete
+    same_package = [(other, data, g) for other, data, g in donors if package(data.get("货品名称")) == package(row.get("货品名称"))]
+    if same_package:
+        donors = same_package
+    reference_g = donors[0][2]
+    return {"target_g":nominal, "reference_g":reference_g, "difference_g":abs(reference_g - nominal),
+            "donors":[other for other, _, _ in donors], "kind":"同克重估算" if reference_g == nominal else "最接近克重估算"}
+
+
 def fill_same_weight_quotes(table, measurements, weights):
     """Only absent weight AND volume qualify. Donors always have measured weight."""
     from shipping_costs import ShippingQuote
     from statistics import median
     original = dict(table.prices)
-    def grams(code, row):
-        if "辅材" in text(row.get("分类")):
-            return None
-        return weights.get(code) or name_grams(row.get("货品名称"))
     for code, row in measurements.items():
         if optional_number(row.get("重量(g)")) is not None or optional_number(row.get("体积(cm³)")) is not None:
             continue
-        nominal = grams(code, row)
-        if nominal is None:
+        group = reference_products(code, measurements, weights)
+        if group is None:
             continue
-        donors = [(other, data) for other, data in measurements.items()
-                  if other != code and (optional_number(data.get("重量(g)")) or 0) > 0
-                  and grams(other, data) == nominal]
-        complete = [(other, data) for other, data in donors if (optional_number(data.get("体积(cm³)")) or 0) > 0]
-        if complete:
-            donors = complete
-        same_package = [(other, data) for other, data in donors if package(data.get("货品名称")) == package(row.get("货品名称"))]
-        if same_package:
-            donors = same_package
         for key, current in original.items():
-            if key[0] != code or current.amount is not None:
+            refresh_estimate = normalize_match_code(code) in NEAREST_WEIGHT_CODES and "克重估算" in current.estimate
+            if key[0] != code or (current.amount is not None and not refresh_estimate):
                 continue
-            refs = [(other, original.get((other, key[1], key[2]))) for other, _ in donors]
+            refs = [(other, original.get((other, key[1], key[2]))) for other in group['donors']]
             refs = [(other, q) for other, q in refs if q is not None and q.amount is not None]
             if not refs:
                 continue
             amount = float(Decimal(str(median(q.amount for _, q in refs))).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
-            estimate = f"同克重估算（{nominal:g}g，参考{','.join(other for other, _ in refs)}的地区报价中位数）"
+            detail = (f"{group['target_g']:g}g" if group['difference_g'] == 0 else
+                      f"目标{group['target_g']:g}g，参考{group['reference_g']:g}g，差{group['difference_g']:g}g")
+            estimate = f"{group['kind']}（{detail}，参考{','.join(other for other, _ in refs)}的地区报价中位数）"
             table.prices[key] = ShippingQuote(amount, estimate + "；" + "；".join(q.source for _, q in refs), estimate=estimate)

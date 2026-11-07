@@ -1,7 +1,7 @@
 {
   "name": "daily-report",
-  "version": "2026.11.07+freight.1",
-  "description": "按月累计商品及店铺日报；缺体积按重量、缺重量体积按同克重商品估算运费，缺省市按多数地区报价估算；保留来源与每件0.4元打包费。",
+  "version": "2026.11.07+freight.2",
+  "description": "按月累计商品及店铺日报；缺体积按重量、缺重量体积按同克重商品估算运费；指定4个编码可参考最接近克重，估算保留来源；缺省市按多数地区报价。",
   "skills": [
     "./skills/data-report-multi-platform"
   ],
