@@ -6,6 +6,7 @@ YTO/China Post quote. This is a per-unit estimate, not an actual parcel bill.
 """
 from dataclasses import dataclass, field
 from pathlib import Path
+from collections import Counter
 import math
 
 from data_quality_protection import DataQualityError, normalize_match_code, optional_number, text
@@ -17,7 +18,7 @@ PROVINCES = set("湖北 浙江 江苏 安徽 江西 广东 山东 湖南 河南 
 PROVINCE_HEADERS = ("收货省份", "收货省", "收件省份", "收件省", "收货人省份", "省份", "省")
 CITY_HEADERS = ("收货城市", "收货市", "收件城市", "收件市", "收货人城市", "城市", "市")
 QUANTITY = "实际成交数量（去退款去补单后）"
-POLICY = "黑吉辽固定圆通；其他地区取圆通、邮政有效报价较低者"
+POLICY = "黑吉辽固定圆通；其他地区取圆通、邮政有效报价较低者；缺省市按适用地区最多的报价估算"
 
 
 def normalize_province(value) -> str:
@@ -48,6 +49,7 @@ class ShippingQuote:
     amount: float | None
     source: str
     reason: str = ""
+    estimate: str = ""
 
 
 @dataclass
@@ -66,13 +68,32 @@ class ShippingTable:
         return self.prices.get((key, carrier, region),
                                ShippingQuote(None, "", "运费表未匹配编码或地区"))
 
+    def majority_region(self, code: str) -> ShippingQuote:
+        """Mode of the per-region carrier selections; a tie uses the higher price."""
+        regions = sorted({r for c, _, r in self.prices if c == normalize_match_code(code)})
+        quotes = [(r, self._select_region(code, r)) for r in regions]
+        valid = [(r, q) for r, q in quotes if q.amount is not None]
+        if not valid:
+            return ShippingQuote(None, "", "该编码无可用地区运费，无法按多数地区估算")
+        frequencies = Counter(round(q.amount, 8) for _, q in valid)
+        amount = max(frequencies, key=lambda n: (frequencies[n], n))
+        selected = [(r, q) for r, q in valid if math.isclose(q.amount, amount, abs_tol=1e-8)]
+        label = "缺收货省市，按适用地区最多的报价估算"
+        source = (f"{label}={amount:g}元/件（{len(selected)}/{len(valid)}个有效地区，"
+                  f"并列取较高价；地区={','.join(r for r, _ in selected)}）；参考：{selected[0][1].source}")
+        estimates = [label] + [q.estimate for _, q in selected if q.estimate]
+        return ShippingQuote(amount, source, estimate="；".join(dict.fromkeys(estimates)))
+
     def select(self, code: str, province: str, city: str = "") -> ShippingQuote:
+        if normalize_match_code(city).removesuffix("市") == "深圳" and normalize_province(province) not in ("", "广东"):
+            return ShippingQuote(None, "", "收货省份与深圳市冲突")
         region = destination_region(province, city)
-        if not region:
-            return ShippingQuote(None, "", "收货省市缺失、冲突或无法识别")
+        return self._select_region(code, region) if region else self.majority_region(code)
+
+    def _select_region(self, code: str, region: str) -> ShippingQuote:
         yto = self.lookup(code, "圆通", region)
         if region in NORTHEAST:
-            return ShippingQuote(yto.amount, "黑吉辽固定圆通；" + yto.source, yto.reason)
+            return ShippingQuote(yto.amount, "黑吉辽固定圆通；" + yto.source, yto.reason, yto.estimate)
         postal = self.lookup(code, "邮政", region)
         valid = [(q.amount, carrier, q) for carrier, q in (("圆通", yto), ("邮政", postal))
                  if q.amount is not None]
@@ -82,7 +103,7 @@ class ShippingTable:
         # Stable carrier order makes equal-price selections reproducible.
         amount, carrier, selected = min(valid, key=lambda item: item[0])
         comparison = f"圆通={yto.amount if yto.amount is not None else '无有效报价'}，邮政={postal.amount if postal.amount is not None else '无有效报价'}"
-        return ShippingQuote(amount, f"其他地区取低价（{comparison}，选{carrier}）；{selected.source}")
+        return ShippingQuote(amount, f"其他地区取低价（{comparison}，选{carrier}）；{selected.source}", estimate=selected.estimate)
 
 
 def capture_shipping_order(aggregate: dict, order: dict, quantity: float,
@@ -101,17 +122,21 @@ def capture_shipping_order(aggregate: dict, order: dict, quantity: float,
 
 def apply_shipping_cost(row: dict, aggregate: dict, table: ShippingTable,
                         warnings: list[str], cost_log: dict) -> None:
-    """Quantity-weighted unit cost; any unmatched effective units stay unknown."""
+    """Quantity-weighted unit cost, including explicitly marked estimates."""
     row["快递成本"] = ""
     quantity = optional_number(row.get(QUANTITY))
     if quantity is None or quantity <= 0:
         cost_log.update({"快递成本": "", "运费来源": "", "运费匹配状态": "无有效销量"})
         return
     code = text(row.get("SKU编码") or row.get("商品SKU"))
-    contexts = aggregate.get("_运费订单", {}).values()
+    contexts = list(aggregate.get("_运费订单", {}).values())
+    whole_row_reason = text(aggregate.get("_运费整行估算原因"))
+    if whole_row_reason:
+        contexts = [{"编码": code, "省": "", "市": "", "数量": quantity, "来源示例": whole_row_reason}]
     total_cost = matched = captured = 0.0
     sources = []
     missing = []
+    estimates = [whole_row_reason] if whole_row_reason else []
     for context in contexts:
         count = context["数量"]
         captured += count
@@ -127,6 +152,8 @@ def apply_shipping_cost(row: dict, aggregate: dict, table: ShippingTable,
         else:
             matched += count
             total_cost += count * quote.amount
+            if quote.estimate:
+                estimates.append(quote.estimate)
     if not math.isclose(captured, quantity, rel_tol=1e-9, abs_tol=1e-6):
         missing.append(f"运费上下文数量{captured:g}与报表有效数量{quantity:g}不一致")
     status = f"已匹配{matched:g}/{quantity:g}件；{POLICY}"
@@ -139,7 +166,13 @@ def apply_shipping_cost(row: dict, aggregate: dict, table: ShippingTable,
     else:
         row["快递成本"] = total_cost / quantity
         remark = "快递成本按收货地区报价预估，黑吉辽圆通、其他取低价"
-    row["备注"] = "；".join(filter(None, (text(row.get("备注")), remark)))
+        if estimates:
+            labels = "；".join(dict.fromkeys(estimates))
+            status += "；估算来源：" + labels
+            remark += "；运费估算说明：" + labels.replace("；", "，")
+    own_remarks = {"运费未完整匹配，综合成本及利润留空", "快递成本按收货地区报价预估，黑吉辽圆通、其他取低价"}
+    preserved = [s for s in text(row.get("备注")).split("；") if s and s not in own_remarks and not s.startswith("运费估算说明：")]
+    row["备注"] = "；".join([*preserved, remark])
     cost_log.update({"快递成本": row["快递成本"], "运费来源": "；".join(sources), "运费匹配状态": status})
 
 
@@ -156,8 +189,25 @@ def load_shipping_table(path: Path) -> tuple[ShippingTable, list[str]]:
     except Exception as exc:
         raise DataQualityError(f"运费成本表读取失败：{path}；{exc}") from exc
     try:
+        estimates, measurements = {}, {}
         if "编码匹配" in wb.sheetnames:
-            table.selected_region = text(wb["编码匹配"]["B4"].value)
+            info = wb["编码匹配"]
+            table.selected_region = text(info["B4"].value)
+            headers = None
+            for rn, values in enumerate(info.iter_rows(values_only=True), 1):
+                if headers is None:
+                    labels = [text(v) for v in values]
+                    if "编码" in labels and "数据状态" in labels:
+                        headers = labels
+                    elif rn > 20:
+                        break
+                    continue
+                code = normalize_match_code(values[headers.index("编码")])
+                state = text(values[headers.index("数据状态")])
+                if code:
+                    measurements[code] = dict(zip(headers, values))
+                if code and "估算" in state:
+                    estimates[code] = state
         for carrier, name in CARRIER_SHEETS.items():
             if name not in wb.sheetnames:
                 raise DataQualityError(f"运费成本表缺少工作表：{path}/{name}")
@@ -191,8 +241,11 @@ def load_shipping_table(path: Path) -> tuple[ShippingTable, list[str]]:
                     valid = amount is not None and amount > 0 and not isinstance(raw, bool)
                     source = (f"运费表:{path.name}/{name}/{get_column_letter(index + 1)}"
                               f"{physical_row}/编码={raw_code}/地区={region}（预估）")
+                    estimate = estimates.get(code, "") if valid else ""
+                    if estimate:
+                        source += "；" + estimate
                     quote = ShippingQuote(amount if valid else None, source,
-                                          "" if valid else f"费用无有效正数或公式缓存缺失：{text(raw) or '空白'}")
+                                          "" if valid else f"费用无有效正数或公式缓存缺失：{text(raw) or '空白'}", estimate)
                     key = (code, carrier, region)
                     previous = table.prices.get(key)
                     if previous:
@@ -204,6 +257,9 @@ def load_shipping_table(path: Path) -> tuple[ShippingTable, list[str]]:
                     table.prices[key] = quote
     finally:
         wb.close()
+    if measurements:
+        from shipping_estimates import nominal_weights, fill_same_weight_quotes
+        fill_same_weight_quotes(table, measurements, nominal_weights(path.parent / "产品成本.xlsx"))
     codes = {key[0] for key in table.prices}
     usable = {key[0] for key, quote in table.prices.items() if quote.amount is not None}
     warnings.append(f"运费成本表按已保存的地区报价读取：编码{len(codes)}个，可用报价编码{len(usable)}个；"

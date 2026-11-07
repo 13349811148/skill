@@ -1,7 +1,7 @@
 {
   "name": "daily-report",
-  "version": "2026.11.07+date.1",
-  "description": "商品日报20列；日期仅显示yyyy-mm-dd，保留各行业务日期；SKU ID紧随商品ID，备注为最后一列；按月累计，商品日报同步WPS。",
+  "version": "2026.11.07+freight.1",
+  "description": "按月累计商品及店铺日报；缺体积按重量、缺重量体积按同克重商品估算运费，缺省市按多数地区报价估算；保留来源与每件0.4元打包费。",
   "skills": [
     "./skills/data-report-multi-platform"
   ],

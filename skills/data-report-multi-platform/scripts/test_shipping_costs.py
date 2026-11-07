@@ -86,10 +86,21 @@ class ShippingPolicyTests(unittest.TestCase):
         table = self.table()
         self.assertEqual(table.select("A", "安徽省").amount, 2)
         self.assertEqual(table.select("A", "广东省", "深圳市").amount, 4)
-        self.assertIsNone(table.select("A", "广东省", "").amount)
+        self.assertEqual(table.select("A", "广东省", "").amount, 9)
         self.assertIsNone(table.select("A", "辽宁", "深圳").amount)
-        self.assertIsNone(table.select("A", "未知").amount)
-        self.assertIsNone(table.select("A", "").amount)  # No selected-region fallback.
+        self.assertEqual(table.select("A", "未知").amount, 9)
+        self.assertEqual(table.select("A", "").amount, 9)  # Mode, not the selected-region display.
+        self.assertIn("3/6", table.select("A", "").source)
+        self.assertIn("估算", table.select("A", "").estimate)
+
+    def test_mode_is_counted_after_carrier_selection_and_ties_take_higher(self):
+        table = self.table()
+        table.prices[("a", "圆通", "辽宁")] = ShippingQuote(2, "圆通/辽宁")
+        table.prices[("a", "邮政", "深圳")] = ShippingQuote(9, "邮政/深圳")
+        table.prices[("a", "圆通", "深圳")] = ShippingQuote(9, "圆通/深圳")
+        # Three regions cost 2 and three cost 9 after the Northeast rule; tie is conservative.
+        self.assertEqual(table.majority_region("A").amount, 9)
+        self.assertIsNone(table.majority_region("unknown").amount)
 
     def test_one_missing_quote_only_allows_fallback_outside_northeast(self):
         table = self.table()
@@ -115,7 +126,7 @@ class ShippingPolicyTests(unittest.TestCase):
         self.assertIn("邮政/安徽", log["运费来源"])
         self.assertEqual(warnings, [])
 
-    def test_partial_match_never_averages_only_the_known_orders(self):
+    def test_missing_destination_uses_mode_in_quantity_weighted_cost(self):
         aggregate = {}
         capture_shipping_order(aggregate, {"省": "安徽"}, 3, "A", "订单/行2")
         capture_shipping_order(aggregate, {}, 1, "A", "订单/行3")
@@ -123,11 +134,40 @@ class ShippingPolicyTests(unittest.TestCase):
         warnings, log = [], {}
         apply_shipping_cost(row, aggregate, self.table(), warnings, log)
         apply_product_cost_rules(row)
-        for field in ("快递成本", "综合成本", "毛利", "净利润"):
-            self.assertEqual(row[field], "")
+        self.assertEqual(row["快递成本"], 3.75)
         self.assertEqual(row["产品成本"], 10)
-        self.assertIn("3/4件", log["运费匹配状态"])
-        self.assertTrue(any("订单/行3" in warning for warning in warnings))
+        self.assertIn("4/4件", log["运费匹配状态"])
+        self.assertIn("适用地区最多", row["备注"])
+        self.assertEqual(warnings, [])
+
+    def test_missing_code_or_quantity_mismatch_stays_unknown(self):
+        for code, count in (("unknown", 4), ("A", 3)):
+            aggregate = {}
+            capture_shipping_order(aggregate, {}, count, code, "订单/行2")
+            row = {"SKU编码":code, "实际成交数量（去退款去补单后）":4}
+            warnings, log = [], {}
+            apply_shipping_cost(row, aggregate, self.table(), warnings, log)
+            self.assertEqual(row["快递成本"], "")
+            self.assertTrue(warnings)
+
+    def test_explicit_historical_estimate_uses_confirmed_final_quantity(self):
+        row = {"SKU编码":"A", "实际成交数量（去退款去补单后）":4, "备注":"已剔除补单；运费未完整匹配，综合成本及利润留空"}
+        warnings, log = [], {}
+        apply_shipping_cost(row, {"_运费整行估算原因":"历史有效订单集合未唯一核实"}, self.table(), warnings, log)
+        self.assertEqual(row["快递成本"], 9)
+        self.assertIn("历史有效订单集合未唯一核实", log["运费匹配状态"])
+        self.assertIn("已剔除补单", row["备注"])
+        self.assertNotIn("运费未完整匹配", row["备注"])
+
+    def test_reference_estimate_metadata_propagates_without_adding_packing_again(self):
+        table = self.table()
+        table.prices[("a","邮政","安徽")] = ShippingQuote(2.4,"报价已含0.4打包费",estimate="同克重估算（300g）")
+        aggregate = {};capture_shipping_order(aggregate, {"省":"安徽"}, 2, "A", "订单/行2")
+        row = {"SKU编码":"A", "实际成交数量（去退款去补单后）":2}
+        warnings, log = [], {}
+        apply_shipping_cost(row, aggregate, table, warnings, log)
+        self.assertEqual(row["快递成本"], 2.4)
+        self.assertIn("同克重估算", row["备注"])
 
 
 if __name__ == "__main__":

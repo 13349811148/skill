@@ -83,17 +83,19 @@ class ShippingIntegrationTests(unittest.TestCase):
                 self.assertNotIn("无报价地区", logs[0]["运费来源"])
                 self.assertFalse(any("运费未完整匹配" in warning for warning in warnings))
 
-    def test_both_platforms_leave_profit_unknown_when_any_effective_order_lacks_region(self):
+    def test_both_platforms_estimate_missing_region_without_changing_accepted_orders(self):
         for module in (pdd, tmall):
             with self.subTest(platform=module.__name__), TemporaryDirectory() as directory:
                 _, rows, warnings, logs = self.build(Path(directory), module, True)
                 row = rows[0]
                 self.assertEqual(row["实际成交数量（去退款去补单后）"], 5)
                 self.assertEqual(row["产品成本"], 10)
-                for field in ("快递成本", "综合成本", "毛利", "净利润"):
-                    self.assertEqual(row[field], "")
-                self.assertIn("4/5件", logs[0]["运费匹配状态"])
-                self.assertTrue(any("运费未完整匹配" in warning for warning in warnings))
+                self.assertEqual(row["快递成本"], 4.8)  # 1x9 + 3x2 + missing region at tied mode 9.
+                self.assertAlmostEqual(row["毛利"], 339)
+                self.assertAlmostEqual(row["净利润"], 339)
+                self.assertIn("5/5件", logs[0]["运费匹配状态"])
+                self.assertIn("适用地区最多", row["备注"])
+                self.assertFalse(any("运费未完整匹配" in warning for warning in warnings))
 
 
 if __name__ == "__main__":
