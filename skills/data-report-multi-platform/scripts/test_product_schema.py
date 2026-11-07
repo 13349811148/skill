@@ -10,25 +10,34 @@ import build_pdd_report as pdd
 import build_tmall_report as tmall
 import pdd_local_runtime as runtime
 from product_cost_rules import apply_product_cost_rules, product_output_row, REMOVED_REPORT_COLUMNS
+from product_schema import PRODUCT_COLUMNS, LEGACY_COLUMNS_32, compatible_headers, normalize_headers
 
 
 class ProductSchemaTests(unittest.TestCase):
-    def test_windows_csv_line_endings_keep_the_existing_multiline_header(self):
+    def test_windows_csv_line_endings_keep_the_new_schema(self):
         with TemporaryDirectory() as directory:
             path=Path(directory)/'columns.csv'
             raw=pdd.COLUMNS_CSV.read_bytes().replace(b'\r\n',b'\n').replace(b'\n',b'\r\n')
             path.write_bytes(raw)
             for module in (pdd,tmall):
                 with patch.object(module,'COLUMNS_CSV',path):
-                    self.assertIn(module.PROMOTION_MECHANISM_COLUMN,module.read_template_columns())
+                    self.assertEqual(module.read_template_columns(),list(PRODUCT_COLUMNS))
+        legacy=[c.replace('\n','\r\n') for c in LEGACY_COLUMNS_32]
+        self.assertTrue(compatible_headers(legacy,list(PRODUCT_COLUMNS)))
 
-    def test_both_platforms_expose_32_columns_with_no_removed_fields(self):
+    def test_both_platforms_expose_20_columns_with_no_removed_fields(self):
         for module in (pdd,tmall):
             columns=module.read_template_columns()
-            self.assertEqual(len(columns),32)
+            self.assertEqual(len(columns),20)
             self.assertFalse(set(columns)&set(REMOVED_REPORT_COLUMNS))
-            self.assertIn(module.PROMOTION_MECHANISM_COLUMN,columns)
-            self.assertEqual(columns[-5:],['项目组','管理类型','品种','产线','SKU ID'])
+            self.assertNotIn(module.PROMOTION_MECHANISM_COLUMN,columns)
+            self.assertEqual(columns[columns.index('商品ID')+1],'SKU ID')
+            self.assertEqual(columns[-1],'备注')
+            self.assertEqual(columns.count('SKU ID'),1)
+
+    def test_unknown_legacy_headers_are_rejected(self):
+        self.assertFalse(compatible_headers([*LEGACY_COLUMNS_32,'人工新增'],list(PRODUCT_COLUMNS)))
+        self.assertFalse(compatible_headers([c for c in LEGACY_COLUMNS_32 if c!='SKU ID'],list(PRODUCT_COLUMNS)))
 
     def test_partial_reference_pass_keeps_unit_cost_row_profit_and_deleted_columns(self):
         columns=pdd.read_template_columns()

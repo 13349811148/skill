@@ -1,5 +1,6 @@
 """Per-unit comprehensive cost and whole-row gross/net profit."""
 from typing import Any
+from product_schema import HIDDEN_OUTPUT_COLUMNS
 
 from data_quality_protection import optional_number, normalize_match_code, text
 
@@ -8,7 +9,7 @@ PLATFORM_COST_RATE = 0.007
 NEW_COST_COLUMNS = ("综合成本", "快递成本", "其他均摊成本", "平台费用")
 REMOVED_COLUMNS = ("店铺费用", "平摊管理费用")
 REMOVED_REPORT_COLUMNS = ("活动价", "报名价", "每单补贴金额", "总补贴金额",
-                          "净销售额（实际成交+总补贴金额）")
+                          "净销售额（实际成交+总补贴金额）") + HIDDEN_OUTPUT_COLUMNS
 
 
 def apply_product_cost_rules(row: dict[str, Any]) -> None:

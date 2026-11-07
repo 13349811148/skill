@@ -8,6 +8,7 @@ import sys
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from product_schema import validate_product_columns
 from pathlib import Path
 from typing import Any
 
@@ -242,8 +243,10 @@ def read_template_columns() -> list[str]:
         reader = csv.DictReader(fh)
         for row in reader:
             columns.append(row["column"].replace("\r\n", "\n").replace("\r", "\n"))
-    if columns.count("SKU ID") != 1 or not columns or columns[-1] != "SKU ID":
-        raise ReportError("列模板必须且只能包含一个 SKU ID，并将其放在绝对最后一列。")
+    try:
+        validate_product_columns(columns)
+    except ValueError as exc:
+        raise ReportError(str(exc)) from exc
     return columns
 
 
@@ -1691,6 +1694,8 @@ def write_workbook(path: Path, columns: list[str], rows: list[dict[str, Any]]) -
         for r, row in enumerate(rows, start=2):
             for c, header in enumerate(columns, start=1):
                 value = row.get(header, "")
+                if header == "日期" and isinstance(value, str) and value:
+                    value = datetime.fromisoformat(value[:10])
                 if header in text_columns:
                     value = text(value)
                 ws.Cells(r, c).Value = value

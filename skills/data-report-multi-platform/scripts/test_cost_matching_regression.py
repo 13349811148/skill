@@ -164,11 +164,11 @@ def test_marketing_fallback_only_when_cost_table_misses() -> None:
     assert not resolution.specification_conflict_warning
 
 
-def test_template_places_sku_id_last() -> None:
-    expected_tail = ["项目组", "管理类型", "品种", "产线", "SKU ID"]
+def test_template_places_sku_id_after_product_id() -> None:
     for name, module in (("拼多多", pdd), ("天猫", tmall)):
         columns = module.read_template_columns()
-        assert columns[-5:] == expected_tail, f"{name}日报末尾列顺序错误: {columns[-5:]}"
+        assert columns[columns.index("商品ID")+1] == "SKU ID"
+        assert columns[-1] == "备注"
         assert columns.count("SKU ID") == 1, f"{name}日报的 SKU ID 列数量不是 1"
 
 
@@ -454,7 +454,7 @@ def main() -> None:
     test_product_sku_header_and_platform_loaders()
     test_per_row_fallback_and_duplicate_protection()
     test_marketing_fallback_only_when_cost_table_misses()
-    test_template_places_sku_id_last()
+    test_template_places_sku_id_after_product_id()
     test_backup_promotion_inputs_stop_both_platforms()
     test_full_report_cost_regression_for_both_platforms()
     test_four_subsidized_orders_do_not_trigger_below_cost_confirmation()

@@ -18,7 +18,8 @@ s.getRange(`A1:${last}${n+1}`).values=[d.columns,...part.rows.map(r=>d.columns.m
 s.getRange(`A1:${last}${n+1}`).format.font={name:'Arial',size:10,color:'#202830'};
 s.getRange(`A1:${last}${n+1}`).format.columnWidth=18;
 s.getRange(`A1:${last}${n+1}`).format.rowHeight=24;
-s.getRange('A:A').format.columnWidth=14;s.getRange('E:E').format.columnWidth=35;
+s.getRange('A:A').format.columnWidth=14;
+const shop=column('店铺名称');if(shop)s.getRange(`${shop}:${shop}`).format.columnWidth=35;
 for(const name of ['商品ID','SKU编码','SKU ID']){const c=column(name);if(c)s.getRange(`${c}:${c}`).format.columnWidth=23;}
 const skuName=column('SKU名称');
 if(skuName){s.getRange(`${skuName}:${skuName}`).format.columnWidth=42;if(n)s.getRange(`${skuName}2:${skuName}${n+1}`).format.wrapText=true;}
@@ -34,9 +35,16 @@ if(qty)s.getRange(`${qty}2:${qty}${n+1}`).setNumberFormat('#,##0');if(margin)s.g
 // Historical schema migrations can carry the retained columns' original formats.
 if(n&&part.sourceNumberFormats)s.getRange(`A2:${last}${n+1}`).format.numberFormat=part.sourceNumberFormats;
 if(n)for(const name of part.sourceWrappedColumns||[]){const c=column(name);if(c)s.getRange(`${c}2:${c}${n+1}`).format.wrapText=true;}
+// Date and identifier contracts override any historical format payload.
+if(n){const date=column('日期');if(date)s.getRange(`${date}2:${date}${n+1}`).setNumberFormat('yyyy-mm-dd');
+for(const name of ['商品ID','SKU编码','SKU ID']){const c=column(name);if(c)s.getRange(`${c}2:${c}${n+1}`).setNumberFormat('@');}}
 s.freezePanes.freezeRows(1);wb.recalculate();
-for(const [area,name] of process.env.DAILY_REPORT_PREVIEW==='0'?[]:[['A1:I7','identity'],['J1:R7','costs'],['S1:AC7','amounts']]){
+for(const [area,name] of process.env.DAILY_REPORT_PREVIEW==='0'?[]:[['A1:F7','identity'],['G1:L7','costs'],['M1:T7','amounts']]){
+ // Preview renderer coerces numeric text under @ to scientific notation. Use
+ // full-digit preview formatting, then restore text format before XLSX export.
+ if(name==='identity'&&n)for(const field of ['商品ID','SKU ID']){const c=column(field);if(c)s.getRange(`${c}2:${c}${n+1}`).setNumberFormat('0');}
  const img=await wb.render({sheetName:part.name,range:area,scale:1.2,format:'png'});await fs.writeFile(output+`.${d.sheets?part.name+'.':''}${name}.png`,new Uint8Array(await img.arrayBuffer()));
+ if(name==='identity'&&n)for(const field of ['商品ID','SKU ID']){const c=column(field);if(c)s.getRange(`${c}2:${c}${n+1}`).setNumberFormat('@');}
 }
 }
 wb.recalculate();

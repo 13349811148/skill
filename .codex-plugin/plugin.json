@@ -1,7 +1,7 @@
 {
   "name": "daily-report",
-  "version": "2026.11.06+profit.1",
-  "description": "商品日报32列；综合成本为单件金额，毛利=实际成交金额−综合成本×有效销量，净利润=毛利−推广费；仅商品日报同步WPS。",
+  "version": "2026.11.07+columns.1",
+  "description": "商品日报20列；日期yyyy-mm-dd，SKU ID紧随商品ID，备注为最后一列；按月累计保存，只有商品日报同步WPS。",
   "skills": [
     "./skills/data-report-multi-platform"
   ],

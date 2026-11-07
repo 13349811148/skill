@@ -12,6 +12,8 @@ import re
 import subprocess
 import tempfile
 import csv
+import shutil
+from product_schema import compatible_headers, normalize_headers
 
 SCRIPTS = Path(__file__).resolve().parent
 
@@ -60,30 +62,39 @@ def locked(output):
         lock.unlink(missing_ok=True)
 
 
-def read_product(output, columns):
+def read_product(output, columns, schema_info=None):
     if not output.exists():
         return {}
     from openpyxl import load_workbook
     wb = load_workbook(output, read_only=True, data_only=False)
     months = {}
+    seen = set()
     try:
         for sheet in wb:
             if not re.fullmatch(r'\d{4}-\d{2}', sheet.title):
                 raise ValueError(f'商品总表含旧格式/未知子表 {sheet.title}，请先明确迁移，不覆盖')
             sheet.reset_dimensions()
             iterator = sheet.iter_rows(values_only=True)
-            if [v if v is not None else '' for v in next(iterator, ())] != columns:
+            headers = normalize_headers(next(iterator, ()))
+            if not compatible_headers(headers, columns):
                 raise ValueError(f'商品总表表头不一致: {sheet.title}')
+            if headers != columns and schema_info is not None:
+                schema_info['legacy'] = True
             rows = []
             for raw in iterator:
                 if not any(v is not None for v in raw):
                     continue
                 if any(isinstance(v, str) and v.startswith('=') for v in raw):
                     raise ValueError('商品总表存在人工公式，需核对行变更引用后再更新')
-                row = dict(zip(columns, raw)); row['日期'] = day(row['日期'])
+                source = dict(zip(headers, raw))
+                row = {column: source.get(column) for column in columns}
+                row['日期'] = day(row['日期'])
                 if row['日期'][:7] != sheet.title:
                     raise ValueError(f'商品总表跨月数据放错子表: {sheet.title}/{row["日期"]}')
-                rows.append(row)
+                key = product_key(row)
+                if key in seen:
+                    raise ValueError(f'历史商品日报业务键重复: {key}')
+                seen.add(key); rows.append(row)
             months[sheet.title] = rows
     finally:
         wb.close()
@@ -98,6 +109,28 @@ def product_key(row):
 def product_sort(row):
     # Preserve the existing empty-burn-at-the-bottom convention within each month.
     return ('空烧推广费' in str(row.get('备注') or ''), *product_key(row))
+
+
+def backup_legacy_product(output):
+    """Guard features that a column projection cannot safely preserve."""
+    from openpyxl import load_workbook
+    workbook = load_workbook(output, data_only=False)
+    try:
+        if workbook.defined_names or workbook._external_links:
+            raise ValueError('旧商品日报含名称或外部链接，需核对后再迁移列')
+        for sheet in workbook:
+            if (sheet.tables or sheet._charts or sheet._images or sheet.merged_cells.ranges
+                    or sheet.conditional_formatting or sheet.data_validations.dataValidation
+                    or any(cell.comment for row in sheet for cell in row)):
+                raise ValueError(f'旧商品日报含人工对象或批注，需核对后再迁移列: {sheet.title}')
+    finally:
+        workbook.close()
+    folder = output.parent/'内部备份'; folder.mkdir(exist_ok=True)
+    target = folder/f'{output.stem}_32列迁移前_{datetime.now():%Y%m%d_%H%M%S_%f}.xlsx'
+    shutil.copy2(output, target)
+    state = output.with_suffix('.product.json')
+    if state.exists():
+        shutil.copy2(state, target.with_suffix('.product.json'))
 
 
 def commit(output, payload, writer):
@@ -134,8 +167,12 @@ def product(output, columns, rows, dates, date_notes=None):
         previous_notes=state.get('date_notes', {})
         if any(dt in previous_notes and dt not in (date_notes or {}) for dt in dates):
             raise ValueError('本次日期已有确认的剔除/修订口径；请先按原规则处理数据，再提供date_notes或CLI --note，不能直接恢复原始订单')
-        months = read_product(output, columns)
-        affected = sorted({dt[:7] for dt in dates})
+        schema_info = {}
+        months = read_product(output, columns, schema_info)
+        legacy = schema_info.get('legacy', False)
+        # Rebuild every retained month once so deleted formatted columns cannot
+        # linger in untouched sheets. Only the requested dates replace data.
+        affected = sorted({dt[:7] for dt in dates} | (set(months) if legacy else set()))
         sheets = []
         for month in affected:
             previous = months.get(month, [])
@@ -145,9 +182,12 @@ def product(output, columns, rows, dates, date_notes=None):
             sheets.append({'name': month, 'rows': merged, 'oldRows': len(previous)})
             months[month] = merged
         payload = {'columns': columns, 'rows': [r for m in sorted(months) for r in months[m]],
-                   'sheets': sheets, 'existingWorkbook': str(output) if output.exists() else None,
+                   'sheets': sheets, 'existingWorkbook': str(output) if output.exists() and not legacy else None,
                    'replace_dates': sorted(dates), 'archive_mode': True,
                    'date_notes': {**previous_notes, **(date_notes or {})}}
+        if legacy:
+            backup_legacy_product(output)
+            payload['schema_migration'] = '32列转20列，仅字段投影，原销量、金额、利润与日期口径保留'
         commit(output, payload, 'write_product_report.mjs')
     return output
 
