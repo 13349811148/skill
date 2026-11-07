@@ -4,6 +4,16 @@ const [input,output]=process.argv.slice(2),d=JSON.parse(await fs.readFile(input,
 const wb=d.existingWorkbook?await SpreadsheetFile.importXlsx(await FileBlob.load(d.existingWorkbook)):Workbook.create();
 const letter=(n)=>{let value='';for(;n>0;n=Math.floor((n-1)/26))value=String.fromCharCode(65+(n-1)%26)+value;return value;};
 const column=(name)=>{const index=d.columns.indexOf(name);return index<0?null:letter(index+1);};
+// Write a standard numeric Excel date. ISO t="d" exports can appear as
+// literal timestamps in WPS even when the display format is yyyy-mm-dd.
+const excelDateSerial=(value)=>{
+ const raw=String(value??'').trim();
+ const match=/^(\d{4})-(\d{2})-(\d{2})(?:[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})?)?$/.exec(raw);
+ if(!match)throw new Error(`无效日报日期: ${raw}`);
+ const [year,month,day]=match.slice(1).map(Number),stamp=Date.UTC(year,month-1,day);
+ if(new Date(stamp).toISOString().slice(0,10)!==raw.slice(0,10))throw new Error(`无效日报日期: ${raw}`);
+ return (stamp-Date.UTC(1899,11,30))/86400000;
+};
 const last=letter(d.columns.length);
 const money=['综合成本','产品成本','快递成本','其他均摊成本','平台费用','到手价','实际成交金额（去退款去补单后）','毛利','推广费用','净利润'];
 const parts=d.sheets||[{name:'每日销售数据',rows:d.rows,oldRows:0}];
@@ -14,7 +24,7 @@ if(!s)s=wb.worksheets.add(part.name);
 const n=part.rows.length;
 s.getRange(`A1:${letter(Math.max(d.columns.length,part.oldColumnCount||0))}${Math.max(n,part.oldRows||0)+1}`).clear({applyTo:'contents'});
 s.showGridLines=false;
-s.getRange(`A1:${last}${n+1}`).values=[d.columns,...part.rows.map(r=>d.columns.map(h=>h==='日期'?new Date(r[h]+'T00:00:00Z'):r[h]===''||r[h]===undefined?null:r[h]))];
+s.getRange(`A1:${last}${n+1}`).values=[d.columns,...part.rows.map(r=>d.columns.map(h=>h==='日期'?excelDateSerial(r[h]):r[h]===''||r[h]===undefined?null:r[h]))];
 s.getRange(`A1:${last}${n+1}`).format.font={name:'Arial',size:10,color:'#202830'};
 s.getRange(`A1:${last}${n+1}`).format.columnWidth=18;
 s.getRange(`A1:${last}${n+1}`).format.rowHeight=24;

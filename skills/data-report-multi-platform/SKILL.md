@@ -13,7 +13,7 @@ Use this Skill to generate separate reports for recognized platforms. Before cal
 
 ## 商品输出格式（2026-11-07用户确认）
 
-商品日报固定20列，顺序以 [列模板](references/template_columns.csv) 为准。前6列为“日期、店铺名称、商品ID、SKU ID、SKU编码、SKU名称”，备注为最后一列。SKU ID只出现一次，紧随商品ID，以文本保存。日期必须为真实日期，统一显示`yyyy-mm-dd`，例如`2026-11-07`。
+商品日报固定20列，顺序以 [列模板](references/template_columns.csv) 为准。前6列为“日期、店铺名称、商品ID、SKU ID、SKU编码、SKU名称”，备注为最后一列。SKU ID只出现一次，紧随商品ID，以文本保存。日期以Excel数值序列保存为真实日期，统一显示`yyyy-mm-dd`，例如`2026-11-07`；保留每行各自的业务日期，不导出ISO时间戳或T00:00:00.000Z后缀。
 
 不输出品牌、所属运营、平台、大类、促销机制，及备注之后原有空白列、大类辅助列、辅助、项目组、管理类型、品种、产线。已删除的活动价、报名价、补贴和净销售额等列也不恢复。原始营销信息和成本元数据继续用于内部匹配、订单校验及独立日志，删除输出列不改变成本、运费、销量、推广、退款和利润口径。
 
