@@ -1,7 +1,7 @@
 {
   "name": "daily-report",
-  "version": "2026.11.09+goods.1",
-  "description": "按月累计商品、货品与店铺日报；分区美化、组合装精确拆分、每日店铺净利润汇总，保留推广核对、成本及运费匹配规则。",
+  "version": "2026.11.09+goods.2",
+  "description": "按月累计商品、货品与店铺日报；货品销售额、毛利、推广费及净利润按成本占比分摊，货品均价及每日金额对账。",
   "skills": [
     "./skills/data-report-multi-platform"
   ],

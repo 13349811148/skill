@@ -19,7 +19,13 @@ def load_catalog(root):
         if len(candidates) != 1:
             return GoodsCatalog()
         path = candidates[0]
-    return GoodsCatalog.from_sheets(read_workbook_sheets(path))
+    from decimal import Decimal
+    from data_quality_protection import load_cost_table_records
+    costs, _ = load_cost_table_records(path, read_workbook_sheets(path))
+    catalog = costs.goods_catalog
+    catalog.unit_costs = {code: Decimal(str(row['产品成本'])) for code,row in costs.items()}
+    catalog.cost_kinds = {code: row.get('成本性质') for code,row in costs.items()}
+    return catalog
 
 
 def daily_profit(rows):
@@ -62,7 +68,7 @@ def store_payload(path):
     return dict(state, rows=rows, headers=HEADERS)
 
 
-def refresh(report, database_root, platform, dates, archive_dir, explicit_store=None, migrate=False):
+def refresh(report, database_root, platform, dates, archive_dir, explicit_store=None, migrate=False, goods_only=False):
     report = Path(report); archive_dir = Path(archive_dir); dates = set(dates)
     catalog = load_catalog(database_root)
     months = read_product(report, list(PRODUCT_COLUMNS))
@@ -91,7 +97,7 @@ def refresh(report, database_root, platform, dates, archive_dir, explicit_store=
         annotated.append(row)
         if error:
             issues.append({'日期': row['日期'], 'SKU编码': row['SKU编码'], '原因': error})
-    if migrate or annotated != original:
+    if not goods_only and (migrate or annotated != original):
         all_dates = sorted({r['日期'] for r in original})
         state = json.loads(report.with_suffix('.product.json').read_text(encoding='utf-8'))
         notes = dict(state.get('date_notes', {}))
@@ -100,13 +106,14 @@ def refresh(report, database_root, platform, dates, archive_dir, explicit_store=
             if note not in notes.get(date, ''):
                 notes[date] = '；'.join(filter(None, [notes.get(date), note]))
         product(report, list(PRODUCT_COLUMNS), annotated, all_dates, notes)
-    goods, goods_issues = goods_rows(annotated, catalog)
+    financial_audit = {}
+    goods, goods_issues = goods_rows(annotated, catalog, financial_audit)
     name = '拼多多' if platform == 'pdd' else '天猫'
     goods_output = archive_dir/f'货品日报_{name}.xlsx'
     parts = [{'name': month, 'rows': [r for r in goods if r['日期'][:7] == month]}
              for month in sorted({r['日期'][:7] for r in annotated})]
     payload = {'columns': GOODS_COLUMNS, 'rows': goods, 'sheets': parts, 'kind': 'goods',
-               'issues': goods_issues, 'source_product_report': str(report)}
+               'issues': goods_issues, 'source_product_report': str(report), 'financial_audit': financial_audit}
     with locked(goods_output):
         commit(goods_output, payload, 'write_goods_report.mjs')
     profit = daily_profit(annotated)
@@ -115,7 +122,7 @@ def refresh(report, database_root, platform, dates, archive_dir, explicit_store=
     profits_by_alias = {(d, aliases.get(s, s)): v for (d, s), v in profit.items()}
     stores = [Path(explicit_store)] if explicit_store else sorted(archive_dir.glob('店铺日报_????-??.xlsx'))
     updated = []
-    for path in stores:
+    for path in ([] if goods_only else stores):
         data = store_payload(path)
         changed = False
         for row in data['rows']:
@@ -134,9 +141,9 @@ def refresh(report, database_root, platform, dates, archive_dir, explicit_store=
         if changed:
             store(data, archive_dir, path); updated.append(str(path))
     audit = {'product_report': str(report), 'goods_report': str(goods_output), 'product_rows': len(annotated),
-             'goods_rows': len(goods), 'goods_issues': goods_issues, 'removed_sales_rows': removed,
+             'goods_rows': len(goods), 'goods_issues': goods_issues, 'financial_audit': financial_audit, 'removed_sales_rows': removed,
              'daily_profit': [{'日期': d, '店铺': s, **v} for (d, s), v in sorted(profit.items())], 'stores': updated}
-    audit_path = report.with_name(report.stem+'_货品与利润核对.json')
+    audit_path = goods_output.with_name(goods_output.stem+'_财务分摊核对.json') if goods_only else report.with_name(report.stem+'_货品与利润核对.json')
     # Preserve prior exclusion evidence after an idempotent rerun.
     if audit_path.exists():
         previous = json.loads(audit_path.read_text(encoding='utf-8')).get('removed_sales_rows', [])

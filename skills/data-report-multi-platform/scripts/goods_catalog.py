@@ -5,7 +5,7 @@ import re
 from data_quality_protection import normalize_match_code, text
 
 SALES_QUANTITY = '实际成交数量（去退款去补单后）'
-GOODS_COLUMNS = ['日期', '店铺名称', '货品编码', '货品名称', '基础单位', '货品数量', '来源SKU及货品数量', '备注']
+GOODS_COLUMNS = ['日期', '店铺名称', '货品编码', '货品名称', '基础单位', '货品数量', '销售额', '客单价（货品均价）', '毛利', '推广费用', '净利润', '来源SKU及货品数量', '备注']
 
 
 class GoodsCatalog:
@@ -79,7 +79,7 @@ class GoodsCatalog:
             return result, {}, str(error)
 
 
-def goods_rows(product_rows, catalog):
+def quantity_rows(product_rows, catalog):
     grouped, issues = {}, []
     for source in product_rows:
         _, parts, error = catalog.annotate(source)
@@ -108,3 +108,9 @@ def goods_rows(product_rows, catalog):
             row['货品数量'] = float(row['货品数量'])
         rows.append(row)
     return rows, issues
+
+
+def goods_rows(product_rows, catalog, financial_audit=None):
+    from goods_financials import allocate_financials
+    rows, issues = quantity_rows(product_rows, catalog)
+    return allocate_financials(rows, product_rows, catalog, financial_audit), issues

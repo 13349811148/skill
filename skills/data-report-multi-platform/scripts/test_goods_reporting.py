@@ -17,7 +17,9 @@ class GoodsReportingTests(unittest.TestCase):
               ['货品','','A','货品甲','袋'],['货品','','B','货品乙','盒'],
               ['组合装','PACK','A×2；B×1','两甲一乙','套'],
               ['组合装','NEST','PACK×3；A×1','嵌套装','套']]
-        return GoodsCatalog.from_sheets([SimpleNamespace(rows=rows)])
+        catalog=GoodsCatalog.from_sheets([SimpleNamespace(rows=rows)])
+        catalog.unit_costs={'a':Decimal(10),'b':Decimal(20)}
+        return catalog
 
     def row(self, code='PACK', quantity=4, **extra):
         return {'日期':'2026-11-08','店铺名称':'店','SKU编码':code,
@@ -34,7 +36,7 @@ class GoodsReportingTests(unittest.TestCase):
         goods,issues=goods_rows(rows,self.catalog())
         self.assertFalse(issues)
         self.assertEqual([(r['货品编码'],r['货品数量']) for r in goods],[('A',11),('B',4)])
-        self.assertFalse(any('净利润' in r for r in goods))
+        self.assertEqual(sum(r['净利润'] for r in goods),24)
         self.assertEqual(daily_profit(rows)[('2026-11-08','店')]['value'],24)
 
     def test_cycles_and_missing_child_do_not_become_partial_quantities(self):
@@ -45,8 +47,9 @@ class GoodsReportingTests(unittest.TestCase):
         self.assertIn('缺少货品',error)
 
     def test_empty_burn_has_no_goods_and_reduces_store_profit(self):
-        row=self.row('unknown',0,净利润=-9,备注='空烧推广费')
-        self.assertEqual(goods_rows([row],self.catalog()),([],[]))
+        row=self.row('unknown',0,净利润=-9,推广费用=9,毛利=0,备注='空烧推广费')
+        self.assertEqual(goods_rows([row],self.catalog())[0][0]['货品数量'],0)
+        self.assertEqual(goods_rows([row],self.catalog())[0][0]['净利润'],-9)
         self.assertEqual(daily_profit([row])[('2026-11-08','店')]['value'],-9)
 
     def test_unresolved_skus_remain_separate_and_traceable(self):

@@ -29,7 +29,7 @@ export function detailStyle(sheet,headers,rows,headerRow,groups){
   band(sheet,`${col(start)}${headerRow-1}:${col(finish)}${headerRow-1}`,label,color);
   sheet.getRange(`${col(start)}${headerRow}:${col(start)}${Math.max(headerRow,end)}`).format.borders={left:{style:'medium',color:'#CFD9E5'}};
  }
- const widths={'日期':14,'店铺名称':34,'商品ID':23,'SKU ID':23,'SKU编码':15,'SKU名称':42,'货品编码':17,'货品名称':48,'货品数量':14,'来源SKU及货品数量':28,'基础单位':12,'备注':70,'实际成交数量（去退款去补单后）':18,'实际成交金额（去退款去补单后）':21};
+ const widths={'日期':14,'店铺名称':34,'商品ID':23,'SKU ID':23,'SKU编码':15,'SKU名称':42,'货品编码':17,'货品名称':48,'货品数量':14,'来源SKU及货品数量':28,'基础单位':12,'销售额':18,'客单价（货品均价）':19,'毛利':18,'推广费用':18,'净利润':18,'备注':70,'实际成交数量（去退款去补单后）':18,'实际成交金额（去退款去补单后）':21};
  headers.forEach((h,i)=>{
   const c=col(i+1);sheet.getRange(`${c}:${c}`).format.columnWidth=widths[h]||16;
   if(rows.length){
@@ -38,7 +38,7 @@ export function detailStyle(sheet,headers,rows,headerRow,groups){
    else if(['商品ID','SKU ID','SKU编码','货品编码'].includes(h))range.setNumberFormat('@');
    else if(h==='毛利率')range.setNumberFormat('0.00%');
    else if(['货品数量','实际成交数量（去退款去补单后）'].includes(h))range.setNumberFormat(rows.some(r=>typeof r[h]==='number'&&!Number.isInteger(r[h]))?'#,##0.00':'#,##0');
-   else if(['综合成本','产品成本','快递成本','其他均摊成本','平台费用','到手价','实际成交金额（去退款去补单后）','毛利','推广费用','净利润'].includes(h))range.setNumberFormat('#,##0.00;[Red](#,##0.00);0.00');
+   else if(['综合成本','产品成本','快递成本','其他均摊成本','平台费用','到手价','销售额','客单价（货品均价）','实际成交金额（去退款去补单后）','毛利','推广费用','净利润'].includes(h))range.setNumberFormat('#,##0.00;[Red](#,##0.00);0.00');
    if(['SKU名称','货品名称','货品数量','来源SKU及货品数量','备注'].includes(h))range.format.wrapText=true;
   }
  });
