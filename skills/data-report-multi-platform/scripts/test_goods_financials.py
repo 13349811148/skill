@@ -27,6 +27,8 @@ class GoodsFinancialTests(unittest.TestCase):
         self.assertEqual([a['销售额'],b['销售额']],[40,40])
         self.assertEqual([a[PRICE],b[PRICE]],[5,10])
         self.assertEqual([a['毛利'],a['推广费用'],a['净利润']],[10,4,6])
+        self.assertAlmostEqual(a['净利率'],6/40)
+        self.assertAlmostEqual(b['净利率'],6/40)
         self.assertTrue(all(r['complete'] for r in audit['daily_reconciliation']))
 
     def test_missing_one_child_cost_keeps_all_mixed_money_blank(self):

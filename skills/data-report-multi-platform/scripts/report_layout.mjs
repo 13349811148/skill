@@ -37,6 +37,7 @@ export function detailStyle(sheet,headers,rows,headerRow,groups){
    if(h==='日期'){range.setNumberFormat('yyyy-mm-dd');range.format.horizontalAlignment='center';}
    else if(['商品ID','SKU ID','SKU编码','货品编码'].includes(h))range.setNumberFormat('@');
    else if(h==='毛利率')range.setNumberFormat('0.00%');
+   else if(h==='净利率')range.setNumberFormat('0.00%;[Red](0.00%);0.00%');
    else if(['货品数量','实际成交数量（去退款去补单后）'].includes(h))range.setNumberFormat(rows.some(r=>typeof r[h]==='number'&&!Number.isInteger(r[h]))?'#,##0.00':'#,##0');
    else if(['综合成本','产品成本','快递成本','其他均摊成本','平台费用','到手价','销售额','客单价（货品均价）','实际成交金额（去退款去补单后）','毛利','推广费用','净利润'].includes(h))range.setNumberFormat('#,##0.00;[Red](#,##0.00);0.00');
    if(['SKU名称','货品名称','货品数量','来源SKU及货品数量','备注'].includes(h))range.format.wrapText=true;

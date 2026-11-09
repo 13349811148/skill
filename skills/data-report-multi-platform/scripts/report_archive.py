@@ -144,8 +144,11 @@ def commit(output, payload, writer):
         data = folder/'payload.json'; staged = folder/'report.xlsx'
         data.write_text(json.dumps(payload, ensure_ascii=False, default=str), encoding='utf-8')
         subprocess.run([str(node), str(SCRIPTS/writer), str(data), str(staged)], check=True)
+        if payload.get('nativeGoodsSource'):
+            from native_goods_archive import transplant
+            transplant(Path(payload['nativeGoodsSource']), staged, payload)
         os.replace(staged, output)
-        suffix = '.product.json' if writer == 'write_product_report.mjs' else '.goods.json' if writer == 'write_goods_report.mjs' else '.store.json'
+        suffix = '.product.json' if writer == 'write_product_report.mjs' else '.goods.json' if writer in ('write_goods_report.mjs','write_profit_rates.mjs') else '.store.json'
         os.replace(data, output.with_suffix(suffix))
         for extra in folder.glob('report.xlsx.*'):
             os.replace(extra, output.with_name(output.name+extra.name[len('report.xlsx'):]))
@@ -212,6 +215,11 @@ def cost_log(output, columns, rows, dates):
 
 
 def store(payload, directory, explicit_output=None):
+    from store_schema import STORE_HEADERS, compatible_store_headers
+    from profit_rates import net_margin
+    if not compatible_store_headers(payload['headers']):
+        raise ValueError('店铺输入表头未识别，不能投影')
+    payload = dict(payload, headers=list(STORE_HEADERS))
     months = sorted({day(r['日期'])[:7] for r in payload['rows']})
     results = []
     for month in months:
@@ -228,7 +236,7 @@ def store(payload, directory, explicit_output=None):
                 try:
                     sheet = wb['①平台日报']; sheet.reset_dimensions()
                     header = [v for v in next(sheet.iter_rows(min_row=3, max_row=3, values_only=True))]
-                    if header not in (payload['headers'], payload['headers'][:-1] if payload['headers'][-1] == '店铺净利润' else []):
+                    if not compatible_store_headers(header):
                         raise ValueError('店铺月报表头不一致，不能自动覆盖')
                     for raw in sheet.iter_rows(min_row=4, values_only=True):
                         if not raw[0]:
@@ -257,6 +265,8 @@ def store(payload, directory, explicit_output=None):
                     if r.get(field) is None and store_key(r) in merged:
                         r[field] = merged[store_key(r)].get(field)
             merged.update({store_key(r): r for r in incoming})
+            for row in merged.values():
+                row['净利率'] = net_margin(row.get('店铺净利润'), row.get('净成交额'))
             result = dict(payload, rows=[merged[k] for k in sorted(merged)], oldRows=len(previous),
                           existingWorkbook=str(output) if output.exists() else None, archive_mode=True,
                           report_note=payload.get('report_note') or '本月累计日报；同一日期/平台/店铺重新生成时替换，不重复追加。历史估算和缺失口径按各日独立日志；今日动作/异常说明不自动填。')

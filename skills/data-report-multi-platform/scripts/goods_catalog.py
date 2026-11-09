@@ -5,7 +5,7 @@ import re
 from data_quality_protection import normalize_match_code, text
 
 SALES_QUANTITY = '实际成交数量（去退款去补单后）'
-GOODS_COLUMNS = ['日期', '店铺名称', '货品编码', '货品名称', '基础单位', '货品数量', '销售额', '客单价（货品均价）', '毛利', '推广费用', '净利润', '来源SKU及货品数量', '备注']
+GOODS_COLUMNS = ['日期', '店铺名称', '货品编码', '货品名称', '基础单位', '货品数量', '销售额', '客单价（货品均价）', '毛利', '推广费用', '净利润', '来源SKU及货品数量', '备注', '净利率']
 
 
 class GoodsCatalog:

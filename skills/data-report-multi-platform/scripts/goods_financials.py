@@ -132,6 +132,8 @@ def allocate_financials(quantity_rows, sources, catalog, audit=None):
         row = rows[key]
         count, sales = row.get('货品数量'), row.get('销售额')
         row[PRICE] = sales/count if sales is not None and count is not None and count > 0 else None
+        from profit_rates import net_margin
+        row['净利率'] = net_margin(row.get('净利润'), sales)
         row['备注'] = '；'.join(filter(None, [row.get('备注'), *sorted(notes[key])]))
         result.append(row)
     return result

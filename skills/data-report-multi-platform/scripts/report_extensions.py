@@ -53,7 +53,8 @@ def store_payload(path):
         sheet = workbook['①平台日报']; sheet.reset_dimensions()
         headers = list(next(sheet.iter_rows(min_row=3, max_row=3, values_only=True)))
         from build_store_report import HEADERS
-        if headers not in (HEADERS, HEADERS[:-1]):
+        from store_schema import compatible_store_headers
+        if not compatible_store_headers(headers):
             raise ValueError(f'店铺表头未识别: {path}')
         rows = []
         for values in sheet.iter_rows(min_row=4, values_only=True):
@@ -113,7 +114,8 @@ def refresh(report, database_root, platform, dates, archive_dir, explicit_store=
     parts = [{'name': month, 'rows': [r for r in goods if r['日期'][:7] == month]}
              for month in sorted({r['日期'][:7] for r in annotated})]
     payload = {'columns': GOODS_COLUMNS, 'rows': goods, 'sheets': parts, 'kind': 'goods',
-               'issues': goods_issues, 'source_product_report': str(report), 'financial_audit': financial_audit}
+               'issues': goods_issues, 'source_product_report': str(report), 'financial_audit': financial_audit,
+               'nativeGoodsSource': str(goods_output) if goods_output.exists() else None}
     with locked(goods_output):
         commit(goods_output, payload, 'write_goods_report.mjs')
     profit = daily_profit(annotated)
@@ -131,6 +133,8 @@ def refresh(report, database_root, platform, dates, archive_dir, explicit_store=
             key = row['日期'], aliases.get(row['店铺'], row['店铺'])
             summary = profits_by_alias.get(key)
             row['店铺净利润'] = summary['value'] if summary else None
+            from profit_rates import net_margin
+            row['净利率'] = net_margin(row.get('店铺净利润'), row.get('净成交额'))
             row['_净利润核对'] = summary or {'value': None, 'missing': ['无当日商品日报'], 'rows': 0}
             evidence_key = '|'.join((row['日期'], row['平台'], row['店铺'], '店铺净利润'))
             data.setdefault('evidence', {})[evidence_key] = str(report)+'；同日店铺SKU净利润之和（含空烧推广），不使用拆分货品重复汇总'

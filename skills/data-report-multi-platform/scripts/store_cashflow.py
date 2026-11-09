@@ -231,6 +231,8 @@ def apply(rows, ledger, logs, evidence, backend=None):
         paid, refunded, count = row['支付金额'], row['退款金额'], row['支付订单数']
         net = money(Decimal(str(paid))-Decimal(str(refunded))) if paid is not None and refunded is not None else None
         row['净成交额'] = net
+        from profit_rates import net_margin
+        row['净利率'] = net_margin(row.get('店铺净利润'), net)
         row['客单价'] = paid/count if paid is not None and count is not None and count>0 else None
         spend = row.get('推广花费')
         row['推广ROI'] = net/spend if net is not None and net>=0 and spend is not None and spend>0 else None

@@ -1,7 +1,7 @@
 {
   "name": "daily-report",
-  "version": "2026.11.09+cashflow.1",
-  "description": "按月累计商品、货品与店铺日报；店铺净成交按支付日订单商家实收减当日成功退款，同意退款时间估算归日，后台金额仅复核。",
+  "version": "2026.11.09+margin.1",
+  "description": "按月累计商品、货品与店铺日报；货品及店铺净利率按净销售额计算，保留已有货品汇总页与透视表，店铺订单退款现金流口径不变。",
   "skills": [
     "./skills/data-report-multi-platform"
   ],
@@ -11,7 +11,7 @@
   },
   "interface": {
     "displayName": "日报（商品＋货品＋店铺）",
-    "shortDescription": "生成商品、货品和店铺日报，核对推广费用与每日净利润。",
+    "shortDescription": "生成商品、货品和店铺日报，核对推广费用、净利润与净利率。",
     "defaultPrompt": [
       "使用日报生成指定日期的商品、货品和店铺日报。"
     ]
