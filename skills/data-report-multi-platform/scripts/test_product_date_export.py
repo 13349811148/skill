@@ -21,13 +21,13 @@ class DateExportTests(unittest.TestCase):
             self.assertEqual(result.returncode,0,result.stderr)
             workbook=load_workbook(output,data_only=True)
             sheet=workbook.active
-            self.assertEqual([sheet.cell(i,1).value.strftime('%Y-%m-%d') for i in range(2,5)],['2026-10-19','2026-10-20','2026-11-01'])
-            self.assertTrue(all(sheet.cell(i,1).number_format=='yyyy-mm-dd' for i in range(2,5)))
+            self.assertEqual([sheet.cell(i,1).value.strftime('%Y-%m-%d') for i in range(3,6)],['2026-10-19','2026-10-20','2026-11-01'])
+            self.assertTrue(all(sheet.cell(i,1).number_format=='yyyy-mm-dd' for i in range(3,6)))
             workbook.close()
             ns={'s':'http://schemas.openxmlformats.org/spreadsheetml/2006/main'}
             with zipfile.ZipFile(output) as archive:
                 tree=ET.fromstring(archive.read('xl/worksheets/sheet1.xml'))
-                for index in range(2,5):
+                for index in range(3,6):
                     cell=tree.find(f's:sheetData/s:row/s:c[@r="A{index}"]',ns)
                     self.assertIn(cell.get('t'),(None,'n'))
                     self.assertTrue(cell.find('s:v',ns).text.isdecimal())

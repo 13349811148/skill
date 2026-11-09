@@ -77,6 +77,10 @@ def run_platform(platform: str, passthrough: list[str]) -> int:
         module = build_tmall_report if platform == 'tmall' else build_pdd_report
         report = Path(option_value(passthrough, '--output', str(module.DEFAULT_OUTPUT)))
         try:
+            from report_extensions import refresh
+            refresh(report, Path(option_value(passthrough, '--database-root', str(DEFAULT_DATABASE_ROOT))), platform,
+                    requested_dates(passthrough), Path(os.environ['DAILY_REPORT_ARCHIVE_DIR']),
+                    os.environ.get('DAILY_REPORT_STORE_OUTPUT') or None)
             task = prepare_wps_upload(report, platform, started_ns)
             print('WPS_UPLOAD_HANDOFF: ' + json.dumps(task, ensure_ascii=False), flush=True)
             print('下一步必须读取 references/wps_upload.md，通过浏览器上传商品日报并验证在线链接；本地导出不等于上传成功。', flush=True)
@@ -93,8 +97,27 @@ def main() -> int:
     parser.add_argument("--store-output", help="新增店铺维度日报路径")
     parser.add_argument("--store-only", action="store_true", help="仅生成店铺维度，正常请求默认两种均输出")
     parser.add_argument('--archive-dir',type=Path,help='固定报表目录，默认运营数据库/数据报表输出')
+    parser.add_argument('--refresh-existing',action='store_true',help='保留既有业务结果，更新版式、货品拆分、确认的销售剔除及店铺净利润')
     args, passthrough = parser.parse_known_args()
     archive_root=args.archive_dir or Path(option_value(passthrough,'--database-root',str(DEFAULT_DATABASE_ROOT)))/'数据报表输出'
+    if args.refresh_existing:
+        from report_extensions import refresh
+        platforms = ['pdd','tmall'] if not args.platform or args.platform == 'both' else [args.platform]
+        outputs = []
+        for platform in platforms:
+            name = '拼多多' if platform == 'pdd' else '天猫'
+            report = archive_root/f'商品日报_{name}.xlsx'
+            if not report.exists():
+                continue
+            started_ns = time.time_ns()
+            refresh(report, Path(option_value(passthrough,'--database-root',str(DEFAULT_DATABASE_ROOT))),
+                    platform, set(), archive_root, args.store_output, migrate=True)
+            outputs.append(report)
+            print('WPS_UPLOAD_HANDOFF: '+json.dumps(prepare_wps_upload(report,platform,started_ns),ensure_ascii=False),flush=True)
+        if not outputs:
+            print('未找到固定商品日报，不能迁移未知历史文件',file=sys.stderr)
+            return 2
+        return 0
     os.environ['DAILY_REPORT_ARCHIVE']='1'
     os.environ['DAILY_REPORT_ARCHIVE_DIR']=str(archive_root)
     os.environ['DAILY_REPORT_DATES']=json.dumps(sorted(requested_dates(passthrough)))
@@ -107,6 +130,7 @@ def main() -> int:
             elif value.startswith(option + "="):
                 store_arguments.extend([option, value.split("=", 1)[1]])
     if args.store_output:
+        os.environ['DAILY_REPORT_STORE_OUTPUT'] = args.store_output
         store_arguments.extend(["--output", args.store_output])
     for source in args.store_input:
         store_arguments.extend(["--input", source])

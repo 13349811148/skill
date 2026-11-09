@@ -1,7 +1,7 @@
 {
   "name": "daily-report",
-  "version": "2026.11.07+freight.2",
-  "description": "按月累计商品及店铺日报；缺体积按重量、缺重量体积按同克重商品估算运费；指定4个编码可参考最接近克重，估算保留来源；缺省市按多数地区报价。",
+  "version": "2026.11.09+goods.1",
+  "description": "按月累计商品、货品与店铺日报；分区美化、组合装精确拆分、每日店铺净利润汇总，保留推广核对、成本及运费匹配规则。",
   "skills": [
     "./skills/data-report-multi-platform"
   ],
@@ -10,10 +10,10 @@
     "name": "Chen Fei"
   },
   "interface": {
-    "displayName": "日报（商品＋店铺）",
-    "shortDescription": "生成商品和店铺两份日报，核对推广费用及后台交易指标。",
+    "displayName": "日报（商品＋货品＋店铺）",
+    "shortDescription": "生成商品、货品和店铺日报，核对推广费用与每日净利润。",
     "defaultPrompt": [
-      "使用日报生成本周的商品日报和店铺日报。"
+      "使用日报生成指定日期的商品、货品和店铺日报。"
     ]
   }
 }

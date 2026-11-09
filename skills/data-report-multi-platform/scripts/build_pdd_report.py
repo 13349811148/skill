@@ -1148,6 +1148,9 @@ def load_order_aggregates(
     below_cost_count = 0
     supplementary_price_lines = 0
     marked_non_sales_lines = 0
+    excluded_product_lines = 0
+    from report_exclusions import excluded_pdd_product
+
     missing_cost_rows: set[tuple[str, str, str, str, str]] = set()
     seen_order_lines: dict[tuple[str, str, str, str, str], Path] = {}
     order_paths, duplicate_file_warnings = deduplicate_exact_files(
@@ -1207,6 +1210,9 @@ def load_order_aggregates(
                     continue
                 style_id = text(row.get(required["style_id"]))
                 product_id = text(row.get(required["product_id"]))
+                if excluded_pdd_product(product_id):
+                    excluded_product_lines += 1
+                    continue
                 shop = text(row.get(required["shop"]))
                 merchant_spec_code = text(row.get(merchant_code_col)) if merchant_code_col else ""
                 if not merchant_spec_code:
@@ -1347,6 +1353,8 @@ def load_order_aggregates(
         warnings.append(
             f"订单成本缺失，未执行低于成本10%检查,{date},{shop},{product_id},{style_id},{merchant_spec_code}"
         )
+    if excluded_product_lines:
+        warnings.append(f'按用户固定商品ID排除销售明细{excluded_product_lines}条，推广花费保留实际值')
     if supplementary_price_lines:
         warnings.append(
             "已识别为补差价，不计销售；"

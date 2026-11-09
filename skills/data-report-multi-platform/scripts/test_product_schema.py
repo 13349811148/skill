@@ -25,10 +25,10 @@ class ProductSchemaTests(unittest.TestCase):
         legacy=[c.replace('\n','\r\n') for c in LEGACY_COLUMNS_32]
         self.assertTrue(compatible_headers(legacy,list(PRODUCT_COLUMNS)))
 
-    def test_both_platforms_expose_20_columns_with_no_removed_fields(self):
+    def test_both_platforms_expose_22_columns_with_no_removed_fields(self):
         for module in (pdd,tmall):
             columns=module.read_template_columns()
-            self.assertEqual(len(columns),20)
+            self.assertEqual(len(columns),22)
             self.assertFalse(set(columns)&set(REMOVED_REPORT_COLUMNS))
             self.assertNotIn(module.PROMOTION_MECHANISM_COLUMN,columns)
             self.assertEqual(columns[columns.index('商品ID')+1],'SKU ID')

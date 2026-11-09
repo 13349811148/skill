@@ -76,9 +76,11 @@ def read_product(output, columns, schema_info=None):
             sheet.reset_dimensions()
             iterator = sheet.iter_rows(values_only=True)
             headers = normalize_headers(next(iterator, ()))
+            if '日期' not in headers:
+                headers = normalize_headers(next(iterator, ()))
             if not compatible_headers(headers, columns):
                 raise ValueError(f'商品总表表头不一致: {sheet.title}')
-            if headers != columns and schema_info is not None:
+            if tuple(headers) != tuple(columns) and schema_info is not None:
                 schema_info['legacy'] = True
             rows = []
             for raw in iterator:
@@ -126,7 +128,7 @@ def backup_legacy_product(output):
     finally:
         workbook.close()
     folder = output.parent/'内部备份'; folder.mkdir(exist_ok=True)
-    target = folder/f'{output.stem}_32列迁移前_{datetime.now():%Y%m%d_%H%M%S_%f}.xlsx'
+    target = folder/f'{output.stem}_版式迁移前_{datetime.now():%Y%m%d_%H%M%S_%f}.xlsx'
     shutil.copy2(output, target)
     state = output.with_suffix('.product.json')
     if state.exists():
@@ -143,7 +145,7 @@ def commit(output, payload, writer):
         data.write_text(json.dumps(payload, ensure_ascii=False, default=str), encoding='utf-8')
         subprocess.run([str(node), str(SCRIPTS/writer), str(data), str(staged)], check=True)
         os.replace(staged, output)
-        suffix = '.product.json' if writer == 'write_product_report.mjs' else '.store.json'
+        suffix = '.product.json' if writer == 'write_product_report.mjs' else '.goods.json' if writer == 'write_goods_report.mjs' else '.store.json'
         os.replace(data, output.with_suffix(suffix))
         for extra in folder.glob('report.xlsx.*'):
             os.replace(extra, output.with_name(output.name+extra.name[len('report.xlsx'):]))
@@ -187,7 +189,7 @@ def product(output, columns, rows, dates, date_notes=None):
                    'date_notes': {**previous_notes, **(date_notes or {})}}
         if legacy:
             backup_legacy_product(output)
-            payload['schema_migration'] = '32列转20列，仅字段投影，原销量、金额、利润与日期口径保留'
+            payload['schema_migration'] = '已识别旧表迁移为22列分组表头，原业务字段与日期口径保留'
         commit(output, payload, 'write_product_report.mjs')
     return output
 
@@ -226,7 +228,7 @@ def store(payload, directory, explicit_output=None):
                 try:
                     sheet = wb['①平台日报']; sheet.reset_dimensions()
                     header = [v for v in next(sheet.iter_rows(min_row=3, max_row=3, values_only=True))]
-                    if header != payload['headers']:
+                    if header not in (payload['headers'], payload['headers'][:-1] if payload['headers'][-1] == '店铺净利润' else []):
                         raise ValueError('店铺月报表头不一致，不能自动覆盖')
                     for raw in sheet.iter_rows(min_row=4, values_only=True):
                         if not raw[0]:
@@ -251,7 +253,7 @@ def store(payload, directory, explicit_output=None):
             for r in incoming:
                 if merged.get(store_key(r),{}).get('_口径说明') and not r.get('_口径说明'):
                     raise ValueError('本次店铺日期已有确认修订；先恢复同日剔除/估算口径并携带_口径说明，再更新月报')
-                for field in ['今日主要动作', '异常说明']:
+                for field in ['今日主要动作', '异常说明', '店铺净利润']:
                     if r.get(field) is None and store_key(r) in merged:
                         r[field] = merged[store_key(r)].get(field)
             merged.update({store_key(r): r for r in incoming})

@@ -71,7 +71,7 @@ class ShippingIntegrationTests(unittest.TestCase):
                 columns, rows, warnings, logs = self.build(Path(directory), module)
                 self.assertEqual(len(rows), 1)
                 row = rows[0]
-                self.assertEqual(len(columns), 20)
+                self.assertEqual(len(columns), 22)
                 self.assertFalse(set(row)&{'活动价','报名价','每单补贴金额','总补贴金额','净销售额（实际成交+总补贴金额）'})
                 self.assertEqual(row["实际成交数量（去退款去补单后）"], 4)
                 self.assertEqual(row["实际成交金额（去退款去补单后）"], 400)

@@ -1,62 +1,19 @@
 import fs from 'node:fs/promises';
 import {Workbook,SpreadsheetFile,FileBlob} from './artifact_runtime.mjs';
+import {col,excelDate,detailStyle,previews} from './report_layout.mjs';
 const [input,output]=process.argv.slice(2),d=JSON.parse(await fs.readFile(input,'utf8'));
 const wb=d.existingWorkbook?await SpreadsheetFile.importXlsx(await FileBlob.load(d.existingWorkbook)):Workbook.create();
-const letter=(n)=>{let value='';for(;n>0;n=Math.floor((n-1)/26))value=String.fromCharCode(65+(n-1)%26)+value;return value;};
-const column=(name)=>{const index=d.columns.indexOf(name);return index<0?null:letter(index+1);};
-// Write a standard numeric Excel date. ISO t="d" exports can appear as
-// literal timestamps in WPS even when the display format is yyyy-mm-dd.
-const excelDateSerial=(value)=>{
- const raw=String(value??'').trim();
- const match=/^(\d{4})-(\d{2})-(\d{2})(?:[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})?)?$/.exec(raw);
- if(!match)throw new Error(`无效日报日期: ${raw}`);
- const [year,month,day]=match.slice(1).map(Number),stamp=Date.UTC(year,month-1,day);
- if(new Date(stamp).toISOString().slice(0,10)!==raw.slice(0,10))throw new Error(`无效日报日期: ${raw}`);
- return (stamp-Date.UTC(1899,11,30))/86400000;
-};
-const last=letter(d.columns.length);
-const money=['综合成本','产品成本','快递成本','其他均摊成本','平台费用','到手价','实际成交金额（去退款去补单后）','毛利','推广费用','净利润'];
-const parts=d.sheets||[{name:'每日销售数据',rows:d.rows,oldRows:0}];
-for(const part of parts){
-let s;
-try{s=wb.worksheets.getItem(part.name);}catch{s=wb.worksheets.add(part.name);}
-if(!s)s=wb.worksheets.add(part.name);
-const n=part.rows.length;
-s.getRange(`A1:${letter(Math.max(d.columns.length,part.oldColumnCount||0))}${Math.max(n,part.oldRows||0)+1}`).clear({applyTo:'contents'});
-s.showGridLines=false;
-s.getRange(`A1:${last}${n+1}`).values=[d.columns,...part.rows.map(r=>d.columns.map(h=>h==='日期'?excelDateSerial(r[h]):r[h]===''||r[h]===undefined?null:r[h]))];
-s.getRange(`A1:${last}${n+1}`).format.font={name:'Arial',size:10,color:'#202830'};
-s.getRange(`A1:${last}${n+1}`).format.columnWidth=18;
-s.getRange(`A1:${last}${n+1}`).format.rowHeight=24;
-s.getRange('A:A').format.columnWidth=14;
-const shop=column('店铺名称');if(shop)s.getRange(`${shop}:${shop}`).format.columnWidth=35;
-for(const name of ['商品ID','SKU编码','SKU ID']){const c=column(name);if(c)s.getRange(`${c}:${c}`).format.columnWidth=23;}
-const skuName=column('SKU名称');
-if(skuName){s.getRange(`${skuName}:${skuName}`).format.columnWidth=42;if(n)s.getRange(`${skuName}2:${skuName}${n+1}`).format.wrapText=true;}
-const remark=column('备注');
-if(remark){s.getRange(`${remark}:${remark}`).format.columnWidth=75;
-if(n){s.getRange(`${remark}2:${remark}${n+1}`).format.wrapText=true;s.getRange(`${remark}2:${remark}${n+1}`).format.rowHeight=48;}}
-s.getRange(`A1:${last}1`).format={fill:'#25476A',font:{name:'Arial',size:10,bold:true,color:'#FFFFFF'},wrapText:true,rowHeight:64,horizontalAlignment:'center',verticalAlignment:'center'};
-if(n){s.getRange(`A2:A${n+1}`).setNumberFormat('yyyy-mm-dd');
-for(const name of ['商品ID','SKU编码','SKU ID']){const col=column(name);if(col)s.getRange(`${col}2:${col}${n+1}`).setNumberFormat('@');}
-for(const name of money){const col=column(name);if(col)s.getRange(`${col}2:${col}${n+1}`).setNumberFormat('#,##0.00');}
-const qty=column('实际成交数量（去退款去补单后）'),margin=column('毛利率');
-if(qty)s.getRange(`${qty}2:${qty}${n+1}`).setNumberFormat('#,##0');if(margin)s.getRange(`${margin}2:${margin}${n+1}`).setNumberFormat('0.00%');}
-// Historical schema migrations can carry the retained columns' original formats.
-if(n&&part.sourceNumberFormats)s.getRange(`A2:${last}${n+1}`).format.numberFormat=part.sourceNumberFormats;
-if(n)for(const name of part.sourceWrappedColumns||[]){const c=column(name);if(c)s.getRange(`${c}2:${c}${n+1}`).format.wrapText=true;}
-// Date and identifier contracts override any historical format payload.
-if(n){const date=column('日期');if(date)s.getRange(`${date}2:${date}${n+1}`).setNumberFormat('yyyy-mm-dd');
-for(const name of ['商品ID','SKU编码','SKU ID']){const c=column(name);if(c)s.getRange(`${c}2:${c}${n+1}`).setNumberFormat('@');}}
-s.freezePanes.freezeRows(1);wb.recalculate();
-for(const [area,name] of process.env.DAILY_REPORT_PREVIEW==='0'?[]:[['A1:F7','identity'],['G1:L7','costs'],['M1:T7','amounts']]){
- // Preview renderer coerces numeric text under @ to scientific notation. Use
- // full-digit preview formatting, then restore text format before XLSX export.
- if(name==='identity'&&n)for(const field of ['商品ID','SKU ID']){const c=column(field);if(c)s.getRange(`${c}2:${c}${n+1}`).setNumberFormat('0');}
- const img=await wb.render({sheetName:part.name,range:area,scale:1.2,format:'png'});await fs.writeFile(output+`.${d.sheets?part.name+'.':''}${name}.png`,new Uint8Array(await img.arrayBuffer()));
- if(name==='identity'&&n)for(const field of ['商品ID','SKU ID']){const c=column(field);if(c)s.getRange(`${c}2:${c}${n+1}`).setNumberFormat('@');}
+for(const part of d.sheets||[{name:'每日销售数据',rows:d.rows}]){
+ let s;try{s=wb.worksheets.getItem(part.name);}catch{}
+ if(!s)s=wb.worksheets.add(part.name);
+ const end=part.rows.length+2,last=col(d.columns.length);
+ s.getRange(`A1:${col(Math.max(d.columns.length,part.oldColumnCount||0))}${Math.max(end,(part.oldRows||0)+2)}`).clear({applyTo:'contents'});
+ if(part.rows.length)s.getRange(`A3:${last}${end}`).values=part.rows.map(r=>d.columns.map(h=>h==='日期'?excelDate(r[h]):r[h]??null));
+ detailStyle(s,d.columns,part.rows,2,[[1,2,'基本信息','#304A68'],[3,6,'商品 / SKU','#304A68'],[7,8,'货品拆分','#2A7080'],[9,13,'单件成本','#9A722F'],[14,18,'销售与毛利','#3D6788'],[19,21,'推广与净利润','#3D7665'],[22,22,'说明','#66758A']]);
+ wb.recalculate();
+ if(part.rows.length)for(const c of ['C','D'])s.getRange(`${c}3:${c}${end}`).setNumberFormat('0');
+ await previews(wb,part.name,output,[['A1:H6','identity'],['I1:R6','economics'],['S1:V6','profit']]);
+ if(part.rows.length)for(const c of ['C','D'])s.getRange(`${c}3:${c}${end}`).setNumberFormat('@');
 }
-}
-wb.recalculate();
-await(await SpreadsheetFile.exportXlsx(wb)).save(output);
-console.log(`商品日报已导出:${output}; rows=${d.rows.length}; 更新子表=${parts.map(s=>s.name).join(',')}`);
+wb.recalculate();await(await SpreadsheetFile.exportXlsx(wb)).save(output);
+console.log(`商品日报已导出:${output}; rows=${d.rows.length}`);

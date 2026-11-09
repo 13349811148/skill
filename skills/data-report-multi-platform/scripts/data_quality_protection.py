@@ -231,6 +231,8 @@ def load_cost_table_records(
     """
     sheets = list(sheets)
     costs: dict[str, dict[str, Any]] = CostRecords(load_cost_sku_names(sheets))
+    from goods_catalog import GoodsCatalog
+    costs.goods_catalog = GoodsCatalog.from_sheets(sheets)
     warnings: list[str] = []
     for data in sheets:
         if getattr(data, "truncated", False):

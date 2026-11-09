@@ -12,6 +12,19 @@ REMOVED_REPORT_COLUMNS = ("活动价", "报名价", "每单补贴金额", "总�
                           "净销售额（实际成交+总补贴金额）") + HIDDEN_OUTPUT_COLUMNS
 
 
+TEMPORARY_ZERO_PROFIT_CODES = frozenset({'zb03', 'zb27', 'cb10'})
+
+def apply_temporary_profit(row):
+    code = normalize_match_code(row.get('SKU编码') or row.get('商品SKU'))
+    cost = optional_number(row.get('产品成本'))
+    quantity = optional_number(row.get('实际成交数量（去退款去补单后）'))
+    if code in TEMPORARY_ZERO_PROFIT_CODES and (cost is None or cost <= 0) and quantity and quantity > 0:
+        row['净利润'] = 0.0
+        note = '用户2026-11-09确认：缺产品成本期间净利润暂计0，成本与毛利留空，补齐成本后恢复正常计算'
+        if note not in str(row.get('备注') or ''):
+            row['备注'] = '；'.join(filter(None, [row.get('备注'), note]))
+
+
 def apply_product_cost_rules(row: dict[str, Any]) -> None:
     """Comprehensive cost is per unit; gross deducts it times quantity.
 
@@ -38,6 +51,7 @@ def apply_product_cost_rules(row: dict[str, Any]) -> None:
     row["平台费用"] = arrival * PLATFORM_COST_RATE if valid_sales else ""
     row.update({"综合成本": "", "毛利": "", "毛利率": "", "净利润": "", "定价是否合理": ""})
     if not valid_sales or cost is None or cost <= 0 or row["快递成本"] == "":
+        apply_temporary_profit(row)
         return
     total = cost + row["快递成本"] + row["其他均摊成本"] + row["平台费用"]
     row["综合成本"] = total
@@ -61,4 +75,8 @@ def product_output_row(row: dict[str, Any], columns: list[str], costs) -> dict[s
               if column not in REMOVED_REPORT_COLUMNS}
     output["SKU编码"] = code
     output["SKU名称"] = name
+    catalog = getattr(costs, 'goods_catalog', None)
+    if catalog is not None and {'货品名称', '货品数量'}.issubset(columns):
+        output, _, _ = catalog.annotate(output)
+    apply_temporary_profit(output)
     return output
