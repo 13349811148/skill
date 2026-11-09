@@ -99,8 +99,13 @@ def main() -> int:
     parser.add_argument('--archive-dir',type=Path,help='固定报表目录，默认运营数据库/数据报表输出')
     parser.add_argument('--refresh-existing',action='store_true',help='保留既有业务结果，更新版式、货品拆分、确认的销售剔除及店铺净利润')
     parser.add_argument('--refresh-goods-only',action='store_true',help='只更新既有货品日报的金额与利润，不改商品/店铺文件或触发商品上传')
+    parser.add_argument('--refresh-store-cashflow',action='store_true',help='只按订单实收及退款时间更新已生成店铺月报金额，后台仅复核')
     args, passthrough = parser.parse_known_args()
     archive_root=args.archive_dir or Path(option_value(passthrough,'--database-root',str(DEFAULT_DATABASE_ROOT)))/'数据报表输出'
+    if args.refresh_store_cashflow:
+        from build_store_report import refresh_cashflow
+        refresh_cashflow(Path(option_value(passthrough,'--database-root',str(DEFAULT_DATABASE_ROOT))), archive_root, args.store_output)
+        return 0
     if args.refresh_existing or args.refresh_goods_only:
         from report_extensions import refresh
         platforms = ['pdd','tmall'] if not args.platform or args.platform == 'both' else [args.platform]

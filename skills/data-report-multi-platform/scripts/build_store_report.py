@@ -56,7 +56,7 @@ def records(path):
                 if any(v is not None for v in row): yield dict(zip(headers,row))
     finally: wb.close()
 
-def build_payload(root, dates, sources=(), config=None):
+def build_payload(root, dates, sources=(), config=None, include_cashflow=True):
     config=config or json.loads((SKILL/'references/store_report_config.json').read_text(encoding='utf-8'))
     rows={}; logs=[]; evidence={}; selected={}
     def insert(record,source,fields,platform=None,shop=None):
@@ -138,6 +138,10 @@ def build_payload(root, dates, sources=(), config=None):
         for dt in dates:
             key=(dt,shop['平台'],shop['店铺'])
             row=rows.setdefault(key,{h:None for h in HEADERS});row.update(zip(HEADERS[:3],key));row['填报人']=config.get('reporters',{}).get(shop['店铺'])
+    if include_cashflow:
+        from store_cashflow import load as load_cashflow, apply as apply_cashflow
+        ledger = load_cashflow(root, dates, config)
+        apply_cashflow(rows.values(), ledger, logs, evidence)
     for row in rows.values():
         for field in ALWAYS_BLANK:row[field]=None
         row['新客数'],row['老客数']=estimate_customers(row.get('支付买家数'),row.get('老客数占比'))
@@ -159,6 +163,30 @@ def build_payload(root, dates, sources=(), config=None):
         if row['支付金额'] is not None and row['退款金额'] is not None and row['支付金额']-row['退款金额']<0:
             logs.append({'date':row['日期'],'shop':row['店铺'],'message':'全店净成交额为负，保留净成交额；推广ROI和推广费比留空'})
     return {'headers':HEADERS,'rows':[rows[k] for k in sorted(rows)],'logs':logs,'evidence':evidence}
+
+def refresh_cashflow(root, directory, explicit_output=None):
+    """Migrate only existing store cash-flow fields; preserve other business inputs."""
+    from report_extensions import store_payload
+    from report_archive import store
+    from store_cashflow import load as load_cashflow, apply as apply_cashflow
+    root, directory = Path(root), Path(directory)
+    paths = [Path(explicit_output)] if explicit_output else sorted(directory.glob('店铺日报_????-??.xlsx'))
+    if not paths:
+        raise ValueError('未找到已生成的店铺月报，不能猜测历史覆盖范围')
+    payloads = [(path, store_payload(path)) for path in paths]
+    dates = {r['日期'] for _, payload in payloads for r in payload['rows']}
+    config = json.loads((SKILL/'references/store_report_config.json').read_text(encoding='utf-8'))
+    backend = build_payload(root, dates, config=config, include_cashflow=False)
+    backend_rows = {(r['日期'],r['平台'],r['店铺']):r for r in backend['rows']}
+    ledger = load_cashflow(root, dates, config)
+    results = []
+    for path,payload in payloads:
+        apply_cashflow(payload['rows'], ledger, payload.setdefault('logs',[]), payload.setdefault('evidence',{}), backend_rows)
+        payload['cashflow_sources'] = {k:v for k,v in ledger.items() if k!='rows'}
+        results.extend(store(payload, directory, path))
+    print('店铺现金流已按订单实收及退款事件更新: '+', '.join(str(p) for p in results))
+    return results
+
 
 def main():
     p=argparse.ArgumentParser()

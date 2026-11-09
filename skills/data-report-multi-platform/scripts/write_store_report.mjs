@@ -26,7 +26,7 @@ if(n){
   const retained=payload.rows[i-4]._原值保留||{};
   const labels={M:'新客数',N:'老客数',P:'客单价',Q:'支付转化率',R:'净成交额',U:'推广ROI',V:'推广费比'};
   for(const [c,f] of Object.entries(form)){
-   if(Object.hasOwn(retained,labels[c]))sheet.getRange(`${c}${i}`).values=[[retained[labels[c]]]];
+   if(Object.hasOwn(retained,labels[c]) && !(payload.rows[i-4]._现金流规则 && ['客单价','净成交额','推广ROI','推广费比'].includes(labels[c])))sheet.getRange(`${c}${i}`).values=[[retained[labels[c]]]];
    else sheet.getRange(`${c}${i}`).formulas=[[f]];
   }
  }
@@ -36,8 +36,8 @@ if(n){
  for(const c of ['H','K','P','R','S','T','U','AA'])sheet.getRange(`${c}4:${c}${n+3}`).setNumberFormat('#,##0.00');
 }
 sheet.getRange('A1:AA1').unmerge();sheet.getRange('A1:AA1').merge();
-sheet.getRange('A1').values=[['店铺每日经营日报 · 净利润按商品日报汇总（含空烧推广；暂计0见日志）']];
-sheet.getRange('A1:AA1').format={fill:'#1E334B',font:{name:'Microsoft YaHei',size:16,bold:true,color:'#FFFFFF'},rowHeight:40,verticalAlignment:'center'};
+sheet.getRange('A1').values=[['店铺每日经营日报 · 订单实收－退款；退款按同意时间估算；净利润按商品日报汇总']];
+sheet.getRange('A1:AA1').format={fill:'#1E334B',font:{name:'Microsoft YaHei',size:16,bold:true,color:'#FFFFFF'},rowHeight:40,verticalAlignment:'center',horizontalAlignment:'left',wrapText:false};
 sheet.getRange('A2:AA2').unmerge();sheet.getRange('A2:AA2').clear({applyTo:'contents'});
 for(const [range,label,color] of [['A2:D2','基本信息','#304A68'],['E2:G2','流量（曝光 / 点击为推广口径）','#2A7080'],['H2:L2','支付与退款','#3D6788'],['M2:Q2','客户与转化','#3D6788'],['R2:V2','成交与推广','#9A722F'],['W2:Z2','店铺记录','#66758A'],['AA2:AA2','经营利润','#3D7665']])band(sheet,range,label,color);
 sheet.getRange('A3:AA3').values=[payload.headers];
@@ -59,7 +59,7 @@ wb.recalculate();
 const check=await wb.inspect({kind:'match',searchTerm:'#REF!|#DIV/0!|#VALUE!|#NAME\\?|#NUM!',options:{useRegex:true,maxResults:20},maxChars:2000});
 await fs.writeFile(output+'.inspect.ndjson',check.ndjson);
 if(process.env.STORE_REPORT_PREVIEW){
- for(const [area,name] of [['A1:J8','identity'],['R1:AA8','profit']]){
+ for(const [area,name] of [['A1:L8','identity'],['R1:AA8','profit']]){
   const image=await wb.render({sheetName:'①平台日报',range:area,scale:1.2,format:'png'});
   await fs.writeFile(output+`.${name}.png`,new Uint8Array(await image.arrayBuffer()));
  }

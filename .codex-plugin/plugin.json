@@ -1,7 +1,7 @@
 {
   "name": "daily-report",
-  "version": "2026.11.09+goods.2",
-  "description": "按月累计商品、货品与店铺日报；货品销售额、毛利、推广费及净利润按成本占比分摊，货品均价及每日金额对账。",
+  "version": "2026.11.09+cashflow.1",
+  "description": "按月累计商品、货品与店铺日报；店铺净成交按支付日订单商家实收减当日成功退款，同意退款时间估算归日，后台金额仅复核。",
   "skills": [
     "./skills/data-report-multi-platform"
   ],
