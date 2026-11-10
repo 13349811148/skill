@@ -14,6 +14,18 @@ REMOVED_REPORT_COLUMNS = ("活动价", "报名价", "每单补贴金额", "总�
 
 TEMPORARY_ZERO_PROFIT_CODES = frozenset({'zb03', 'zb27', 'cb10'})
 
+EXPIRY_PROFIT_NOTE = '用户2026-11-10确认：货品名称含临期，净利润计0；实际毛利和推广费用保留'
+
+
+def apply_name_profit_override(row):
+    """The user's goods-name policy overrides net profit, independent of cost."""
+    if '临期' not in str(row.get('货品名称') or ''):
+        return False
+    row['净利润'] = 0.0
+    if EXPIRY_PROFIT_NOTE not in str(row.get('备注') or ''):
+        row['备注'] = '；'.join(filter(None, [row.get('备注'), EXPIRY_PROFIT_NOTE]))
+    return True
+
 def apply_temporary_profit(row):
     code = normalize_match_code(row.get('SKU编码') or row.get('商品SKU'))
     cost = optional_number(row.get('产品成本'))
@@ -79,4 +91,5 @@ def product_output_row(row: dict[str, Any], columns: list[str], costs) -> dict[s
     if catalog is not None and {'货品名称', '货品数量'}.issubset(columns):
         output, _, _ = catalog.annotate(output)
     apply_temporary_profit(output)
+    apply_name_profit_override(output)
     return output

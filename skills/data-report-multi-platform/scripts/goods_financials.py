@@ -36,13 +36,16 @@ def allocate_financials(quantity_rows, sources, catalog, audit=None):
     day_inputs = defaultdict(lambda: {m: [] for m in METRICS})
     day_incomplete = defaultdict(set)
     for source in sources:
+        annotated, parts, error = catalog.annotate(source)
+        from product_cost_rules import apply_name_profit_override
+        source=dict(source, 货品名称=annotated.get('货品名称') or source.get('货品名称'))
+        apply_name_profit_override(source)
         date, shop = source['日期'], source['店铺名称']
         origin = {k: source.get(k) for k in ['日期', '店铺名称', '商品ID', 'SKU ID', 'SKU编码']}
         money = {m: numeric(source.get(SOURCE_FIELDS[m]), m) for m in METRICS}
         for metric, value in money.items():
             day_inputs[date, shop][metric].append(value)
         quantity = Decimal(str(source.get('实际成交数量（去退款去补单后）') or 0))
-        _, parts, error = catalog.annotate(source)
         mode = '单一货品全额归属'
         weights = None
         if quantity == 0:
@@ -130,6 +133,8 @@ def allocate_financials(quantity_rows, sources, catalog, audit=None):
     result = []
     for key in sorted(rows, key=lambda k: (k[2].startswith('空烧推广费:'), *k)):
         row = rows[key]
+        from product_cost_rules import apply_name_profit_override
+        apply_name_profit_override(row)
         count, sales = row.get('货品数量'), row.get('销售额')
         row[PRICE] = sales/count if sales is not None and count is not None and count > 0 else None
         from profit_rates import net_margin

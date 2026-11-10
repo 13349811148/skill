@@ -149,6 +149,7 @@ def transplant(source,staged,payload):
         # Keep user-created sheets/pivots while updating generated month sheets.
         workbook=ET.fromstring(original['xl/workbook.xml']);sheets=workbook.find(Q('sheets'))
         rels=ET.fromstring(original['xl/_rels/workbook.xml.rels']);types=ET.fromstring(original['[Content_Types].xml'])
+        added_month=False
         for part in payload['sheets']:
             name=part['name'];tree=ET.fromstring(authored[new_sheets[name]])
             for row in tree.findall(f'{Q("sheetData")}/{Q("row")}'):
@@ -159,6 +160,7 @@ def transplant(source,staged,payload):
                 if 'style' in item.attrib:item.set('style',str(styles.map('cellXfs',int(item.attrib['style']))))
             target=source_sheets.get(name)
             if not target:
+                added_month=True
                 number=max([0,*[int(re.search(r'sheet(\d+)\.xml$',p)[1]) for p in source_sheets.values()]])+1
                 target=f'xl/worksheets/sheet{number}.xml';rid='rIdGoods'+str(number)
                 while any(r.attrib['Id']==rid for r in rels):rid+='x'
@@ -169,9 +171,18 @@ def transplant(source,staged,payload):
                 ET.SubElement(types,ct,{'PartName':'/'+target,'ContentType':'application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml'})
                 source_sheets[name]=target
             original[target]=ET.tostring(tree,encoding='utf-8',xml_declaration=True)
-        original['xl/workbook.xml']=ET.tostring(workbook,encoding='utf-8',xml_declaration=True)
-        original['xl/_rels/workbook.xml.rels']=ET.tostring(rels,encoding='utf-8',xml_declaration=True)
-        original['[Content_Types].xml']=ET.tostring(types,encoding='utf-8',xml_declaration=True)
+        if added_month:
+            original['xl/workbook.xml']=ET.tostring(workbook,encoding='utf-8',xml_declaration=True)
+            original['xl/_rels/workbook.xml.rels']=ET.tostring(rels,encoding='utf-8',xml_declaration=True)
+            # OPC package metadata requires an unprefixed root in the importer.
+            def opc_xml(tree):
+                raw=ET.tostring(tree,encoding='unicode')
+                matched=re.match(r'<([^:> ]+):',raw)
+                if not matched:return raw.encode('utf-8')
+                prefix=matched[1]
+                return raw.replace('xmlns:'+prefix+'=', 'xmlns=').replace('<'+prefix+':','<').replace('</'+prefix+':','</').encode('utf-8')
+            original['xl/_rels/workbook.xml.rels']=opc_xml(rels)
+            original['[Content_Types].xml']=opc_xml(types)
     original['xl/styles.xml']=ET.tostring(styles.original,encoding='utf-8',xml_declaration=True)
     temporary=Path(staged).with_suffix('.native.xlsx')
     with zipfile.ZipFile(temporary,'w',compression=zipfile.ZIP_DEFLATED) as z:

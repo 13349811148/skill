@@ -91,10 +91,11 @@ def refresh(report, database_root, platform, dates, archive_dir, explicit_store=
                 row['_货品匹配编码'] = match['商品SKU']
                 row['_货品编码来源'] = match.get('来源')
     annotated, issues = [], []
-    from product_cost_rules import apply_temporary_profit
+    from product_cost_rules import apply_temporary_profit, apply_name_profit_override
     for row in retained:
         apply_temporary_profit(row)
         row, _, error = catalog.annotate(row)
+        apply_name_profit_override(row)
         annotated.append(row)
         if error:
             issues.append({'日期': row['日期'], 'SKU编码': row['SKU编码'], '原因': error})

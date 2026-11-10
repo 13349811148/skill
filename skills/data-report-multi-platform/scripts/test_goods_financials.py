@@ -75,6 +75,16 @@ class GoodsFinancialTests(unittest.TestCase):
         reversed_rows,_=goods_rows(list(reversed(sources)),self.catalog())
         self.assertEqual(rows,reversed_rows)
 
+    def test_expiry_goods_zero_profit_and_normal_goods_and_promotion_reconcile(self):
+        cat=self.catalog();cat.records['a']['name']='临期-甲';audit={}
+        sources=[self.row('AA',sales=30,gross=-3,promo=7,net=-10),self.row('B',sales=25,gross=8,promo=2,net=6)]
+        rows,_=goods_rows(sources,cat,audit);by={r['货品编码']:r for r in rows}
+        self.assertEqual((by['A']['净利润'],by['A']['净利率']),(0,0))
+        self.assertEqual((by['A']['销售额'],by['A']['毛利'],by['A']['推广费用']),(30,-3,7))
+        self.assertEqual(by['B']['净利润'],6)
+        net_check=next(x for x in audit['daily_reconciliation'] if x['metric']=='净利润')
+        self.assertEqual((net_check['source_total'],net_check['output_known_subtotal']),('6.00','6.00'))
+
     def test_unresolved_sku_keeps_receipt_visible_but_does_not_invent_quantity(self):
         rows,issues=goods_rows([self.row('UNKNOWN',qty=1,sales=19.9,gross=None,promo=0,net=None)],self.catalog())
         self.assertEqual(len(issues),1)

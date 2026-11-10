@@ -1,7 +1,7 @@
 {
   "name": "daily-report",
-  "version": "2026.11.09+margin.1",
-  "description": "按月累计商品、货品与店铺日报；货品及店铺净利率按净销售额计算，保留已有货品汇总页与透视表，店铺订单退款现金流口径不变。",
+  "version": "2026.11.10+expiry.1",
+  "description": "按月累计商品、货品与店铺日报；货品名称含临期的净利润计0，保留实际销售、成本及推广费用，店铺利润和净利率同步汇总。",
   "skills": [
     "./skills/data-report-multi-platform"
   ],
