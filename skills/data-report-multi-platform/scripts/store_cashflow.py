@@ -50,9 +50,11 @@ def money(value):
 
 def discover(root, legacy, current):
     from jd_promotion import is_jd_archive
+    from tmall_v3 import is_tmall_path
     folder = root/legacy if (root/legacy).exists() else root/current
     return sorted((p for p in folder.rglob('*') if p.is_file() and p.suffix.lower() in {'.xlsx', '.xls', '.csv'}
-                   and not p.name.startswith('~$') and not is_excluded_order_path(p) and not is_jd_archive(p)),
+                   and not p.name.startswith('~$') and not is_excluded_order_path(p) and not is_jd_archive(p)
+                   and not is_tmall_path(p)),
                   key=lambda p: (p.stat().st_mtime_ns, str(p)), reverse=True) if folder.exists() else []
 
 
@@ -96,14 +98,17 @@ def records(path, required):
             break
 
 
-def exclusions(root, config):
+def exclusions(root, config, platform='拼多多'):
     path = root/'_系统/日报配置/订单剔除.json'
     if not path.exists():
         return set(), None
     data = json.loads(path.read_text(encoding='utf-8-sig'))
     aliases = config.get('shop_aliases', {})
+    if platform == '天猫':
+        from tmall_v3 import shop_name
+        aliases = {**aliases, **{r['店铺']: shop_name(r['店铺']) for r in data['groups'] if r.get('平台') == platform}}
     return {(aliases.get(r['店铺'], r['店铺']), text(order)) for r in data['groups']
-            for order in r['订单号'] if r.get('平台','拼多多') == '拼多多'}, str(path)
+            for order in r['订单号'] if r.get('平台', '拼多多') == platform}, str(path)
 
 
 def load(root, dates, config):
@@ -221,10 +226,10 @@ def load(root, dates, config):
             'refund_sources': refund_sources, 'exclusions_source': exclusion_source}
 
 
-def apply(rows, ledger, logs, evidence, backend=None):
+def apply(rows, ledger, logs, evidence, backend=None, *, platform='拼多多', policy=POLICY_NOTE):
     for row in rows:
         key = row['日期'], row['平台'], row['店铺']
-        if row['平台'] != '拼多多':
+        if row['平台'] != platform:
             continue
         values = ledger['rows'].get(key, {field: None for field in CASH_FIELDS})
         reference = dict((backend or {}).get(key, row))
@@ -235,7 +240,8 @@ def apply(rows, ledger, logs, evidence, backend=None):
             checks.append({'field': field, '订单售后计算': value, '后台复核': original,
                            '差异': round(value-original, 2) if value is not None and original is not None else None})
             row[field] = value
-            evidence['|'.join((*key, field))] = ('订单支付日商家实收汇总' if field.startswith('支付') else '退款成功，按同意退款时间归日（估算）')
+            evidence['|'.join((*key, field))] = policy if platform == '天猫' else (
+                '订单支付日商家实收汇总' if field.startswith('支付') else '退款成功，按同意退款时间归日（估算）')
         paid, refunded, count = row['支付金额'], row['退款金额'], row['支付订单数']
         net = money(Decimal(str(paid))-Decimal(str(refunded))) if paid is not None and refunded is not None else None
         row['净成交额'] = net
@@ -249,17 +255,17 @@ def apply(rows, ledger, logs, evidence, backend=None):
         checks.append({'field':'净成交额','订单售后计算':net,'后台复核':round(reference_net,2) if reference_net is not None else None,
                        '差异':round(net-reference_net,2) if net is not None and reference_net is not None else None})
         for field in CASH_DERIVED:
-            evidence['|'.join((*key,field))] = '订单/售后现金流派生；'+POLICY_NOTE
+            evidence['|'.join((*key,field))] = '订单/售后现金流派生；'+policy
         previous = {k:v for k,v in row.get('_原值保留', {}).items() if k in CASH_FIELDS+CASH_DERIVED}
         if previous:
             row.setdefault('_历史现金流保留', {}).update(previous)
             row['_原值保留'] = {k:v for k,v in row['_原值保留'].items() if k not in CASH_FIELDS+CASH_DERIVED}
         old_note = row.get('_口径说明')
-        if old_note and POLICY_NOTE not in old_note:
+        if old_note and policy not in old_note:
             row.setdefault('_历史口径说明', old_note)
-        row['_口径说明'] = POLICY_NOTE
-        row['_现金流规则'] = POLICY_NOTE
+        row['_口径说明'] = policy
+        row['_现金流规则'] = policy
         row['_后台金额复核'] = checks
         row['_现金流明细'] = values.get('_现金流明细', {})
-        logs.append({'date': key[0], 'shop': key[2], 'message': POLICY_NOTE, 'checks': checks})
+        logs.append({'date': key[0], 'shop': key[2], 'message': policy, 'checks': checks})
     logs.extend(ledger['logs'])

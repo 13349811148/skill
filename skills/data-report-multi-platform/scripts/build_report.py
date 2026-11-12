@@ -15,6 +15,7 @@ import build_pdd_report
 from portable_reports import read_workbook_sheets
 from handoff_protection import find_header_row, is_excluded_order_path
 from jd_promotion import is_jd_archive
+from tmall_v3 import is_main_order
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -37,14 +38,10 @@ def option_value(arguments: list[str], option: str, default: str) -> str:
 
 
 def detect_platforms(database_root: Path) -> set[str]:
-    orders_dir = database_root / "订单数据"
-    if not orders_dir.exists():
-        orders_dir = database_root / "2.订单数据库"
-    if not orders_dir.exists():
-        return set()
-
+    directories = (database_root / '订单数据', database_root / '2.订单数据库')
     detected: set[str] = set()
-    for path in orders_dir.rglob("*"):
+    paths = (path for directory in directories for path in directory.rglob('*'))
+    for path in paths:
         if (
             not path.is_file()
             or path.suffix.lower() not in ORDER_FILE_EXTENSIONS
@@ -62,7 +59,7 @@ def detect_platforms(database_root: Path) -> set[str]:
         except Exception:
             continue
         for sheet in sheets:
-            if find_header_row(sheet.rows, build_tmall_report.is_tmall_order_headers) is not None:
+            if find_header_row(sheet.rows, lambda headers: is_main_order(headers) or build_tmall_report.is_tmall_order_headers(headers)) is not None:
                 detected.add("tmall")
             if find_header_row(sheet.rows, build_pdd_report.is_pdd_order_headers) is not None:
                 detected.add("pdd")
@@ -162,6 +159,9 @@ def main() -> int:
     os.environ['DAILY_REPORT_DATES']=json.dumps(sorted(dates))
     store_arguments = []
     store_arguments.extend(['--archive-dir',str(archive_root)])
+    for platform in selected:
+        if platform in PLATFORM_SCRIPTS:
+            store_arguments.extend(['--platform', {'pdd': '拼多多', 'tmall': '天猫'}[platform]])
     for option in ("--database-root", "--start-date", "--end-date", "--date"):
         for index, value in enumerate(passthrough):
             if value == option and index + 1 < len(passthrough):

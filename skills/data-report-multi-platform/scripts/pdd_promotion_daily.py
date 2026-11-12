@@ -47,7 +47,7 @@ def load(root,target_dates):
         if any(t in str(path).lower() for t in ['备份','副本','backup']):raise ValueError(f'推广目录含备份 {path}')
         meta=path.with_suffix(path.suffix+'.archive.json')
         md=json.loads(meta.read_text(encoding='utf-8-sig')) if meta.exists() else {}
-        if md.get('platform') == '京东':
+        if md.get('platform') in ('京东', '天猫'):
             continue
         relative=path.relative_to(folder).parts
         shop=md.get('shop') or relative[0] if len(relative)>1 else md.get('shop')

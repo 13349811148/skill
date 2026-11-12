@@ -58,13 +58,14 @@ def install(module):
     original_discover=module.discover_files
     def discover(root,subdir):
         from jd_promotion import is_jd_archive
+        from tmall_v3 import is_tmall_path
         current={'订单数据':'2.订单数据库','商品数据':'1.产品数据库','推广数据':'4.推广数据库','售后数据':'3.售后数据库'}.get(subdir)
-        if (root/subdir).exists():return [p for p in original_discover(root,subdir) if not is_jd_archive(p)]
+        if (root/subdir).exists():return [p for p in original_discover(root,subdir) if not is_jd_archive(p) and not is_tmall_path(p)]
         if not current or not (root/current).exists():return []
         result=[]
         for p in (root/current).rglob('*'):
             if p.is_file() and p.suffix.lower() in {'.xlsx','.xls','.csv'} and not p.name.startswith('~$'):
-                if is_jd_archive(p):continue
+                if is_jd_archive(p) or is_tmall_path(p):continue
                 if subdir=='订单数据' and module.is_excluded_order_path(p):continue
                 result.append(p)
         return sorted(result)

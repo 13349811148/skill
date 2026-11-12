@@ -13,6 +13,7 @@ from decimal import Decimal, ROUND_HALF_UP
 SKILL = Path(__file__).resolve().parent.parent
 from store_schema import STORE_HEADERS
 from pdd_promotion_daily import is_product_marketing, promotion_fee_field
+import tmall_v3
 HEADERS = list(STORE_HEADERS)
 DERIVED = {'客单价','支付转化率','净成交额','推广ROI','推广费比','新客数','老客数','净利率'}
 ALWAYS_BLANK = {'今日主要动作','异常说明'}
@@ -58,7 +59,8 @@ def records(path):
                 if any(v is not None for v in row): yield dict(zip(headers,row))
     finally: wb.close()
 
-def build_payload(root, dates, sources=(), config=None, include_cashflow=True):
+def build_payload(root, dates, sources=(), config=None, include_cashflow=True, platforms=None):
+    platforms = {'拼多多', '天猫'} if platforms is None else set(platforms)
     config=config or json.loads((SKILL/'references/store_report_config.json').read_text(encoding='utf-8'))
     rows={}; logs=[]; evidence={}; selected={}
     def insert(record,source,fields,platform=None,shop=None):
@@ -70,6 +72,10 @@ def build_payload(root, dates, sources=(), config=None, include_cashflow=True):
         shop=config.get('shop_aliases',{}).get(str(shop),shop)
         if not platform or not shop:
             logs.append({'source':str(source),'date':dt,'message':'缺少明确平台或店铺，未导入'});return
+        if platform not in platforms:
+            return
+        if platform == tmall_v3.PLATFORM:
+            shop = tmall_v3.shop_name(shop)
         key=(dt,str(platform),str(shop))
         row=rows.setdefault(key,{h:None for h in HEADERS});row.update(zip(HEADERS[:3],key))
         row['填报人']=config.get('reporters',{}).get(str(shop))
@@ -98,19 +104,27 @@ def build_payload(root, dates, sources=(), config=None, include_cashflow=True):
     if backend.exists():
         for path in sorted(backend.rglob('*.xlsx')):
             if path.name.startswith('~$'):continue
-            meta=path.with_suffix('.archive.json')
-            if not meta.exists():continue
-            metadata=json.loads(meta.read_text(encoding='utf-8-sig'))
-            backend_shop=metadata.get('shop')
-            canonical=config.get('shop_aliases',{}).get(str(backend_shop))
+            metadata = tmall_v3.archive_metadata(path)
+            if not metadata:
+                meta = path.with_suffix('.archive.json')
+                if not meta.exists():
+                    continue
+                metadata = json.loads(meta.read_text(encoding='utf-8-sig'))
+            backend_shop = metadata.get('shop')
+            platform = metadata.get('platform') or ('天猫' if str(backend_shop).endswith(('（天猫）', '(天猫)')) else '拼多多')
+            if platform not in platforms:
+                continue
+            canonical = tmall_v3.archive_shop(path, row_shop=backend_shop) if platform == '天猫' else config.get('shop_aliases', {}).get(str(backend_shop))
             if not canonical:
                 logs.append({'source':str(path),'message':'后台店名未确认映射，未与订单/推广合并'});continue
             for record in records(path):
-                insert(record,path,{'访客数':['店铺访客数（人）','店铺访客数','访客数'],'支付金额':['成交金额（元）'],'支付订单数':['订单数','成交订单数（单）'],'支付买家数':['成交买家数','成交买家数（人）'],'老客数占比':['老买家占比','成交老买家占比'],'退款金额':['退款金额（元）'],'退款订单数':['退款单数','退款单数（单）'],'店铺评分':['综合体验星级'],'投诉差评数':['新增差评（条）']},'拼多多',canonical)
+                insert(record,path,{'访客数':['店铺访客数（人）','店铺访客数','访客数'],'支付金额':['成交金额（元）'],'支付订单数':['订单数','成交订单数（单）'],'支付买家数':['成交买家数','成交买家数（人）'],'老客数占比':['老买家占比','成交老买家占比'],'退款金额':['退款金额（元）'],'退款订单数':['退款单数','退款单数（单）'],'店铺评分':['综合体验星级','店铺评分'],'投诉差评数':['新增差评（条）','投诉差评数']},platform,canonical)
                 try:dt=day(record.get('日期'))
                 except (ValueError,TypeError):continue
                 if dt not in dates:continue
-                key=(dt,'拼多多',canonical)
+                key=(dt,platform,canonical)
+                if key not in rows:
+                    continue
                 raw_rate=record.get('转化率') if record.get('转化率') is not None else record.get('成交转化率')
                 if raw_rate is not None:
                     rate=number(raw_rate)
@@ -121,7 +135,7 @@ def build_payload(root, dates, sources=(), config=None, include_cashflow=True):
                         evidence['|'.join((*key,'支付转化率'))]=str(path)+'（后台原始转化率，访客缺失时使用；不反推访客）'
             logs.append({'source':str(path),'message':'后台日成交金额/订单数/买家数对应未扣退款支付口径；退款采用后台当日退款指标；评分=综合体验星级，投诉差评列仅填新增差评（1至3星，不含默认评价）；老客占比取后台原值，新老买家人数按用户确认规则重新推算。'})
     # Account daily exports contain total promotion metrics, without a product ID.
-    for folder in ['4.推广数据库','推广数据']:
+    for folder in ['4.推广数据库','推广数据'] if '拼多多' in platforms else ():
         if not (root/folder).exists():continue
         for path in sorted((root/folder).rglob('*.xlsx')):
             if path.name.startswith('~$') or '账户每日汇总' not in str(path):continue
@@ -131,6 +145,8 @@ def build_payload(root, dates, sources=(), config=None, include_cashflow=True):
             metadata=json.loads(meta.read_text(encoding='utf-8-sig')) if meta.exists() else {}
             shop=metadata.get('shop')
             archived_platform=metadata.get('platform') or ('拼多多' if shop and '拼多多' in shop else None)
+            if archived_platform and archived_platform != '拼多多':
+                continue
             for record in records(path):
                 if any(record.get(k) for k in ['商品ID','商品id','归档商品ID']):
                     raise ValueError(f'账户每日汇总中发现商品明细，不能直接当店铺汇总: {path}')
@@ -146,15 +162,36 @@ def build_payload(root, dates, sources=(), config=None, include_cashflow=True):
                 if fee_field:
                     fields['推广花费']=[fee_field]
                 insert(record,path,fields,platform,shop)
-    configured=config.get('shops',[])
+    if '天猫' in platforms:
+        for (dt, shop), snapshot in tmall_v3.promotion(root, dates).items():
+            insert({'日期': dt, **snapshot['fields']}, snapshot['source'],
+                   {field: [field] for field in tmall_v3.PROMO_FIELDS}, '天猫', shop)
+            rows[dt, '天猫', shop]['_万相台未归属商品花费'] = snapshot['unallocated']
+            window = snapshot['attribution_window']
+            attribution = (f'推广成交额按{window}天转化周期。' if window else
+                           '推广成交额沿用原表未标注周期的口径。' if window == 0 else
+                           '转化周期无共同口径，推广成交额留空。')
+            logs.append({'date': dt, 'shop': shop, 'source': str(snapshot['source']),
+                         'message': '推广指标取万相台场景结案，展现、点击和花费按计划与主体跨转化周期去重。'
+                                    f"未归属商品花费 {snapshot['unallocated']:.2f} 元。{attribution}"})
+    configured = [shop for shop in config.get('shops', []) if shop['平台'] in platforms]
     for shop in configured:
         for dt in dates:
             key=(dt,shop['平台'],shop['店铺'])
             row=rows.setdefault(key,{h:None for h in HEADERS});row.update(zip(HEADERS[:3],key));row['填报人']=config.get('reporters',{}).get(shop['店铺'])
     if include_cashflow:
         from store_cashflow import load as load_cashflow, apply as apply_cashflow
-        ledger = load_cashflow(root, dates, config)
-        apply_cashflow(rows.values(), ledger, logs, evidence)
+        if '拼多多' in platforms:
+            ledger = load_cashflow(root, dates, config)
+            apply_cashflow(rows.values(), ledger, logs, evidence)
+        if '天猫' in platforms:
+            ledger = tmall_v3.cashflow(root, dates, config)
+            for key in ledger['rows']:
+                rows.setdefault(key, dict.fromkeys(HEADERS))
+                rows[key].update(zip(HEADERS[:3], key))
+                rows[key]['填报人'] = config.get('reporters', {}).get(key[2])
+            archive_rows = [row for row in rows.values() if row['店铺'] in ledger['shops']]
+            apply_cashflow(archive_rows, ledger, logs, evidence, platform='天猫', policy=tmall_v3.POLICY)
     for row in rows.values():
         for field in ALWAYS_BLANK:row[field]=None
         row['新客数'],row['老客数']=estimate_customers(row.get('支付买家数'),row.get('老客数占比'))
@@ -205,6 +242,7 @@ def main():
     p=argparse.ArgumentParser()
     p.add_argument('--database-root',default=str(Path.home()/'Desktop/运营数据库'))
     p.add_argument('--input',action='append',default=[])
+    p.add_argument('--platform', action='append', choices=['天猫', '拼多多'])
     p.add_argument('--config',type=Path)
     p.add_argument('--date',action='append');p.add_argument('--start-date');p.add_argument('--end-date')
     p.add_argument('--output',type=Path);p.add_argument('--payload-only',action='store_true')
@@ -218,7 +256,10 @@ def main():
         dates.update((start+timedelta(days=i)).isoformat() for i in range((end-start).days+1))
     if not dates:p.error('必须指定统计日期')
     root=Path(a.database_root);output=a.output or root/'数据报表输出/店铺维度日报.xlsx'
-    payload=build_payload(root,dates,a.input,json.loads(a.config.read_text(encoding='utf-8')) if a.config else None)
+    payload=build_payload(root,dates,a.input,json.loads(a.config.read_text(encoding='utf-8')) if a.config else None, platforms=a.platform)
+    if a.platform == ['天猫'] and not payload['rows']:
+        print(f"指定日期无可核实的天猫店铺数据: {', '.join(sorted(dates))}")
+        return 2
     if os.environ.get('DAILY_REPORT_ARCHIVE')=='1' and not a.payload_only:
         from report_archive import store
         paths=store(payload,a.archive_dir or root/'数据报表输出',a.output)

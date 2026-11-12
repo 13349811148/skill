@@ -48,6 +48,8 @@ from handoff_protection import (
     resolve_order_date,
 )
 from order_line_protection import classify_order_line
+from portable_reports import read_workbook_sheets as read_portable_sheets
+import tmall_v3
 from product_cost_rules import apply_product_cost_rules, product_output_row
 from shipping_costs import load_database_shipping, capture_shipping_order, apply_shipping_cost
 from promotion_protection import (
@@ -232,6 +234,11 @@ def is_tmall_order_headers(headers: list[str]) -> bool:
         "主订单编号",
     }
     tmall_sku_signals = {"skuid", "sku_id"}
+    if tmall_v3.is_main_order(headers) or (
+        '样式id' in normalized and normalized & {'商家实收金额(元)', '汇总_店铺名称', '团id'}
+        and not normalized & {'宝贝id', '子订单编号', '主订单编号'}
+    ):
+        return False
     return bool(normalized & date_signals) and (
         bool(normalized & tmall_signals) or bool(normalized & tmall_sku_signals)
     )
@@ -363,20 +370,24 @@ def rows_to_dicts(rows: list[list[Any]]) -> list[dict[str, Any]]:
 
 
 def discover_files(root: Path, subdir: str) -> list[Path]:
-    folder = root / subdir
-    if not folder.exists():
-        return []
-    suffixes = {".xls", ".xlsx", ".csv"}
-    files = [
+    from jd_promotion import is_jd_archive
+
+    defaults = {'订单数据': '2.订单数据库', '商品数据': '1.产品数据库', '推广数据': '4.推广数据库'}
+    folders = {subdir, defaults.get(subdir, subdir)}
+    return sorted({
         path
-        for path in folder.rglob("*")
-        if path.is_file()
-        and path.suffix.lower() in suffixes
-        and "_合并前备份" not in str(path)
-        and not path.name.startswith("~$")
-        and not (subdir == "订单数据" and is_excluded_order_path(path))
-    ]
-    return sorted(files)
+        for folder in folders
+        for path in (root / folder).rglob('*')
+        if path.is_file() and path.suffix.lower() in {'.xls', '.xlsx', '.csv'}
+        and not path.name.startswith('~$')
+        and '_合并前备份' not in str(path)
+        and not (folder in {'订单数据', '2.订单数据库'} and is_excluded_order_path(path))
+        and not any(part in {tmall_v3.ORDER, tmall_v3.PROMOTION} for part in path.parts)
+        and (folder not in {'1.产品数据库', '4.推广数据库'}
+             or any(part.endswith(('（天猫）', '(天猫)')) for part in path.parts[:-1]))
+        and (folder != '2.订单数据库' or tmall_v3.archive_metadata(path).get('platform') in (None, '天猫'))
+        and not is_jd_archive(path)
+    })
 
 
 def reference_workbooks(folder: Path) -> list[Path]:
@@ -394,7 +405,7 @@ def reference_workbooks(folder: Path) -> list[Path]:
     )
 
 
-def resolve_marketing_path(argument: str | None, database_root: Path) -> Path:
+def resolve_marketing_path(argument: str | None, database_root: Path, allow_missing: bool = False) -> Path:
     if argument:
         return Path(argument)
     folder = database_root / "营销活动监控"
@@ -410,12 +421,14 @@ def resolve_marketing_path(argument: str | None, database_root: Path) -> Path:
     if len(keyword_candidates) == 1:
         return keyword_candidates[0]
     if not keyword_candidates:
+        if allow_missing:
+            return folder / DEFAULT_MARKETING.name
         raise ReportError(f"营销活动表不存在: {folder}；请放入营销活动表，或使用 --marketing 指定文件。")
     names = "、".join(path.name for path in keyword_candidates)
     raise ReportError(f"检测到多个营销活动表候选: {names}；请使用 --marketing 指定本次使用的文件。")
 
 
-def resolve_cost_table_path(argument: str | None, database_root: Path, marketing_path: Path) -> Path:
+def resolve_cost_table_path(argument: str | None, database_root: Path, marketing_path: Path, allow_missing: bool = False) -> Path:
     if argument:
         return Path(argument)
     try:
@@ -442,6 +455,8 @@ def resolve_cost_table_path(argument: str | None, database_root: Path, marketing
     if len(template_candidates) == 1:
         return template_candidates[0]
     if not template_candidates:
+        if allow_missing:
+            return folder / DEFAULT_COST_TABLE.name
         raise ReportError(f"成本表不存在: {folder}；请放入实际成本表，或使用 --cost-table 指定文件。")
     names = "、".join(path.name for path in template_candidates)
     raise ReportError(f"检测到多个成本表模板: {names}；请使用 --cost-table 指定本次使用的文件。")
@@ -577,14 +592,33 @@ def load_product_exports(
     products = ProductExportIndex()
     warnings: list[str] = []
     for path in discover_files(root, "商品数据"):
+        is_v3_template = tmall_v3.PRODUCT in path.parts
         try:
-            sheets = read_workbook_sheets(path, max_rows=ORDER_MAX_ROWS)
+            sheets = read_portable_sheets(path, max_rows=ORDER_MAX_ROWS, merge_duplicate_headers=False) if is_v3_template else read_workbook_sheets(path, max_rows=ORDER_MAX_ROWS)
         except Exception as exc:
             warnings.append(f"商品数据文件读取失败,{path},{exc}")
             continue
         if any(sheet.truncated for sheet in sheets):
             warnings.append(f"商品数据文件超过{ORDER_MAX_ROWS}行，仅读取前{ORDER_MAX_ROWS}行,{path}")
         for sheet in sheets:
+            if is_v3_template:
+                if sheet.sheet_name != '发布模板':
+                    continue
+                header_index = find_header_row(sheet.rows, lambda headers: {'商品id', 'skuid', '商家编码'} <= {normalize_header(h) for h in headers})
+                if header_index is None:
+                    raise ReportError(f'天猫商品发布模板缺少商品ID、SKU ID或商家编码: {path}')
+                headers = [normalize_header(h) for h in sheet.rows[header_index]]
+                item_col, sku_col = headers.index('商品id'), headers.index('skuid')
+                spec_columns = [index for index, header in enumerate(headers) if header == '商家编码' and index > sku_col]
+                if len(spec_columns) != 1:
+                    raise ReportError(f'无法唯一识别天猫发布模板的SKU商家编码列: {path}')
+                for row_number, values in enumerate(sheet.rows[header_index + 1:], header_index + 2):
+                    if len(values) <= sku_col or not text(values[item_col]).strip("'").isdigit() or not text(values[sku_col]).strip("'").isdigit():
+                        continue
+                    code = text(values[spec_columns[0]]) if len(values) > spec_columns[0] else ''
+                    products.add(text(values[item_col]).strip("'"), text(values[sku_col]).strip("'"),
+                                 code, f'{path.name}/{sheet.sheet_name}/第{row_number}行')
+                continue
             header_index = find_header_row(
                 sheet.rows,
                 lambda headers: bool(find_col(headers, list(PRODUCT_ID_CANDIDATES))),
@@ -756,16 +790,18 @@ def load_order_aggregates(
     template_styles: dict[str, dict[str, Any]] | None = None,
     cost_by_merchant_code: dict[str, dict[str, Any]] | None = None,
     product_exports: ProductExportIndex | None = None,
-) -> tuple[dict[tuple[str, str], dict[str, Any]], list[str]]:
+    required_detail_dates: set[str] | None = None,
+) -> tuple[dict[tuple[str, str, str, str], dict[str, Any]], list[str]]:
     if small_receipt_action not in SMALL_RECEIPT_ACTIONS:
         raise ReportError(f"Unsupported small receipt action: {small_receipt_action}")
     template_products = template_products or {}
     template_styles = template_styles or {}
     cost_by_merchant_code = cost_by_merchant_code or {}
     product_exports = product_exports or ProductExportIndex()
-    aggregates: dict[tuple[str, str], dict[str, Any]] = {}
+    aggregates: dict[tuple[str, str, str, str], dict[str, Any]] = {}
     warnings: list[str] = []
     review_details: list[str] = []
+    covered_detail_dates: set[str] = set()
     small_receipt_count = 0
     below_cost_count = 0
     supplementary_price_lines = 0
@@ -833,7 +869,9 @@ def load_order_aggregates(
                     ],
                 ),
             }
-            missing = [name for name, col in required.items() if not col]
+            archived_shop = (tmall_v3.archive_shop(path) if any(
+                part.endswith(('（天猫）', '(天猫)')) for part in path.parts[:-1]) else None)
+            missing = [name for name, col in required.items() if not col and not (name == 'shop' and archived_shop)]
             if missing:
                 raise ReportError(
                     f"订单文件缺字段，已停止生成日报,{path},{sheet.sheet_name},{'|'.join(missing)}"
@@ -843,8 +881,6 @@ def load_order_aggregates(
                     f"天猫订单未提供商家实收，已用买家应付作为商家实收,{path},{sheet.sheet_name}"
                 )
             for row_number, row in numbered_dict_rows(sheet.rows, header_index):
-                if not is_valid_order(row):
-                    continue
                 order_id = (
                     text(row.get(child_order_col))
                     or text(row.get(main_order_col))
@@ -852,12 +888,17 @@ def load_order_aggregates(
                 )
                 date, raw_dates = resolve_order_date(row, "天猫", parse_date)
                 if not date:
+                    if not is_valid_order(row):
+                        continue
                     raise ReportError(
                         "订单日期无法识别，已停止生成日报："
                         f"文件={path}，工作表={sheet.sheet_name}，行={row_number}，"
                         f"订单={order_id or '未提供'}，日期字段={raw_dates or '未找到'}"
                     )
                 if date not in target_dates:
+                    continue
+                covered_detail_dates.add(date)
+                if not is_valid_order(row):
                     continue
                 sales_classification = classify_order_line(row)
                 if sales_classification.sales_excluded:
@@ -869,6 +910,12 @@ def load_order_aggregates(
                 style_id = text(row.get(required["style_id"]))
                 product_id = text(row.get(required["product_id"]))
                 shop = text(row.get(required["shop"]))
+                if archived_shop:
+                    if shop and tmall_v3.shop_name(shop) != archived_shop:
+                        raise ReportError(f'天猫子订单店铺与归档不符: {path}/{sheet.sheet_name}/{row_number}')
+                    shop = archived_shop
+                elif required_detail_dates:
+                    shop = tmall_v3.shop_name(shop)
                 merchant_spec_code = text(row.get(merchant_code_col)) if merchant_code_col else ""
                 if not merchant_spec_code:
                     merchant_spec_code = text(
@@ -961,7 +1008,7 @@ def load_order_aggregates(
                     review_details.append(detail)
                     if small_receipt_action == "exclude":
                         continue
-                key = (date, style_id)
+                key = (date, shop, product_id, style_id)
                 current = aggregates.setdefault(
                     key,
                     {
@@ -988,6 +1035,9 @@ def load_order_aggregates(
                                        f"{path.name}/{sheet.sheet_name}/行{row_number}")
                 if text(merchant_receipt) != "" and number(merchant_receipt) == 0:
                     current["实收金额为0数量"] += quantity
+    missing_dates = (required_detail_dates or set()) - covered_detail_dates
+    if missing_dates:
+        raise ReportError(f"天猫商品、货品日报缺少以下日期的子订单明细: {', '.join(sorted(missing_dates))}。已生成的历史日报未覆盖。")
     if review_details:
         if small_receipt_action == "confirm":
             raise order_review_confirmation_error(review_details)
@@ -1338,9 +1388,10 @@ def build_report(
     promotion_dir: str = "推广数据",
     brand_enjoy_dir: str = "品牌新享数据",
     small_receipt_action: str = "confirm",
+    required_detail_dates: set[str] | None = None,
 ) -> tuple[list[str], list[dict[str, Any]], list[str], list[dict[str, str]]]:
     columns = read_template_columns()
-    marketing_rows = load_marketing_rows(marketing_path)
+    marketing_rows = load_marketing_rows(marketing_path) if marketing_path.exists() else []
     marketing_warnings = duplicate_identifier_warnings(
         marketing_rows, "样式ID", "营销活动表样式ID"
     ) + marketing_price_warnings(marketing_rows)
@@ -1349,7 +1400,10 @@ def build_report(
     known_marketing_product_ids = {
         text(row.get("商品ID")) for row in template_styles.values() if text(row.get("商品ID"))
     }
-    cost_by_merchant_code, cost_warnings = load_costs_by_merchant_code(cost_table_path)
+    if not marketing_path.exists():
+        marketing_warnings.append(f'缺少营销活动表，未估算活动补贴,{marketing_path}')
+    cost_by_merchant_code, cost_warnings = (load_costs_by_merchant_code(cost_table_path) if cost_table_path.exists()
+                                          else ({}, [f'缺少成本表，无法核实的成本与利润留空,{cost_table_path}']))
     try:
         shipping_table, shipping_warnings = load_database_shipping(database_root)
     except DataQualityError as exc:
@@ -1364,6 +1418,7 @@ def build_report(
         template_styles,
         cost_by_merchant_code,
         product_exports,
+        required_detail_dates,
     )
     wanxiang_costs, wanxiang_warnings = load_promo_costs(
         database_root,
@@ -1375,6 +1430,15 @@ def build_report(
         ["花费", "总花费(元)", "成交花费(元)", "消耗", "总消耗"],
         ["主体ID"],
     )
+    scene_snapshots = tmall_v3.promotion(database_root, target_dates)
+    scene_shops = {}
+    for (date, shop), snapshot in scene_snapshots.items():
+        for product_id, cost in snapshot['products'].items():
+            key = (date, product_id)
+            if scene_shops.setdefault(key, shop) != shop:
+                raise ReportError(f'万相台商品同日归属多个店铺: {date}/{product_id}')
+            # A daily scene snapshot replaces the legacy export for the same product and date.
+            wanxiang_costs[key] = cost
     new_acceleration_costs, new_acceleration_warnings = load_promo_costs(
         database_root,
         target_dates,
@@ -1423,6 +1487,9 @@ def build_report(
         date = text(sales_row.get("日期"))
         product_id = text(sales_row.get("商品ID"))
         adjusted_amount, _ = adjusted_actual_receipt(sales_row)
+        scene_shop = scene_shops.get((date, product_id))
+        if scene_shop and tmall_v3.shop_name(sales_row.get('店铺名称')) != scene_shop:
+            raise ReportError(f'万相台归档店铺与子订单店铺不符: {date}/{product_id}')
         product_sales[(date, product_id)] += adjusted_amount
 
     promotion_keys = {
@@ -1442,8 +1509,8 @@ def build_report(
     cost_data_warnings: list[str] = []
     cost_specification_conflicts: set[str] = set()
     cost_source_logs: list[dict[str, str]] = []
-    for key, aggregate in order_rows.items():
-        date, _style_id = key
+    for aggregate in order_rows.values():
+        date = aggregate['日期']
         style_id = text(aggregate.get("样式ID"))
         if style_id and style_id not in template_styles:
             unmatched_styles[style_id] = text(aggregate.get("商品ID"))
@@ -1563,6 +1630,8 @@ def build_report(
             template_styles,
             product_exports,
         )
+        if scene_shop := scene_shops.get((date, product_id)):
+            empty_burn_row['店铺名称'] = scene_shop
         empty_burn_rows.append(product_output_row(empty_burn_row, columns, cost_by_merchant_code))
         empty_burn_cost = empty_burn_row.get("产品成本", "")
         cost_source_logs.append(
@@ -1773,20 +1842,35 @@ def main() -> int:
         default="confirm",
         help="小额实收或单件实收加有效补贴后仍低于成本超过10%%时的处理：confirm（先停止并等待确认）、include（计入）、exclude（不计入）。",
     )
+    parser.add_argument('--allow-missing-reference', action='store_true', help='允许缺少活动或成本表时生成可核实的商品字段')
     args = parser.parse_args()
 
     database_root = Path(args.database_root)
-    marketing_path = resolve_marketing_path(args.marketing, database_root)
-    cost_table_path = resolve_cost_table_path(args.cost_table, database_root, marketing_path)
+    target_dates = requested_dates_from_args(args)
+    main_archives = tmall_v3.archive_files(database_root, '2.订单数据库', tmall_v3.ORDER)
+    if main_archives:
+        found_detail = False
+        for path in discover_files(database_root, args.orders_dir):
+            try:
+                sheets = read_workbook_sheets(path, max_rows=20)
+            except Exception as exc:
+                raise ReportError(f'无法检查天猫子订单表头: {path}/{exc}') from exc
+            if any(find_header_row(sheet.rows, lambda headers: is_tmall_order_headers(headers)
+                                   and bool(find_col(headers, list(SKU_ID_CANDIDATES)))
+                                   and bool(find_col(headers, list(PRODUCT_ID_CANDIDATES)))) is not None for sheet in sheets):
+                found_detail = True
+                break
+        if not found_detail:
+            raise ReportError('天猫商品、货品日报缺少子订单明细，请补导包含商品ID、SKU ID、数量和金额的订单明细。')
+    marketing_path = resolve_marketing_path(args.marketing, database_root, args.allow_missing_reference)
+    cost_table_path = resolve_cost_table_path(args.cost_table, database_root, marketing_path, args.allow_missing_reference)
     output_path = Path(args.output)
     if not database_root.exists():
         raise ReportError(f"Database root does not exist: {database_root}")
-    if not marketing_path.exists():
+    if not marketing_path.exists() and not args.allow_missing_reference:
         raise ReportError(f"营销活动表不存在: {marketing_path}")
-    if not cost_table_path.exists():
+    if not cost_table_path.exists() and not args.allow_missing_reference:
         raise ReportError(f"成本表不存在: {cost_table_path}")
-
-    target_dates = requested_dates_from_args(args)
     columns, rows, warnings, cost_source_logs = build_report(
         database_root,
         marketing_path,
@@ -1796,6 +1880,7 @@ def main() -> int:
         args.promotion_dir,
         args.brand_enjoy_dir,
         args.small_receipt_action,
+        target_dates if main_archives else None,
     )
     write_workbook(output_path, columns, rows)
     write_log(output_path, len(rows), warnings)
@@ -1816,6 +1901,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    read_workbook_sheets = read_portable_sheets
+    from portable_reports import read_workbook
     try:
         raise SystemExit(main())
     except ReportError as exc:

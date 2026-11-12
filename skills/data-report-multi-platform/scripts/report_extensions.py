@@ -133,13 +133,20 @@ def refresh(report, database_root, platform, dates, archive_dir, explicit_store=
                 continue
             key = row['日期'], aliases.get(row['店铺'], row['店铺'])
             summary = profits_by_alias.get(key)
+            unallocated = row.get('_万相台未归属商品花费') if platform == 'tmall' else None
+            if summary and unallocated is not None:
+                value = summary['value']
+                summary = {**summary, 'unallocated_wanxiang_spend': unallocated,
+                           'value': math.fsum((value, -unallocated)) if value is not None else None}
             row['店铺净利润'] = summary['value'] if summary else None
             from profit_rates import net_margin
             row['净利率'] = net_margin(row.get('店铺净利润'), row.get('净成交额'))
             row['_净利润核对'] = summary or {'value': None, 'missing': ['无当日商品日报'], 'rows': 0}
             evidence_key = '|'.join((row['日期'], row['平台'], row['店铺'], '店铺净利润'))
             data.setdefault('evidence', {})[evidence_key] = str(report)+'；同日店铺SKU净利润之和（含空烧推广），不使用拆分货品重复汇总'
-            if not summary or summary['missing'] or summary['zero_estimates']:
+            if unallocated:
+                data['evidence'][evidence_key] += f'，扣除未归属商品的万相台花费 {unallocated:.2f} 元'
+            if not summary or summary['missing'] or summary['zero_estimates'] or unallocated:
                 data.setdefault('logs', []).append({'date': row['日期'], 'shop': row['店铺'], 'message':
                     '店铺净利润口径: '+json.dumps(row['_净利润核对'], ensure_ascii=False)})
             changed = True
