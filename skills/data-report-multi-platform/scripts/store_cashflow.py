@@ -61,6 +61,13 @@ def canonical_shop(row, path, config, order_shop=None):
     raw = next((text(row.get(h)) for h in ['汇总_店铺名称', '店铺名称', '店铺'] if text(row.get(h))), '')
     explicit = aliases.get(raw, raw) if raw else None
     inherited = next((aliases.get(part, part) for part in reversed(path.parts) if aliases.get(part, part) in known), None)
+    if not inherited:
+        for index, part in enumerate(path.parts[:-2]):
+            if part in ('2.订单数据库', '3.售后数据库'):
+                folder_shop = path.parts[index + 1]
+                if path.name.startswith(folder_shop + '—'):
+                    inherited = aliases.get(folder_shop, folder_shop)
+                break
     shop = explicit or inherited or order_shop
     if order_shop and shop and order_shop != shop:
         raise ValueError(f'售后店铺与订单归属冲突: {path.name}')

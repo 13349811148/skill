@@ -4,8 +4,33 @@ from pathlib import Path
 import json
 from portable_reports import read_workbook_sheets
 
+AD_SPEND_COLUMNS = ('推广总花费(元)', '推广成交花费(元)')
+LEGACY_SPEND_COLUMNS = ('总花费(元)', '成交花费(元)')
+MARKETING_COLUMNS = (*AD_SPEND_COLUMNS, '总营销花费(元)', '成交营销花费(元)', '结算券花费(元)')
+EMPTY_SPEND = {'', '-', '--', 'n.a.'}
+
+
+def is_product_marketing(record):
+    return any(field in record for field in MARKETING_COLUMNS)
+
+
+def promotion_fee_field(record):
+    """Find the platform ad-spend column, keeping a reported zero."""
+    columns = AD_SPEND_COLUMNS if is_product_marketing(record) else LEGACY_SPEND_COLUMNS
+    return next((field for field in columns
+                 if record.get(field) is not None and str(record[field]).strip() not in EMPTY_SPEND), None)
+
+
+def reported_fee(record, context):
+    field = promotion_fee_field(record)
+    if field is None:
+        columns = AD_SPEND_COLUMNS if is_product_marketing(record) else LEGACY_SPEND_COLUMNS
+        raise ValueError(f'缺少有效推广花费字段 {context}，需要 {"或".join(columns)}')
+    return value(record[field], True)
+
+
 def value(v,required=False):
-    if v is None or str(v).strip() in ('','-','n.a.'):
+    if v is None or str(v).strip() in EMPTY_SPEND:
         if required:raise ValueError('缺少推广数字')
         return Decimal(0)
     d=Decimal(str(v).replace(',',''))
@@ -34,13 +59,14 @@ def load(root,target_dates):
                 if dt not in target_dates:continue
                 pid=r.get('归档商品ID') or r.get('商品ID')
                 if pid is None and ('账户每日汇总' in str(path)):
-                    key=(dt,shop);fee=value(r.get('总花费(元)') if str(r.get('总花费(元)') or '').strip() not in ('','-') else r.get('成交花费(元)'),True)
-                    if key not in accounts or rank>accounts[key][0]:accounts[key]=(rank,fee,path)
+                    key=(dt,shop)
+                    if key not in accounts or rank>accounts[key][0]:
+                        accounts[key]=(rank,reported_fee(r, f'{path}/{dt}'),path,is_product_marketing(r))
                 elif pid is not None and str(pid).isdigit():
                     batches[(dt,shop)].append(r)
-                    if '当日成交花费(元)' in r:
+                    if '当日成交花费(元)' in r and not is_product_marketing(r):
                         key=(dt,shop);hint_rank=(-1,str(path));fee=value(r['当日成交花费(元)'],True)
-                        if key not in accounts or hint_rank>accounts[key][0]:accounts[key]=(hint_rank,fee,path)
+                        if key not in accounts or hint_rank>accounts[key][0]:accounts[key]=(hint_rank,fee,path,False)
         for key,rows in batches.items():
             if key not in products or rank>products[key][0]:
                 if key in products:logs.append(f'推广日快照更新:{key},保留={path},忽略={products[key][2]}')
@@ -48,13 +74,15 @@ def load(root,target_dates):
     costs=defaultdict(Decimal)
     for key,(_,rows,path) in sorted(products.items()):
         if key not in accounts:raise ValueError(f'缺少店铺每日推广总额 {key}')
-        total=accounts[key][1];managed=[];regular=defaultdict(Decimal)
+        _,total,account_path,upgraded=accounts[key]
+        if any(is_product_marketing(row) != upgraded for row in rows):
+            raise ValueError(f'账户汇总与商品明细的推广报表格式不一致 {key}：{account_path} / {path}')
+        managed=[];regular=defaultdict(Decimal)
         for r in rows:
             pid=str(r.get('归档商品ID') or r['商品ID']);scene=r.get('推广场景')
             if scene=='全店托管':managed.append((pid,value(r.get('交易额(元)'),True)))
             elif scene in ('稳定成本推广','商品推广','标准推广','全站推广'):
-                fee=r.get('总花费(元)');fee=r.get('成交花费(元)') if fee is None or str(fee).strip() in ('','-') else fee
-                regular[pid]+=value(fee,True)
+                regular[pid]+=reported_fee(r, f'{path}/{key[0]}/{pid}')
             else:raise ValueError(f'未知推广类型 {key}/{pid}/{scene}')
         actual=sum(regular.values(),Decimal(0));pool=total-actual;denominator=sum((a for _,a in managed),Decimal(0))
         if pool<0:raise ValueError(f'托管花费负差 {key}:总额{total},商品推广{actual}')
@@ -68,7 +96,8 @@ def load(root,target_dates):
         for pid,fee in allocated.items():costs[(*key,pid)]+=fee
         for pid,fee in regular.items():costs[(*key,pid)]+=fee
         assert sum(allocated.values(),Decimal(0))+actual==total
-        logs.append(f'推广核对:{key},账户总额={total},商品推广实际={actual},托管分摊={pool},尾差={tail},逐日核对=0')
+        basis = '新版商品营销推广花费' if upgraded else '旧版商品推广花费'
+        logs.append(f'推广核对:{key},账户总额={total},商品推广实际={actual},托管分摊={pool},尾差={tail},逐日核对=0,口径={basis}')
     for key in accounts:
         if key not in products and accounts[key][1]>0:raise ValueError(f'账户有推广花费但无商品明细 {key}')
     return {k:float(v) for k,v in costs.items()},logs

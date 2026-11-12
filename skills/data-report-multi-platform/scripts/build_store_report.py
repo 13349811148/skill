@@ -12,6 +12,7 @@ from decimal import Decimal, ROUND_HALF_UP
 
 SKILL = Path(__file__).resolve().parent.parent
 from store_schema import STORE_HEADERS
+from pdd_promotion_daily import is_product_marketing, promotion_fee_field
 HEADERS = list(STORE_HEADERS)
 DERIVED = {'客单价','支付转化率','净成交额','推广ROI','推广费比','新客数','老客数','净利率'}
 ALWAYS_BLANK = {'今日主要动作','异常说明'}
@@ -129,11 +130,22 @@ def build_payload(root, dates, sources=(), config=None, include_cashflow=True):
             meta=path.with_suffix(path.suffix+'.archive.json')
             metadata=json.loads(meta.read_text(encoding='utf-8-sig')) if meta.exists() else {}
             shop=metadata.get('shop')
-            platform=metadata.get('platform') or ('拼多多' if shop and '拼多多' in shop else None)
+            archived_platform=metadata.get('platform') or ('拼多多' if shop and '拼多多' in shop else None)
             for record in records(path):
                 if any(record.get(k) for k in ['商品ID','商品id','归档商品ID']):
                     raise ValueError(f'账户每日汇总中发现商品明细，不能直接当店铺汇总: {path}')
-                insert(record,path,{'曝光次数':['曝光量'],'点击次数':['点击量'],'推广花费':['总花费(元)','成交花费(元)'],'推广成交额':['净交易额(元)']},platform,shop)
+                upgraded=is_product_marketing(record)
+                platform=archived_platform or ('拼多多' if upgraded else None)
+                fee_field=promotion_fee_field(record)
+                if upgraded and not fee_field:
+                    try: promo_date=day(record.get('日期') or record.get('统计日期'))
+                    except (ValueError,TypeError): continue
+                    if promo_date in dates:
+                        raise ValueError(f'账户汇总缺少有效推广花费，不能改用营销花费：{path}/{promo_date}')
+                fields={'曝光次数':['曝光量'],'点击次数':['点击量'],'推广成交额':['净交易额(元)']}
+                if fee_field:
+                    fields['推广花费']=[fee_field]
+                insert(record,path,fields,platform,shop)
     configured=config.get('shops',[])
     for shop in configured:
         for dt in dates:

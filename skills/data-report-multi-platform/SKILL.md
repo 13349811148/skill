@@ -93,6 +93,8 @@ Apply these rules to files produced by the data-organizing Skill and to equivale
 
 ## Promotion Matching Protection
 
+拼多多新版“商品营销”以报表列识别，账户每日汇总与商品分天明细均优先取“推广总花费(元)”，为空时取“推广成交花费(元)”。金额 0 是有效值。总营销花费、成交营销花费及结算券花费不计入日报推广费，优惠券已扣减商家实收。旧版商品推广沿用“总花费(元)”，为空时取“成交花费(元)”。全店托管仍按同日同店的账户推广费减商品推广费后分摊；商品、货品、店铺日报及相关利润统一使用此口径。
+
 Apply all four safeguards before writing either platform workbook. A failure in any safeguard must stop report generation; never silently skip an invalid nonzero promotion row or continue with an unreconciled amount.
 
 1. **Promotion backup gate**: Before reading any promotion amount, inspect every candidate file name and every parent directory under the promotion input roots. Treat names containing `备份`、`副本`、`backup`, or a standalone `bak`/`copy` marker, as backup candidates. If any candidate exists, stop before calculation, list the actual paths in the current conversation, and warn that multiple backups or snapshots can be interpreted as different shops and cause duplicate promotion spend. Ask the user to move them outside every promotion input root before rerunning. Never silently ignore them, reinterpret a backup directory as a shop, or continue by relying on file hashes, shop dimensions, snapshot deduplication, or input-output reconciliation.
