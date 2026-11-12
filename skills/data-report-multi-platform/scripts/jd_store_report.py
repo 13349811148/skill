@@ -17,6 +17,8 @@ SKU = '京东SKU原表'
 ORDER_HEADERS = {'订单号', '商品ID', '商品名称', '订购数量', '商家应收', '订单状态', '付款确认时间'}
 AFTER_SALE_HEADERS = {'服务单号', '订单号', '售后状态', '退款金额', '售后申请时间'}
 REFUND_DATES = ('退款成功时间', '退款完成时间', '退款成功日期', '退款完成日期')
+DEFAULT_PLATFORM_FEE_RATE = Decimal('0.04')
+OVERHEAD_RATE = Decimal('0.167')
 BLANK = (None, '', '-', '--')
 PROVISIONAL_SUFFIX = '（系统计算中，该值仅供参考）'
 
@@ -130,6 +132,8 @@ def refund_rows(root, dates):
         refund_days = {as_day(row[field]) for field in REFUND_DATES if row.get(field) not in BLANK}
         if len(refund_days) > 1:
             raise ValueError(f'京东退款成功日期冲突：{context}')
+        if not refund_days and row.get('审核时间') not in BLANK:
+            refund_days.add(as_day(row['审核时间']))
         if not refund_days:
             applied = as_day(row['售后申请时间'])
             blocked[shop].update(day for day in dates if day >= applied)
@@ -187,14 +191,14 @@ def build(root, dates, unlocked_order=None, platform_fee_rate=None):
     for (shop, _), (day, amount, buyer, provisional) in orders.items():
         payments[shop, day].append((amount, buyer, provisional))
     totals, missing = merchandise_costs(root, orders, items) if orders else ({}, {})
-    if platform_fee_rate is not None:
-        platform_fee_rate = as_money(platform_fee_rate, '京东平台费率')
-        if platform_fee_rate > 1:
-            raise ValueError('京东平台费率请填写0到1之间的小数')
-    overhead_rate = Decimal('0.167')
+    platform_fee_rate = (DEFAULT_PLATFORM_FEE_RATE if platform_fee_rate is None else
+                         as_money(platform_fee_rate, '京东平台费率'))
+    if platform_fee_rate > 1:
+        raise ValueError('京东平台费率请填写0到1之间的小数')
 
     result = {'headers': STORE_HEADERS, 'rows': [], 'logs': [], 'evidence': {}}
-    audit = {'日期': sorted(dates), '推广来源': promo_sources, '加密订单原表': blocked_orders, '分日': []}
+    audit = {'日期': sorted(dates), '推广来源': promo_sources, '加密订单原表': blocked_orders,
+             '京东平台费率': str(platform_fee_rate), '分日': []}
     for shop in sorted(shops):
         for day in sorted(dates):
             row = dict.fromkeys(STORE_HEADERS)
@@ -224,12 +228,15 @@ def build(root, dates, unlocked_order=None, platform_fee_rate=None):
             if row['退款金额'] is None:
                 messages.append('售后未提供可核实的退款成功日期')
             missing_costs = sorted(missing.get((shop, day), ()))
-            if (row['支付金额'] is not None and row['退款金额'] is not None and cash is not None
-                    and platform_fee_rate is not None and not missing_costs and not provisional_count):
+            platform_fee = None
+            if row['支付金额'] is not None and row['退款金额'] is not None:
                 net = Decimal(str(row['支付金额'])) - Decimal(str(row['退款金额']))
-                row['店铺净利润'] = float(net * (1 - overhead_rate - platform_fee_rate)
+                platform_fee = net * platform_fee_rate
+            if (row['支付金额'] is not None and row['退款金额'] is not None and cash is not None
+                    and not missing_costs):
+                row['店铺净利润'] = float(net * (1 - OVERHEAD_RATE) - platform_fee
                                          - totals.get((shop, day), Decimal(0)) - cash)
-                messages.append('店铺净利润按净成交额扣商品成本、估算运费、均摊、京东平台费和现金推广费计算')
+                messages.append(f'店铺净利润为估算，京东平台费按净成交额的{platform_fee_rate:.2%}计算，推广只扣现金')
             else:
                 messages.append('店铺净利润待退款成功日期、订单应收、SKU成本、运费和京东费率齐全后核算')
             result['logs'].append({'date': day, 'shop': shop, 'message': '；'.join(messages)})
@@ -237,6 +244,8 @@ def build(root, dates, unlocked_order=None, platform_fee_rate=None):
             result['evidence'][key + '推广花费'] = '京准通现金消费／投放日期'
             if row['支付金额'] is not None:
                 result['evidence'][key + '支付金额'] = '京东订单原表／付款确认时间／每笔订单商家应收计一次'
+            if row['退款金额'] is not None:
+                result['evidence'][key + '退款金额'] = '京东售后已完成且退款金额为正，按退款成功日期归日，原表缺该列时用审核时间'
             if stats.get('impressions') is not None:
                 messages.append('曝光和点击只覆盖已归档的推广明细')
                 result['evidence'][key + '曝光次数'] = '已归档京准通推广明细（仅已覆盖渠道）'
@@ -244,6 +253,8 @@ def build(root, dates, unlocked_order=None, platform_fee_rate=None):
             result['logs'][-1]['message'] = '；'.join(messages)
             result['rows'].append(row)
             audit['分日'].append({'店铺':shop, '日期':day, '已支付订单数':row['支付订单数'],
+                                 '退款金额':row['退款金额'], '退款订单数':row['退款订单数'],
+                                 '平台费估算':platform_fee, '店铺净利润估算':row['店铺净利润'],
                                  '含暂估应收订单数':provisional_count, '缺成本或运费编码':missing_costs, **stats})
     return result, audit
 
@@ -266,7 +277,8 @@ def run(root, dates, archive_dir, output=None, unlocked_order=None, platform_fee
                 for field in ('支付金额','支付订单数','支付买家数','退款金额','退款订单数','_口径说明'):
                     if row.get(field) is None and field in previous:
                         row[field] = previous[field]
-                if (row['店铺净利润'] is None and previous.get('店铺净利润') is not None and
+                if (any(shop == row['店铺'] for shop, _ in audit['加密订单原表'])
+                        and row['店铺净利润'] is None and previous.get('店铺净利润') is not None and
                         all(row[field] == previous.get(field) for field in ('支付金额','退款金额','推广花费'))):
                     row['店铺净利润'] = previous['店铺净利润']
         store(dict(payload, rows=rows), archive_dir, path)
