@@ -49,9 +49,10 @@ def money(value):
 
 
 def discover(root, legacy, current):
+    from jd_promotion import is_jd_archive
     folder = root/legacy if (root/legacy).exists() else root/current
     return sorted((p for p in folder.rglob('*') if p.is_file() and p.suffix.lower() in {'.xlsx', '.xls', '.csv'}
-                   and not p.name.startswith('~$') and not is_excluded_order_path(p)),
+                   and not p.name.startswith('~$') and not is_excluded_order_path(p) and not is_jd_archive(p)),
                   key=lambda p: (p.stat().st_mtime_ns, str(p)), reverse=True) if folder.exists() else []
 
 

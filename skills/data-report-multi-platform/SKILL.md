@@ -1,9 +1,19 @@
 ---
 name: data-report-multi-platform
-description: "Generate Chinese operating reports for Tmall and Pinduoduo from the local desktop operations database. Use when the user asks for 日报V2版本（天猫+拼多多）, 日报V2, 数据报表多平台版, 天猫拼多多合并报表, 多平台店铺报表, or wants one Skill to generate either a 天猫店铺数据报表 or the previous 拼多多旧格式数据报表 for specified dates."
+description: "Generate Chinese operating reports for Tmall, Pinduoduo and JD from the local desktop operations database. Use for 日报V2、多平台店铺报表、天猫店铺数据报表、拼多多日报、京东店铺日报、京准通现金推广日报."
 ---
 
 # 日报V2版本（天猫+拼多多）
+
+## 京东店铺日报
+
+使用 `scripts/build_report.py --platform jd --start-date YYYY-MM-DD --end-date YYYY-MM-DD`。从 V3 归档识别京东店铺，在固定月报“①平台日报”追加或替换京东店铺日记录。现有拼多多、天猫入口会跳过京东归档。自动平台识别纳入京东，`--platform both` 继续表示天猫和拼多多，`--platform all` 显式运行三个平台。
+
+京准通“推广花费”按投放日期汇总现金消费原表的“支出”，以流水单号去重。红包消费只参与渠道对账，不进投产、推广费比和净利润。推广明细的“花费”只在同店、同日、同渠道明细合计与现金及红包流水合计一致时用于分摊现金。未能归属到SKU的现金仍计入店铺花费，独立记录于月报的京东核对日志。曝光、点击只覆盖已归档明细渠道。
+
+支付按付款确认时间归日，订单内重复的商家应收只汇总一次。平台标注“系统计算中”的应收金额暂作支付估算并记日志。退款只按明确的成功或完成时间归日。缺可核实的退款归日时，退款、净成交额、店铺投产和推广费比留空。利润另需完整的订单应收、SKU成本、运费及确认的京东平台费率。按既有店铺公式以净成交额计算投产与净利率。
+
+读取京准通 `.xls` 需要 `xlrd`，加密订单需要 `msoffcrypto-tool`。Windows 可用同一 Python 执行 `python -m pip install --target "$env:LOCALAPPDATA/Codex/daily-report/python-deps" xlrd msoffcrypto-tool`。订单密码用本次进程的 `DAILY_REPORT_JD_PASSWORD` 环境变量传入，或以 `--jd-order-input` 指定唯一归档对应的可读副本。密码和解密内容不落盘。京东费率以 `--jd-platform-fee-rate` 传入小数。
 
 ## 固定报表保存（2026-10-28用户确认）
 

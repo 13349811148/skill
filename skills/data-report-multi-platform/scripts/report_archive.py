@@ -262,6 +262,8 @@ def store(payload, directory, explicit_output=None):
                 if merged.get(store_key(r),{}).get('_口径说明') and not r.get('_口径说明'):
                     raise ValueError('本次店铺日期已有确认修订；先恢复同日剔除/估算口径并携带_口径说明，再更新月报')
                 for field in ['今日主要动作', '异常说明', '店铺净利润']:
+                    if field == '店铺净利润' and r.get('_净利润以本次为准'):
+                        continue
                     if r.get(field) is None and store_key(r) in merged:
                         r[field] = merged[store_key(r)].get(field)
             merged.update({store_key(r): r for r in incoming})

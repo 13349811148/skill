@@ -14,6 +14,7 @@ import build_tmall_report
 import build_pdd_report
 from portable_reports import read_workbook_sheets
 from handoff_protection import find_header_row, is_excluded_order_path
+from jd_promotion import is_jd_archive
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -50,6 +51,9 @@ def detect_platforms(database_root: Path) -> set[str]:
             or path.name.startswith("~$")
             or is_excluded_order_path(path)
         ):
+            continue
+        if is_jd_archive(path):
+            detected.add('jd')
             continue
         try:
             sheets = read_workbook_sheets(
@@ -91,8 +95,10 @@ def run_platform(platform: str, passthrough: list[str]) -> int:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Generate a Tmall or Pinduoduo operating report.")
-    parser.add_argument("--platform", choices=[*sorted(PLATFORM_SCRIPTS), "both"])
+    parser = argparse.ArgumentParser(description="Generate a Tmall, Pinduoduo, or JD operating report.")
+    parser.add_argument("--platform", choices=[*sorted(PLATFORM_SCRIPTS), "jd", "both", "all"])
+    parser.add_argument('--jd-order-input', type=Path, help='京东加密订单对应的已解密副本')
+    parser.add_argument('--jd-platform-fee-rate', help='已核实的京东平台费率，输入0到1之间的小数')
     parser.add_argument("--store-input", action="append", default=[], help="明确店铺日指标 CSV/XLSX，可重复")
     parser.add_argument("--store-output", help="新增店铺维度日报路径")
     parser.add_argument("--store-only", action="store_true", help="仅生成店铺维度，正常请求默认两种均输出")
@@ -102,7 +108,8 @@ def main() -> int:
     parser.add_argument('--refresh-store-cashflow',action='store_true',help='只按订单实收及退款时间更新已生成店铺月报金额，后台仅复核')
     parser.add_argument('--refresh-net-margins',action='store_true',help='只为现有货品/店铺月报增加净利率，不重算金额或上传商品')
     args, passthrough = parser.parse_known_args()
-    archive_root=args.archive_dir or Path(option_value(passthrough,'--database-root',str(DEFAULT_DATABASE_ROOT)))/'数据报表输出'
+    database_root = Path(option_value(passthrough,'--database-root',str(DEFAULT_DATABASE_ROOT)))
+    archive_root=args.archive_dir or database_root/'数据报表输出'
     if args.refresh_net_margins:
         from profit_rates import refresh_net_margins
         refresh_net_margins(archive_root)
@@ -112,8 +119,10 @@ def main() -> int:
         refresh_cashflow(Path(option_value(passthrough,'--database-root',str(DEFAULT_DATABASE_ROOT))), archive_root, args.store_output)
         return 0
     if args.refresh_existing or args.refresh_goods_only:
+        if args.platform == 'jd':
+            parser.error('京东店铺日报按日期重新生成')
         from report_extensions import refresh
-        platforms = ['pdd','tmall'] if not args.platform or args.platform == 'both' else [args.platform]
+        platforms = ['pdd','tmall'] if not args.platform or args.platform in ('both','all') else [args.platform]
         outputs = []
         for platform in platforms:
             name = '拼多多' if platform == 'pdd' else '天猫'
@@ -130,9 +139,27 @@ def main() -> int:
             print('未找到固定商品日报，不能迁移未知历史文件',file=sys.stderr)
             return 2
         return 0
+    if args.platform in ('both','all'):
+        selected = ['tmall', 'pdd'] + (['jd'] if args.platform == 'all' else [])
+    elif args.platform:
+        selected = [args.platform]
+    else:
+        detected = detect_platforms(database_root)
+        selected = [platform for platform in ('tmall', 'pdd', 'jd') if platform in detected]
+        if not selected and not args.store_only:
+            print('未识别到天猫、拼多多或京东订单归档，请检查订单数据目录和表头。', file=sys.stderr)
+            return 2
+    if 'jd' in selected and (args.store_output and len(selected) > 1 or args.store_input and selected == ['jd']):
+        parser.error('单独生成京东时通过归档读取店铺数据；混合平台使用默认月报路径')
+    dates = requested_dates(passthrough)
+    if selected == ['jd']:
+        from jd_store_report import run
+        run(database_root, dates, archive_root, args.store_output, args.jd_order_input, args.jd_platform_fee_rate)
+        return 0
+
     os.environ['DAILY_REPORT_ARCHIVE']='1'
     os.environ['DAILY_REPORT_ARCHIVE_DIR']=str(archive_root)
-    os.environ['DAILY_REPORT_DATES']=json.dumps(sorted(requested_dates(passthrough)))
+    os.environ['DAILY_REPORT_DATES']=json.dumps(sorted(dates))
     store_arguments = []
     store_arguments.extend(['--archive-dir',str(archive_root)])
     for option in ("--database-root", "--start-date", "--end-date", "--date"):
@@ -147,20 +174,12 @@ def main() -> int:
     for source in args.store_input:
         store_arguments.extend(["--input", source])
     store_result = subprocess.run([sys.executable, str(SCRIPT_DIR / "build_store_report.py"), *store_arguments], check=False).returncode
+    if 'jd' in selected:
+        from jd_store_report import run
+        run(database_root, dates, archive_root, None, args.jd_order_input, args.jd_platform_fee_rate)
     if args.store_only:
         return store_result
-
-    if args.platform == "both":
-        selected = ["tmall", "pdd"]
-    elif args.platform:
-        selected = [args.platform]
-    else:
-        database_root = Path(option_value(passthrough, "--database-root", str(DEFAULT_DATABASE_ROOT)))
-        selected = [platform for platform in ("tmall", "pdd") if platform in detect_platforms(database_root)]
-        if not selected:
-            print("未识别到天猫或拼多多订单表，请检查订单数据目录和表头。", file=sys.stderr)
-            return 2
-
+    selected = [platform for platform in selected if platform != 'jd']
     if len(selected)>1 and option_value(passthrough,'--output',''):
         parser.error('多平台须分别保存，不能共用一个--output；请用--archive-dir指定同一目录')
     results = [run_platform(platform, passthrough) for platform in selected]

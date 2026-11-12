@@ -12,7 +12,7 @@ class WorkbookData:
     total_rows: int=0
     truncated: bool=False
 
-def read_workbook_sheets(path,max_rows=None,max_cols=None):
+def read_workbook_sheets(path,max_rows=None,max_cols=None,*,stream=None,merge_duplicate_headers=True):
     path=Path(path)
     if path.suffix.lower()=='.csv':
         with path.open(encoding='utf-8-sig',newline='') as f:rows=list(csv.reader(f))
@@ -25,7 +25,7 @@ def read_workbook_sheets(path,max_rows=None,max_cols=None):
             rows=[sheet.row_values(i)[:max_cols] for i in range(min(sheet.nrows,max_rows or sheet.nrows))]
             out.append(WorkbookData(path,sheet.name,rows,sheet.nrows,bool(max_rows and sheet.nrows>max_rows)))
         return out
-    wb=load_workbook(path,read_only=True,data_only=True);out=[]
+    wb=load_workbook(stream if stream is not None else path,read_only=True,data_only=True);out=[]
     try:
         for sheet in wb.worksheets:
             sheet.reset_dimensions();iterator=sheet.iter_rows(max_col=max_cols,values_only=True)
@@ -33,7 +33,7 @@ def read_workbook_sheets(path,max_rows=None,max_cols=None):
             truncated=bool(max_rows and len(rows)>max_rows)
             if truncated:rows=rows[:max_rows]
             # V3 exports contain repeated header names with values only in the first slot.
-            if rows:
+            if rows and merge_duplicate_headers:
                 headers=[str(v).strip() if v is not None else '' for v in rows[0]];positions={}
                 for i,h in enumerate(headers):
                     if h:positions.setdefault(h,[]).append(i)
@@ -57,12 +57,14 @@ def install(module):
     module.read_workbook_sheets=read_workbook_sheets;module.read_workbook=read_workbook
     original_discover=module.discover_files
     def discover(root,subdir):
+        from jd_promotion import is_jd_archive
         current={'订单数据':'2.订单数据库','商品数据':'1.产品数据库','推广数据':'4.推广数据库','售后数据':'3.售后数据库'}.get(subdir)
-        if (root/subdir).exists():return original_discover(root,subdir)
+        if (root/subdir).exists():return [p for p in original_discover(root,subdir) if not is_jd_archive(p)]
         if not current or not (root/current).exists():return []
         result=[]
         for p in (root/current).rglob('*'):
             if p.is_file() and p.suffix.lower() in {'.xlsx','.xls','.csv'} and not p.name.startswith('~$'):
+                if is_jd_archive(p):continue
                 if subdir=='订单数据' and module.is_excluded_order_path(p):continue
                 result.append(p)
         return sorted(result)
