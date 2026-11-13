@@ -6,6 +6,7 @@ from data_quality_protection import optional_number, normalize_match_code, text
 
 OTHER_COST_RATE = 0.167
 PLATFORM_COST_RATE = 0.007
+TMALL_PLATFORM_COST_RATE = 0.01
 NEW_COST_COLUMNS = ("综合成本", "快递成本", "其他均摊成本", "平台费用")
 REMOVED_COLUMNS = ("店铺费用", "平摊管理费用")
 REMOVED_REPORT_COLUMNS = ("活动价", "报名价", "每单补贴金额", "总补贴金额",
@@ -37,7 +38,7 @@ def apply_temporary_profit(row):
             row['备注'] = '；'.join(filter(None, [row.get('备注'), note]))
 
 
-def apply_product_cost_rules(row: dict[str, Any]) -> None:
+def apply_product_cost_rules(row: dict[str, Any], *, platform_fee_rate: float = PLATFORM_COST_RATE) -> None:
     """Comprehensive cost is per unit; gross deducts it times quantity.
 
     Gross = actual row receipt minus total cost; net = gross minus promotion.
@@ -60,7 +61,7 @@ def apply_product_cost_rules(row: dict[str, Any]) -> None:
     shipping = optional_number(row.get("快递成本"))
     row["快递成本"] = shipping if valid_sales and shipping is not None and shipping > 0 else ""
     row["其他均摊成本"] = arrival * OTHER_COST_RATE if valid_sales else ""
-    row["平台费用"] = arrival * PLATFORM_COST_RATE if valid_sales else ""
+    row["平台费用"] = arrival * platform_fee_rate if valid_sales else ""
     row.update({"综合成本": "", "毛利": "", "毛利率": "", "净利润": "", "定价是否合理": ""})
     if not valid_sales or cost is None or cost <= 0 or row["快递成本"] == "":
         apply_temporary_profit(row)

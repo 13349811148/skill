@@ -50,7 +50,7 @@ from handoff_protection import (
 from order_line_protection import classify_order_line
 from portable_reports import read_workbook_sheets as read_portable_sheets
 import tmall_v3
-from product_cost_rules import apply_product_cost_rules, product_output_row
+from product_cost_rules import TMALL_PLATFORM_COST_RATE, apply_product_cost_rules, product_output_row
 from shipping_costs import load_database_shipping, capture_shipping_order, apply_shipping_cost
 from promotion_protection import (
     PromotionProtectionError,
@@ -1375,7 +1375,7 @@ def build_empty_burn_promotion_row(
             "备注": f"空烧推广费：无有效销售；{fee_remark}",
         }
     )
-    apply_product_cost_rules(row)
+    apply_product_cost_rules(row, platform_fee_rate=TMALL_PLATFORM_COST_RATE)
     return row
 
 
@@ -1612,7 +1612,7 @@ def build_report(
         net_sales = amount + subsidy if amount or subsidy else 0.0
         row["净销售额（实际成交+总补贴金额）"] = net_sales if net_sales else ""
         apply_shipping_cost(row, aggregate, shipping_table, shipping_warnings, cost_source_logs[-1])
-        apply_product_cost_rules(row)
+        apply_product_cost_rules(row, platform_fee_rate=TMALL_PLATFORM_COST_RATE)
         output_rows.append(product_output_row(row, columns, cost_by_merchant_code))
 
     empty_burn_rows: list[dict[str, Any]] = []
