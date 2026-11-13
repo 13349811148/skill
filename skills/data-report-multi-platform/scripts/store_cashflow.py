@@ -12,8 +12,10 @@ from order_line_protection import classify_order_line
 CASH_FIELDS = ('支付金额', '支付订单数', '退款金额', '退款订单数')
 CASH_DERIVED = ('客单价', '净成交额', '推广ROI', '推广费比')
 PAY_DATES = ('订单支付时间', '支付时间', '订单付款时间', '付款时间')
-POLICY_NOTE = ('用户2026-11-09确认：支付金额按订单支付日汇总商家实收金额(元)，退款只计退款成功，'
-               '按同意退款时间归日（估算），净成交额=订单实收-当日成功退款。后台金额仅复核；'
+REFUND_DATE_FIELD = '同意退款时间'
+POLICY_NOTE = ('用户2026-11-13确认：拼多多支付金额按订单支付日汇总商家实收金额(元)，退款只计退款成功，'
+               '按同意退款时间估算归日。同意时间缺失时，受影响日期的退款和相关指标留空。'
+               '净成交额=订单实收-当日成功退款。后台金额仅复核；'
                '指定订单剔除保留，商品ID销售排除不扩展到店铺现金流。')
 
 
@@ -161,7 +163,7 @@ def load(root, dates, config):
             status = text(row.get('售后状态'))
             successful = status == '退款成功'
             record = {'shop': shop, 'order': oid, 'refund': rid, 'status': status,
-                      'day': day(row.get('同意退款时间')) if successful else None,
+                      'day': day(row.get(REFUND_DATE_FIELD)) if successful else None,
                       'applied': day(row.get('申请时间')),
                       'amount': amount(row.get('退款金额'), source) if successful else None,
                       'source': source, 'file': str(path)}
@@ -205,7 +207,7 @@ def load(root, dates, config):
         if not dt:
             affected = {d for d in dates if not record['applied'] or d >= record['applied']}
             unknown_refund_days[shop].update(affected)
-            logs.append({'source': record['source'], 'message': '退款成功但无同意退款时间，不能分配日期；可能受影响日期退款保持空白'})
+            logs.append({'source': record['source'], 'message': '退款成功但缺同意退款时间，可能受影响的日期退款保持空白'})
         elif dt in dates:
             refund_totals[dt, shop] += record['amount']; refund_order_ids[dt, shop].add(record['order'])
             refund_trace[dt, shop].append({'refund': record['refund'], 'order': record['order'], 'amount': str(record['amount']), 'source': record['source']})
@@ -241,7 +243,7 @@ def apply(rows, ledger, logs, evidence, backend=None, *, platform='拼多多', p
                            '差异': round(value-original, 2) if value is not None and original is not None else None})
             row[field] = value
             evidence['|'.join((*key, field))] = policy if platform == '天猫' else (
-                '订单支付日商家实收汇总' if field.startswith('支付') else '退款成功，按同意退款时间归日（估算）')
+                '订单支付日商家实收汇总' if field.startswith('支付') else '退款成功记录按同意退款时间估算归日')
         paid, refunded, count = row['支付金额'], row['退款金额'], row['支付订单数']
         net = money(Decimal(str(paid))-Decimal(str(refunded))) if paid is not None and refunded is not None else None
         row['净成交额'] = net

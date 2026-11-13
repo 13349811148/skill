@@ -7,7 +7,7 @@ from store_cashflow import load,apply,day,amount,POLICY_NOTE
 
 CONFIG={'shops':[{'平台':'拼多多','店铺':'店'}],'shop_aliases':{'店别名':'店'}}
 ORDER_HEADERS=['订单号','样式ID','商品ID','支付时间','订单成交时间','商家实收金额(元)','汇总_店铺名称','订单状态','商品名称','订单性质','是否计销售']
-REFUND_HEADERS=['售后编号','订单编号','售后状态','退款金额','同意退款时间','申请时间','店铺名称']
+REFUND_HEADERS=['售后编号','订单编号','售后状态','退款金额','同意退款时间','申请时间','店铺名称','退款成功时间']
 
 
 def order(oid,dt,money='10',product='P',title='正常商品'):
@@ -15,7 +15,7 @@ def order(oid,dt,money='10',product='P',title='正常商品'):
 
 
 def refund(rid,oid,dt,money='3',status='退款成功'):
-    return [rid,oid,status,money,dt+' 12:00:00' if dt else '', '2026-11-07 10:00:00','店']
+    return [rid,oid,status,money,dt+' 12:00:00' if dt else '', '2026-11-07 10:00:00','店','2026-11-07 12:00:00']
 
 
 class StoreCashflowTests(unittest.TestCase):
@@ -40,6 +40,7 @@ class StoreCashflowTests(unittest.TestCase):
         self.assertEqual(r['退款金额'],5)
         self.assertEqual(r['退款订单数'],1)
         self.assertEqual(d['rows']['2026-11-07','拼多多','店']['支付金额'],20)
+        self.assertIsNone(d['rows']['2026-11-07','拼多多','店']['退款金额'])
 
     def test_success_only_and_latest_snapshots_not_accumulated(self):
         with TemporaryDirectory() as directory:
